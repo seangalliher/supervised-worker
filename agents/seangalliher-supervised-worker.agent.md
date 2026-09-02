@@ -19,6 +19,18 @@ agents take precedence over plugin agents, so a matching local filename can
 shadow this role. If provenance cannot be verified, do not claim that the role
 pack or its authority boundaries are active.
 
+Resolve the effective companion map by running `node <plugin-root>/src/cli.mjs
+workflow roles` from the target repository. Bundled selectors are reference
+defaults, not mandatory roles. When the command reports a configured workflow,
+show the user its exact `workflowHash` and ask the user to run `node
+<plugin-root>/src/cli.mjs workflow accept <workflowHash>` from the target
+repository. Do not run that acceptance command yourself. Use configured selectors
+only after `workflow roles` reports `accepted: true`. An invalid or changed
+workflow fails closed; do not silently fall back to bundled roles. Before invoking
+any mapped role, verify in the host environment that the selector resolves to the
+intended agent. Supply the accepted hash as `workflowHash` and require the role's
+exact selector as its `producedBy` claim.
+
 ## Start With Durable State
 
 For work requiring three or more steps, or any queue, create or resume
@@ -95,27 +107,25 @@ continue independent work.
 - Handle simple, local, low-risk edits directly when role delegation would add
   no meaningful discrimination. Author the compact `build-contract` and
   `build-report` artifacts yourself before independent review.
-- Invoke `seangalliher-supervised-architect` when work changes a public contract,
-  persistence, security, lifecycle ownership, dependencies, or collaborating
-  modules. Persist and hash its validated `build-contract` before implementation.
-- Invoke `seangalliher-supervised-builder` with one approved build contract and
-  its contract hash only in a clean isolated worktree. If unrelated tracked or
-  untracked work exists, preserve it and create an isolated worktree before
-  delegation. Verify its changed files stay inside `targetFiles`, then persist
-  its provisional report. Run each focused check yourself. Re-invoke the Builder
-  with the resulting evidence or author the final
-   `producedBy: "seangalliher-supervised-worker"` build report, then validate,
-  persist, and hash it.
+- Invoke the effective `architect` role when work changes a public contract,
+   persistence, security, lifecycle ownership, dependencies, or collaborating
+   modules. Persist and hash its validated `build-contract` before implementation.
+- Invoke the effective `builder` role with one approved build contract and its
+   contract hash only in a clean isolated worktree. If unrelated tracked or
+   untracked work exists, preserve it and create an isolated worktree before
+   delegation. Verify its changed files stay inside `targetFiles`, then persist
+   its provisional report. Run each focused check yourself. Re-invoke the Builder
+   with the resulting evidence or author the final report using this active Worker
+   selector as `producedBy`, then validate, persist, and hash it.
 - Stage only approved paths, freeze the candidate, and compute its staged-tree
   hash. Run every `focusedChecks` command and the contract's `broadGate` against
   that unchanged staged tree. The final implemented build report must include
   every required command as passed and set `testedTreeHash` to that exact tree.
   Run `handoff pre-review <contract> <build-report>` and require its hashes,
   test-tree binding, and staged path checks to pass. Then invoke
-  `seangalliher-supervised-diff-reviewer` with that receipt, a rendered staged
-  diff, the validated build contract and its hash, the validated build report
-  and its hash, the staged-tree hash, claimed behavior, and named production
-  consumers.
+   the effective `reviewer` role with that receipt, a rendered staged diff, the
+   validated build contract and its hash, the validated build report and its hash,
+   the staged-tree hash, claimed behavior, and named production consumers.
 - Prefer a reviewer model from a different family than the Builder when the host
    supports that choice. Never weaken context isolation when it does not.
 - Treat every reviewer finding as a hypothesis. Reproduce validated defects,

@@ -12,6 +12,8 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 
+import { WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
+
 export const STATE_DIRECTORY = ".supervised-worker";
 export const PLAN_FILE = "plan.json";
 export const MAX_SAME_PROGRESS_BLOCKS = 2;
@@ -611,6 +613,15 @@ function toolTouchesGitMetadata(input, cwd) {
   );
 }
 
+function toolTouchesWorkflowConfig(input, cwd) {
+  const root = path.join(path.resolve(cwd), ...WORKFLOW_CONFIG_PATH.split("/"));
+  const canonicalRoot = canonicalizeDeepestExisting(root);
+  return inspectToolTargets(input, cwd).targets.some((target) =>
+    pathEquals(target.lexical, root) ||
+    (!target.unsafe && !canonicalRoot.unsafe && pathEquals(target.canonical, canonicalRoot.path)),
+  );
+}
+
 function claimSession(cwd, input) {
   const hash = sessionHash(input);
   if (hash === null) return { claimed: false, conflict: false };
@@ -846,6 +857,13 @@ function handleHookUnsafe(input, eventName, cwd) {
           input,
           "deny",
           "Supervised Worker denied a direct edit to Git metadata. Use reviewed Git commands from the owning worker instead.",
+        );
+      }
+      if (toolTouchesWorkflowConfig(input, cwd)) {
+        return preToolDecision(
+          input,
+          "deny",
+          "Supervised Worker denied an agent file edit to human-managed .github/supervised-worker.json role authority.",
         );
       }
       if (!touchesState) return {};

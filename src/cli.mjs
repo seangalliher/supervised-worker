@@ -12,6 +12,7 @@ import {
   validatePlan,
 } from "./core.mjs";
 import { inspectHandoffFile, verifyBuildHandoff, verifyHandoffChain } from "./handoff.mjs";
+import { acceptWorkflowRoles, resolveWorkflowRoles } from "./workflow.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const MAX_STDIN_BYTES = 1_048_576;
@@ -89,11 +90,13 @@ async function validateRepository() {
     ...expectedAgentFiles.map((fileName) => `agents/${fileName}`),
     "hooks.json",
     "docs/architecture.md",
+    "docs/customizing-roles.md",
     "docs/evaluation.md",
     "docs/roadmap.md",
     "examples/plan.active.json",
     "examples/plan.complete.json",
     "examples/workflow.json",
+    "examples/workflow.specialized.json",
     "examples/handoff.build-contract.json",
     "examples/handoff.build-report.json",
     "examples/handoff.review-report.json",
@@ -109,6 +112,7 @@ async function validateRepository() {
     "src/cli.mjs",
     "src/handoff.mjs",
     "src/standards.mjs",
+    "src/workflow.mjs",
   ];
   const errors = required
     .filter((relativePath) => !existsSync(path.join(root, relativePath)))
@@ -290,6 +294,9 @@ async function validateRepository() {
     "--agent=seangalliher-supervised-worker",
     "--agent=supervised-worker",
     "Copilot CLI 1.0.74 or newer",
+    ".github/supervised-worker.json",
+    "workflowHash",
+    "Customizing Companion Roles",
     "metadata-only lifecycle records",
     "does not yet capture outcome episodes or activate learned procedures",
   ]) {
@@ -304,6 +311,9 @@ async function validateRepository() {
   }
   if (!architectureText.includes("root `hooks.json`")) {
     errors.push("architecture.md must describe Copilot's implemented hook discovery path");
+  }
+  if (!architectureText.includes("self-declared `producedBy`")) {
+    errors.push("architecture.md must describe dynamic handoff producer binding");
   }
   try {
     const { validateStandards } = await import("./standards.mjs");
@@ -320,6 +330,12 @@ function nonEmpty(value) {
 
 async function main() {
   const [command = "help", argument, ...argumentsAfter] = process.argv.slice(2);
+  const usage =
+    "Usage: node src/cli.mjs <validate|doctor|status|release|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
+  if (command === "help") {
+    process.stdout.write(usage);
+    return;
+  }
   if (command === "hook") {
     let text;
     try {
@@ -405,6 +421,18 @@ async function main() {
     if (!report.ok) process.exitCode = 1;
     return;
   }
+  if (command === "workflow" && argument === "roles" && argumentsAfter.length === 0) {
+    const report = resolveWorkflowRoles(process.cwd());
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    if (!report.ok) process.exitCode = 1;
+    return;
+  }
+  if (command === "workflow" && argument === "accept" && argumentsAfter.length === 1) {
+    const report = acceptWorkflowRoles(process.cwd(), argumentsAfter[0]);
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    if (!report.ok) process.exitCode = 1;
+    return;
+  }
   if (command === "validate" || command === "doctor") {
     const errors = await validateRepository();
     const report = {
@@ -418,9 +446,8 @@ async function main() {
     if (errors.length > 0) process.exitCode = 1;
     return;
   }
-  process.stdout.write(
-    "Usage: node src/cli.mjs <validate|doctor|status|release|handoff|hook EVENT>\n",
-  );
+  process.stdout.write(usage);
+  process.exitCode = 1;
 }
 
 await main();

@@ -32,7 +32,7 @@ decision authority, evidence banking, and honest absence claims. It is the sole
 writer of durable plan and handoff state. It may implement simple local changes
 directly, but still records compact build and review artifacts.
 
-Three namespaced companions provide context-isolated roles:
+Three namespaced reference companions provide context-isolated roles:
 
 - **Supervised Architect:** read-only premise verification and structural design;
   returns an approved or escalation-required build contract.
@@ -46,6 +46,21 @@ The companions return JSON conforming to `role-handoff.schema.json`; they do not
 write durable state, stage, commit, push, close provider items, or claim queue
 completion. Agent files do not pin models. A different reviewer model family is
 preferred when available, while context isolation remains mandatory.
+
+The dependency-free workflow resolver reads the optional protected repository
+file `.github/supervised-worker.json`. Its complete `roles` map may replace any
+reference selector with a specialized agent while preserving the three fixed
+authority classes. `workflow roles` returns a SHA-256 over the exact configured
+bytes; the user persists acceptance with `workflow accept <workflowHash>`. Every
+handoff records that hash, so configuration changes invalidate acceptance and
+re-acceptance does not relabel old artifacts. Handoff shape remains schema-defined;
+runtime validation checks each self-declared `producedBy` against the effective
+accepted role map. That check rejects unmapped claims but is not host provenance
+attestation.
+
+Handoff schema version 2 carries `workflowHash`. The compatibility reader accepts
+version 1 artifacts only under bundled defaults, where the absent hash means
+`null`; a configured workflow never grants old artifacts new authority.
 
 The preferred main ID is `seangalliher-supervised-worker`; the established
 `supervised-worker` ID remains as a compatibility selector. A parity test permits
@@ -136,6 +151,7 @@ The state directory belongs to the repository being worked on, not the plugin:
 ```text
 .supervised-worker/
 |-- plan.json       # current objective and queue items
+|-- workflow-acceptance.json # exact accepted repository role-map hash
 |-- handoffs/       # typed summaries below sha256(itemId), never raw provider ids
 |-- runs/*.jsonl    # append-only metadata events by hashed session id
 |-- attachment.json # hash of the session currently governing the plan
@@ -152,6 +168,11 @@ The main worker derives each item handoff directory from `sha256(itemId)`. This
 keeps untrusted provider identifiers out of filesystem paths. Handoffs may carry
 typed source paths, commands, and evidence locators, but not raw prompts, issue
 bodies, tool payloads, credentials, or source contents.
+
+Repository role configuration is strict UTF-8 JSON with duplicate keys rejected.
+The user accepts its exact byte hash in `workflow-acceptance.json`; every handoff
+copies that hash. The acceptance record attests a reviewed mapping, not the
+runtime identity or profile bytes of whichever process later claims a selector.
 
 The working directory, issue data, tool output, plan content, and learned memory
 are untrusted. The installed plugin, constitutional policy, and an explicitly

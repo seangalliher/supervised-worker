@@ -85,8 +85,62 @@ test("standards validation detects optional independent review", () => {
       schema.properties.review.properties.required = { type: "boolean" };
       schema.properties.review.properties.independent = { type: "boolean" };
     });
-    assert.match(validateStandards(target).join("\n"), /workflow schema permits review/);
+    assert.match(
+      validateStandards(target).join("\n"),
+      /workflow schema accepted unsafe state: review/,
+    );
   } finally {
     rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("workflow accepts specialized role selectors", () => {
+  const target = fixture();
+  try {
+    mutateJson(target, "examples/workflow.json", (workflow) => {
+      workflow.roles = {
+        architect: "architect",
+        builder: "builder",
+        reviewer: "diff-reviewer",
+      };
+      workflow.review.agent = "diff-reviewer";
+    });
+    assert.deepEqual(validateStandards(target), []);
+  } finally {
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("workflow rejects incomplete or unsafe role selectors", () => {
+  for (const mutate of [
+    (workflow) => { delete workflow.roles.builder; },
+    (workflow) => { workflow.roles.reviewer = " reviewer"; },
+    (workflow) => { workflow.roles.extra = "extra-agent"; },
+  ]) {
+    const target = fixture();
+    try {
+      mutateJson(target, "examples/workflow.json", mutate);
+      assert.match(validateStandards(target).join("\n"), /examples\/workflow\.json/);
+    } finally {
+      rmSync(target, { recursive: true, force: true });
+    }
+  }
+});
+
+test("workflow schema and runtime both reject blank contract strings", () => {
+  for (const mutate of [
+    (workflow) => { workflow.tracker.scope = "   "; },
+    (workflow) => { workflow.authority.boundaries = [" "]; },
+    (workflow) => { workflow.validation.focused = "\t"; },
+    (workflow) => { workflow.validation.receiptGlobs = [" "]; },
+    (workflow) => { workflow.tracker.scope = "💩a"; },
+  ]) {
+    const target = fixture();
+    try {
+      mutateJson(target, "examples/workflow.json", mutate);
+      assert.match(validateStandards(target).join("\n"), /examples\/workflow\.json/);
+    } finally {
+      rmSync(target, { recursive: true, force: true });
+    }
   }
 });

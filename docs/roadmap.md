@@ -4,6 +4,7 @@
 
 - Agent Plugins 1.0 package
 - Namespaced Architect, Builder, and Diff Reviewer companion agents
+- Protected repository mapping to specialized companion agents
 - Typed, hash-bound role handoff contract
 - Dependency-free staged-tree and cross-artifact handoff verifier
 - Cross-platform Copilot lifecycle hooks

@@ -52,6 +52,11 @@ unless the user deliberately chooses to publish sanitized evaluation fixtures.
 The Supervised Worker is the only role that writes durable workflow state.
 Architect, Builder, and Diff Reviewer companions return JSON objects conforming
 to `schemas/role-handoff.schema.json`; they never edit `.supervised-worker/`.
+Resolve their effective selectors with `workflow roles`. The bundled companions
+are reference defaults; an explicitly accepted `.github/supervised-worker.json`
+may map specialized agents that preserve the same authority and handoff contract.
+The user, not an agent, runs `workflow accept <workflowHash>`. Copy that accepted
+hash into every handoff artifact; bundled defaults use `workflowHash: null`.
 
 For each active item, compute `sha256(itemId)` and store validated artifacts in:
 
@@ -75,7 +80,7 @@ node <plugin-root>/src/cli.mjs handoff pre-review <contract> <build-report>
 node <plugin-root>/src/cli.mjs handoff verify <contract> <build-report> <review-report>
 ```
 
-The chain verifier compares exact file-byte hashes, item IDs, consumers,
+The chain verifier compares exact workflow and file-byte hashes, item IDs, consumers,
 `changedFiles` against `targetFiles`, staged paths, unstaged drift, and the
 review report's tree hash against the current Git index.
 
@@ -85,13 +90,13 @@ review report's tree hash against the current Git index.
    permit work now.
 2. **Verify premise:** Run a check that would fail if the reported behavior or
    missing artifact were not real.
-3. **Design:** Prefer the repository's established pattern. Use the Supervised
-   Architect for structural decisions and hash the approved build contract.
-4. **Build:** Give one approved contract to the Supervised Builder, or implement
+3. **Design:** Prefer the repository's established pattern. Use the resolved
+  Architect for structural decisions and hash the approved build contract.
+4. **Build:** Give one approved contract to the resolved Builder, or implement
    a simple local contract directly. Keep one bounded implementation surface active.
 5. **Validate:** Freeze the staged tree; run every focused check and the broad
    gate against that tree; record `testedTreeHash`; require `handoff pre-review`
-   to pass; run the Supervised Diff Reviewer; then require final `handoff verify`.
+  to pass; run the resolved Reviewer; then require final `handoff verify`.
    A repair changes the tree and invalidates the gates and review.
 6. **Bank:** Bind evidence to the exact commit, push target, issue, and closure
    state. Preserve durable receipts before deleting temporary workspaces.

@@ -1,8 +1,9 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "kind": "review-report",
   "itemId": "issue-42",
   "producedBy": "seangalliher-supervised-diff-reviewer",
+  "workflowHash": null,
   "createdAt": "2026-09-02T12:30:00Z",
   "contractHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "buildReportHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",

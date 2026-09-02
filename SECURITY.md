@@ -59,9 +59,22 @@ outside the alpha security boundary.
   the host environment view that `seangalliher-supervised-*` roles come from this
   plugin before relying on their tool boundaries. Publisher-qualified names
   reduce collisions but do not create a security namespace.
+- Treat `.github/supervised-worker.json` as authority-bearing repository content.
+  Review and explicitly accept the exact `workflowHash` before using specialized
+  role mappings. Built-in agent file edits are denied. Invalid mappings fail
+  closed and cannot silently inherit defaults.
+- Every handoff carries the accepted workflow hash. `producedBy` is still a
+  self-declared selector checked against that mapping, not host-attested identity.
+  The mapping hash does not cover agent profile bytes; verify role provenance and
+  review specialized agent changes separately.
 - Companion roles have no shell tool. Architect and Diff Reviewer are read-only;
   Builder has file editing only. The global hook denies direct Git-metadata edits
   and durable-state edits from any session other than the attached Worker.
+
+The hook does not parse shell command text and cannot prove which agent authored
+a handoff. A same-user process or a shell-capable agent can mutate repository
+files outside built-in edit tools; exact workflow-hash acceptance and handoff
+checks detect later changes but are not host identity attestation.
 
 ## Reporting A Vulnerability
 

@@ -99,3 +99,20 @@ test("release removes an explicitly stale attachment", () => {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test("explicit help succeeds while malformed commands fail", () => {
+  const help = run(["help"]);
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /^Usage:/);
+
+  for (const args of [
+    ["workflow", "accept"],
+    ["workflow", "accept", "abc", "extra"],
+    ["workflow", "roles", "extra"],
+    ["unknown-command"],
+  ]) {
+    const result = run(args);
+    assert.equal(result.status, 1, `${args.join(" ")}: ${result.stderr || result.stdout}`);
+    assert.match(result.stdout, /^Usage:/);
+  }
+});

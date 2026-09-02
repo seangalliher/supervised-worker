@@ -1,8 +1,18 @@
 # Changelog
 
-## 0.1.1-alpha.1 - Unreleased
+## 0.1.2-alpha.1 - Unreleased
 
 - Added namespaced Supervised Architect, Builder, and Diff Reviewer companions.
+- Made bundled companions reference implementations and added protected,
+	hash-identified repository mapping to specialized role selectors.
+- Added user-executed exact-byte workflow acceptance and bound every handoff to
+	the accepted hash, including rejection before acceptance and after reconfiguration.
+- Introduced handoff schema version 2 for workflow-hash binding while preserving
+	version 1 artifacts under bundled reference roles.
+- Rejected duplicate-key and invalid UTF-8 authority files, constrained mappings
+	to filename-derived agent IDs, and documented `producedBy` as self-declared.
+- Replaced acceptance records atomically after fsync, validated strict calendar
+	timestamps, aligned Unicode length semantics, and made malformed CLI commands fail.
 - Added typed, hash-bound build contract, build report, and review report handoffs.
 - Added dependency-free individual, pre-review, and final chain verification
 	against exact artifact bytes and the current Git index.

@@ -3,6 +3,7 @@ import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 import { sha256, stateDirectory } from "./core.mjs";
+import { resolveWorkflowRoles, WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
 
 export const MAX_HANDOFF_BYTES = 1_048_576;
 
@@ -16,6 +17,7 @@ const PROTECTED_ROOTS = new Set([".git", ".supervised-worker"]);
 const HASH_RE = /^[0-9a-f]{64}$/;
 const TREE_HASH_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const ID_RE = /^[a-z0-9][a-z0-9.-]*$/;
+const WORKER_PRODUCERS = ["supervised-worker", "seangalliher-supervised-worker"];
 
 function isRecord(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -208,38 +210,46 @@ export function validateRepositoryPath(workspace, value, label = "path") {
   if (PROTECTED_ROOTS.has(firstSegment)) {
     errors.push(`${label} targets protected repository state`);
   }
+  if (segments.map((segment) => segment.toLowerCase()).join("/") === WORKFLOW_CONFIG_PATH) {
+    errors.push(`${label} targets protected role authority`);
+  }
   if (errors.length === 0) assertExistingPathSafe(workspace, value, label, errors);
   return errors;
 }
 
-function validateCommon(value, expectedKind, producers, errors) {
+function validateCommon(value, expectedKind, producers, workflow, errors) {
   if (!isRecord(value)) return [`${expectedKind} must be an object`];
-  if (value.schemaVersion !== 1) errors.push("schemaVersion must be 1");
+  if (![1, 2].includes(value.schemaVersion)) errors.push("schemaVersion must be 1 or 2");
   if (value.kind !== expectedKind) errors.push(`kind must be ${expectedKind}`);
   if (!nonBlank(value.itemId)) errors.push("itemId must be a non-empty string");
   if (!producers.includes(value.producedBy)) errors.push(`producedBy is invalid for ${expectedKind}`);
+  const expectedWorkflowHash = workflow.configured ? workflow.workflowHash : null;
+  const artifactWorkflowHash = value.schemaVersion === 1 ? null : value.workflowHash;
+  if (value.schemaVersion === 1 && Object.hasOwn(value, "workflowHash")) {
+    errors.push(`schemaVersion 1 ${expectedKind} cannot contain workflowHash`);
+  }
+  if (artifactWorkflowHash !== expectedWorkflowHash) {
+    errors.push(`workflowHash does not match the accepted workflow for ${expectedKind}`);
+  }
   if (!isDateTime(value.createdAt)) errors.push("createdAt must be an RFC 3339 date-time");
   return errors;
 }
 
-function validateBuildContract(value, workspace) {
+function validateBuildContract(value, workspace, roles) {
   const errors = [];
   const keys = new Set([
-    "schemaVersion", "kind", "itemId", "producedBy", "createdAt", "status", "premise",
+    "schemaVersion", "kind", "itemId", "producedBy", "workflowHash", "createdAt", "status", "premise",
     "objective", "authorityBoundaries", "options", "selectedApproach", "targetFiles",
     "consumers", "acceptanceCriteria", "focusedChecks", "broadGate", "exclusions", "blockedBy",
   ]);
-  const required = [...keys];
+  const required = [...keys].filter((key) => key !== "workflowHash" || value?.schemaVersion === 2);
   if (!requiredKeys(value, required, "build-contract", errors)) return errors;
   unknownKeys(value, keys, "build-contract", errors);
   validateCommon(
     value,
     "build-contract",
-    [
-      "supervised-worker",
-      "seangalliher-supervised-worker",
-      "seangalliher-supervised-architect",
-    ],
+    [...WORKER_PRODUCERS, roles.architect],
+    roles,
     errors,
   );
   if (!["approved", "escalation-required"].includes(value.status)) {
@@ -308,22 +318,20 @@ function validateCheck(value, label, errors) {
   validateEvidence(value.evidence, `${label}.evidence`, errors);
 }
 
-function validateBuildReport(value, workspace) {
+function validateBuildReport(value, workspace, roles) {
   const errors = [];
   const keys = new Set([
-    "schemaVersion", "kind", "itemId", "producedBy", "createdAt", "status", "contractHash",
+    "schemaVersion", "kind", "itemId", "producedBy", "workflowHash", "createdAt", "status", "contractHash",
     "testedTreeHash", "changedFiles", "checks", "evidence", "deviations", "blocker",
   ]);
-  if (!requiredKeys(value, [...keys], "build-report", errors)) return errors;
+  const required = [...keys].filter((key) => key !== "workflowHash" || value?.schemaVersion === 2);
+  if (!requiredKeys(value, required, "build-report", errors)) return errors;
   unknownKeys(value, keys, "build-report", errors);
   validateCommon(
     value,
     "build-report",
-    [
-      "supervised-worker",
-      "seangalliher-supervised-worker",
-      "seangalliher-supervised-builder",
-    ],
+    [...WORKER_PRODUCERS, roles.builder],
+    roles,
     errors,
   );
   if (!["implemented", "blocked"].includes(value.status)) errors.push("build-report status is invalid");
@@ -376,16 +384,17 @@ function validateFinding(value, label, errors) {
   if (typeof value.blocksCommit !== "boolean") errors.push(`${label}.blocksCommit must be boolean`);
 }
 
-function validateReviewReport(value) {
+function validateReviewReport(value, roles) {
   const errors = [];
   const keys = new Set([
-    "schemaVersion", "kind", "itemId", "producedBy", "createdAt", "contractHash",
+    "schemaVersion", "kind", "itemId", "producedBy", "workflowHash", "createdAt", "contractHash",
     "buildReportHash", "stagedTreeHash", "claimedBehavior", "consumers", "modelSeparation",
     "verdict", "findings", "notChecked",
   ]);
-  if (!requiredKeys(value, [...keys], "review-report", errors)) return errors;
+  const required = [...keys].filter((key) => key !== "workflowHash" || value?.schemaVersion === 2);
+  if (!requiredKeys(value, required, "review-report", errors)) return errors;
   unknownKeys(value, keys, "review-report", errors);
-  validateCommon(value, "review-report", ["seangalliher-supervised-diff-reviewer"], errors);
+  validateCommon(value, "review-report", [roles.reviewer], roles, errors);
   if (!HASH_RE.test(value.contractHash ?? "")) errors.push("contractHash must be a SHA-256 hash");
   if (!HASH_RE.test(value.buildReportHash ?? "")) errors.push("buildReportHash must be a SHA-256 hash");
   if (!TREE_HASH_RE.test(value.stagedTreeHash ?? "")) errors.push("stagedTreeHash is invalid");
@@ -412,9 +421,16 @@ function validateReviewReport(value) {
 
 export function validateHandoffValue(value, workspace = process.cwd()) {
   if (!isRecord(value)) return ["handoff must be a JSON object"];
-  if (value.kind === "build-contract") return validateBuildContract(value, workspace);
-  if (value.kind === "build-report") return validateBuildReport(value, workspace);
-  if (value.kind === "review-report") return validateReviewReport(value);
+  const workflow = resolveWorkflowRoles(workspace, { requireAcceptance: true });
+  if (!workflow.ok) return workflow.errors.map((error) => `workflow: ${error}`);
+  const effectiveWorkflow = {
+    ...workflow.roles,
+    configured: workflow.configured,
+    workflowHash: workflow.workflowHash,
+  };
+  if (value.kind === "build-contract") return validateBuildContract(value, workspace, effectiveWorkflow);
+  if (value.kind === "build-report") return validateBuildReport(value, workspace, effectiveWorkflow);
+  if (value.kind === "review-report") return validateReviewReport(value, effectiveWorkflow);
   return ["handoff kind is unsupported"];
 }
 

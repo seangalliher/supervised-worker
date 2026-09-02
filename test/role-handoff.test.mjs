@@ -55,7 +55,11 @@ test("both Worker selector identities produce valid handoffs", () => {
   }
 
   contract.producedBy = "other-worker";
-  assertInvalid(contract, "unknown Worker producer");
+  assert.equal(validate(contract), true, ajv.errorsText(validate.errors));
+  assert.match(
+    validateHandoffValue(contract, root).join("\n"),
+    /producedBy is invalid for build-contract/,
+  );
 });
 
 test("escalation blocked-build and changes-required branches validate", () => {
@@ -110,6 +114,8 @@ test("build contract paths stay repository relative", () => {
     ".supervised-worker/plan.json",
     ".Supervised-Worker/plan.json",
     ".supervised-worker./plan.json",
+    ".github/supervised-worker.json",
+    ".GitHub/Supervised-Worker.JSON",
     "src/unsafe\u0000path.js",
     "src/*.js",
     "src/",
@@ -181,4 +187,40 @@ test("review report requires a real staged tree hash", () => {
   const value = clone(readJson("examples/handoff.review-report.json"));
   value.stagedTreeHash = "not-a-tree";
   assertInvalid(value, "malformed staged tree hash");
+});
+
+test("legacy v1 handoffs remain valid only with bundled reference roles", () => {
+  for (const fileName of [
+    "handoff.build-contract.json",
+    "handoff.build-report.json",
+    "handoff.review-report.json",
+  ]) {
+    const legacy = clone(readJson(`examples/${fileName}`));
+    legacy.schemaVersion = 1;
+    delete legacy.workflowHash;
+    assertValid(legacy, `legacy ${fileName}`);
+
+    const invalidV1 = clone(legacy);
+    invalidV1.workflowHash = null;
+    assertInvalid(invalidV1, `version 1 ${fileName} with workflowHash`);
+  }
+});
+
+test("schema and runtime reject the same noncanonical timestamps", () => {
+  for (const fileName of [
+    "handoff.build-contract.json",
+    "handoff.build-report.json",
+    "handoff.review-report.json",
+  ]) {
+    for (const timestamp of [
+      "2026-09-02t12:00:00z",
+      "1990-12-31T23:59:60Z",
+      "0000-01-01T00:00:00Z",
+      "2026-02-30T00:00:00Z",
+    ]) {
+      const value = clone(readJson(`examples/${fileName}`));
+      value.createdAt = timestamp;
+      assertInvalid(value, `${fileName} timestamp ${timestamp}`);
+    }
+  }
 });

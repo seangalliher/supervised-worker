@@ -28,6 +28,8 @@ helper deterministic and the plugin small.
 - Architect and Diff Reviewer remain read-only. Builder edits only the approved
 	`targetFiles` footprint.
 - Learned procedures are advisory and cannot modify constitutional policy.
+- Specialized companion agents must preserve the reference role's tool boundary,
+  typed handoff kind, and prohibition on durable state and repository history.
 - New public behavior requires focused tests and a cross-platform lifecycle test.
 - A claim that something is absent requires an enumerating check.
 

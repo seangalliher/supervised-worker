@@ -987,3 +987,35 @@ test("cyclic writer payload traversal terminates", () => {
   assert.equal(result.signal, null, "cyclic payload traversal timed out");
   assert.equal(result.status, 0, result.stderr);
 });
+
+test("agent file edits cannot modify human-managed role authority", () => {
+  const cwd = workspace();
+  const workflowPath = path.join(cwd, ".github", "supervised-worker.json");
+  const denied = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: "companion-session",
+      cwd,
+      tool_name: "Write",
+      tool_input: { file_path: workflowPath },
+    },
+    "PreToolUse",
+  );
+  assert.equal(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /role authority/);
+
+  writePlan(cwd);
+  attachPlan(cwd, "owner-session");
+  const ownerDenied = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: "owner-session",
+      cwd,
+      tool_name: "Write",
+      tool_input: { file_path: workflowPath },
+    },
+    "PreToolUse",
+  );
+  assert.equal(ownerDenied.permissionDecision, "deny");
+  assert.match(ownerDenied.permissionDecisionReason, /human-managed/);
+});

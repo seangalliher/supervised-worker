@@ -25,6 +25,14 @@ tests that would fail against the unprotected behavior.
   files, hidden unstaged/untracked edits, and non-clean final verdicts are
   rejected by the dependency-free runtime verifier.
 - Role-pack agents contain no repository-specific terminology or model pins.
+- Specialized role maps fail before exact-hash acceptance and after any byte
+  change; re-acceptance does not make old handoffs current.
+- Duplicate keys, invalid UTF-8, linked authority files, role collisions, Worker
+  impersonation, and unmapped producer claims are rejected.
+- `producedBy` is treated as an unauthenticated claim until a supported host
+  exposes attested subagent identity and profile provenance.
+- Version 1 handoffs remain readable only under bundled defaults; configured
+  workflows require version 2 and an exact accepted hash.
 
 ## Dogfood Threshold Before v0.1
 

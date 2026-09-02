@@ -13,7 +13,7 @@
       "required": ["kind", "scope"],
       "properties": {
         "kind": { "enum": ["github"] },
-        "scope": { "type": "string", "minLength": 3 },
+        "scope": { "type": "string", "minLength": 3, "pattern": "\\S" },
         "query": { "type": "string", "default": "is:issue is:open" }
       }
     },
@@ -34,9 +34,19 @@
         "mode": { "enum": ["supervised", "delegated"] },
         "boundaries": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
+          "items": { "$ref": "#/$defs/nonBlank" },
           "uniqueItems": true
         }
+      }
+    },
+    "roles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["architect", "builder", "reviewer"],
+      "properties": {
+        "architect": { "$ref": "#/$defs/agentSelector" },
+        "builder": { "$ref": "#/$defs/agentSelector" },
+        "reviewer": { "$ref": "#/$defs/agentSelector" }
       }
     },
     "validation": {
@@ -44,11 +54,11 @@
       "additionalProperties": false,
       "required": ["focused", "broad"],
       "properties": {
-        "focused": { "type": "string", "minLength": 1 },
-        "broad": { "type": "string", "minLength": 1 },
+        "focused": { "$ref": "#/$defs/nonBlank" },
+        "broad": { "$ref": "#/$defs/nonBlank" },
         "receiptGlobs": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
+          "items": { "$ref": "#/$defs/nonBlank" },
           "uniqueItems": true
         }
       }
@@ -60,7 +70,7 @@
       "properties": {
         "required": { "const": true },
         "independent": { "const": true },
-        "agent": { "type": "string", "minLength": 1 }
+        "agent": { "$ref": "#/$defs/agentSelector" }
       }
     },
     "filing": {
@@ -69,6 +79,22 @@
       "properties": {
         "maximumNewPerClosures": { "type": "integer", "minimum": 0 },
         "closureDenominator": { "type": "integer", "minimum": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "nonBlank": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "agentSelector": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!.*(?:--|\\.\\.))[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$",
+      "not": {
+        "enum": ["supervised-worker", "seangalliher-supervised-worker"]
       }
     }
   }

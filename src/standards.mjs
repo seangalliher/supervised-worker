@@ -6,6 +6,7 @@ import addFormats from "ajv-formats";
 import { parseDocument } from "yaml";
 
 import { validateHandoffValue } from "./handoff.mjs";
+import { validateWorkflowValue } from "./workflow.mjs";
 
 const PLUGIN_SCHEMA_ID = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 const PLUGIN_KEYS = new Set([
@@ -38,6 +39,7 @@ const SCHEMA_FILES = [
 ];
 const EXAMPLE_SCHEMAS = [
   ["examples/workflow.json", "workflow.schema.json"],
+  ["examples/workflow.specialized.json", "workflow.schema.json"],
   ["examples/plan.active.json", "plan.schema.json"],
   ["examples/plan.complete.json", "plan.schema.json"],
   ["examples/handoff.build-contract.json", "role-handoff.schema.json"],
@@ -209,10 +211,41 @@ function validatePolicyGates(validate, errors) {
 }
 
 function validateWorkflowGates(validate, workflow, errors) {
+  const rejectBoth = (name, value) => {
+    if (validate(value)) errors.push(`workflow schema accepted unsafe state: ${name}`);
+    if (validateWorkflowValue(value).length === 0) {
+      errors.push(`workflow runtime accepted unsafe state: ${name}`);
+    }
+  };
   for (const field of ["required", "independent"]) {
     const value = structuredClone(workflow);
     value.review[field] = false;
-    if (validate(value)) errors.push(`workflow schema permits review.${field}=false`);
+    rejectBoth(`review.${field}=false`, value);
+  }
+  for (const [name, mutate] of [
+    ["blank tracker scope", (value) => { value.tracker.scope = "   "; }],
+    ["blank authority boundary", (value) => { value.authority.boundaries = [" "]; }],
+    ["blank focused command", (value) => { value.validation.focused = "\t"; }],
+    ["blank receipt glob", (value) => { value.validation.receiptGlobs = [" "]; }],
+  ]) {
+    const value = structuredClone(workflow);
+    mutate(value);
+    rejectBoth(name, value);
+  }
+  for (const [name, mutate] of [
+    ["duplicate role selectors", (value) => { value.roles.builder = value.roles.architect; }],
+    ["Worker as companion", (value) => { value.roles.architect = "supervised-worker"; }],
+    ["conflicting reviewer aliases", (value) => { value.review.agent = "other-reviewer"; }],
+    ["legacy reviewer duplicates Architect", (value) => {
+      delete value.roles;
+      value.review.agent = "seangalliher-supervised-architect";
+    }],
+  ]) {
+    const value = structuredClone(workflow);
+    mutate(value);
+    if (validateWorkflowValue(value).length === 0) {
+      errors.push(`workflow runtime accepted unsafe state: ${name}`);
+    }
   }
 }
 
@@ -313,6 +346,9 @@ export function validatePublishedSchemas(root) {
       if (!validate(example)) errors.push(...formatAjvErrors(examplePath, validate.errors));
       if (schemaFile === "role-handoff.schema.json") {
         const runtimeErrors = validateHandoffValue(example, root);
+        errors.push(...runtimeErrors.map((error) => `${examplePath} runtime: ${error}`));
+      } else if (schemaFile === "workflow.schema.json") {
+        const runtimeErrors = validateWorkflowValue(example);
         errors.push(...runtimeErrors.map((error) => `${examplePath} runtime: ${error}`));
       }
     } catch (error) {

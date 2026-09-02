@@ -543,6 +543,128 @@ test("preferred Worker producer passes every CLI handoff gate", () => {
   });
 });
 
+test("specialized workflow roles pass the complete CLI handoff chain", () => {
+  withFixture((fixture) => {
+    const workflow = readJson("examples/workflow.json");
+    workflow.roles = {
+      architect: "architect",
+      builder: "builder",
+      reviewer: "diff-reviewer",
+    };
+    workflow.review.agent = "diff-reviewer";
+    const workflowPath = path.join(fixture.cwd, ".github", "supervised-worker.json");
+    writeJson(workflowPath, workflow);
+    git(fixture.cwd, "add", "--", "src/module.js", ".github/supervised-worker.json");
+    git(
+      fixture.cwd,
+      "-c",
+      "user.name=Supervised Worker Test",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "--quiet",
+      "-m",
+      "add workflow baseline",
+    );
+    writeFileSync(path.join(fixture.cwd, "src", "module.js"), "export const value = 2;\n");
+    git(fixture.cwd, "add", "--", "src/module.js");
+
+    const resolved = spawnSync(process.execPath, [cli, "workflow", "roles"], {
+      cwd: fixture.cwd,
+      encoding: "utf8",
+    });
+    assert.equal(resolved.status, 0, resolved.stderr || resolved.stdout);
+    const roleReport = JSON.parse(resolved.stdout);
+    assert.equal(roleReport.accepted, false);
+    assert.match(roleReport.workflowHash, /^[0-9a-f]{64}$/);
+
+    fixture.contract.producedBy = "architect";
+    fixture.contract.workflowHash = roleReport.workflowHash;
+    const contractHash = writeJson(fixture.contractPath, fixture.contract);
+    fixture.build.producedBy = "builder";
+    fixture.build.workflowHash = roleReport.workflowHash;
+    fixture.build.contractHash = contractHash;
+    fixture.build.testedTreeHash = git(fixture.cwd, "write-tree");
+    const buildHash = writeJson(fixture.buildPath, fixture.build);
+    fixture.review.producedBy = "diff-reviewer";
+    fixture.review.workflowHash = roleReport.workflowHash;
+    fixture.review.contractHash = contractHash;
+    fixture.review.buildReportHash = buildHash;
+    fixture.review.stagedTreeHash = git(fixture.cwd, "write-tree");
+    writeJson(fixture.reviewPath, fixture.review);
+
+    const handoffCommands = [
+      ["handoff", "validate", fixture.contractPath],
+      ["handoff", "pre-review", fixture.contractPath, fixture.buildPath],
+      ["handoff", "verify", fixture.contractPath, fixture.buildPath, fixture.reviewPath],
+    ];
+    for (const args of handoffCommands) {
+      const result = spawnSync(process.execPath, [cli, ...args], {
+        cwd: fixture.cwd,
+        encoding: "utf8",
+      });
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.match(JSON.parse(result.stdout).errors.join("\n"), /explicitly accepted/);
+    }
+
+    const accepted = spawnSync(
+      process.execPath,
+      [cli, "workflow", "accept", roleReport.workflowHash],
+      { cwd: fixture.cwd, encoding: "utf8" },
+    );
+    assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+    assert.equal(JSON.parse(accepted.stdout).accepted, true);
+
+    for (const args of handoffCommands) {
+      const result = spawnSync(process.execPath, [cli, ...args], {
+        cwd: fixture.cwd,
+        encoding: "utf8",
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.equal(JSON.parse(result.stdout).ok, true);
+    }
+
+    writeFileSync(workflowPath, `${readFileSync(workflowPath, "utf8")}\n`);
+    for (const args of handoffCommands) {
+      const result = spawnSync(process.execPath, [cli, ...args], {
+        cwd: fixture.cwd,
+        encoding: "utf8",
+      });
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.match(JSON.parse(result.stdout).errors.join("\n"), /explicitly accepted/);
+    }
+
+    const changedRoles = spawnSync(process.execPath, [cli, "workflow", "roles"], {
+      cwd: fixture.cwd,
+      encoding: "utf8",
+    });
+    const changedRoleReport = JSON.parse(changedRoles.stdout);
+    const reaccepted = spawnSync(
+      process.execPath,
+      [cli, "workflow", "accept", changedRoleReport.workflowHash],
+      { cwd: fixture.cwd, encoding: "utf8" },
+    );
+    assert.equal(reaccepted.status, 0, reaccepted.stderr || reaccepted.stdout);
+    for (const args of handoffCommands) {
+      const result = spawnSync(process.execPath, [cli, ...args], {
+        cwd: fixture.cwd,
+        encoding: "utf8",
+      });
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.match(JSON.parse(result.stdout).errors.join("\n"), /workflowHash does not match/);
+    }
+  });
+});
+
+test("default workflow rejects a specialized producer identity", () => {
+  const contract = readJson("examples/handoff.build-contract.json");
+  contract.producedBy = "architect";
+  assert.match(
+    validateHandoffValue(contract, root).join("\n"),
+    /producedBy is invalid for build-contract/,
+  );
+});
+
 test("CLI accepts a filesystem alias that resolves inside the handoff directory", () => {
   withFixture(({ cwd, contractPath }) => {
     const aliasParent = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-alias-parent-"));

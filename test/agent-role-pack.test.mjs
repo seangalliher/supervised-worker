@@ -56,6 +56,8 @@ test("companion agents have bounded non-overlapping authority", () => {
   assert.equal(builder.metadata["disable-model-invocation"], false);
   assert.equal(reviewer.metadata["user-invocable"], true);
   assert.equal(reviewer.metadata["disable-model-invocation"], false);
+  assert.match(builder.metadata.description, /reports Worker-supplied focused validation/);
+  assert.doesNotMatch(builder.metadata.description, /runs focused validation/);
   for (const [id, agent] of [
     ["seangalliher-supervised-architect", architect],
     ["seangalliher-supervised-builder", builder],
@@ -65,6 +67,8 @@ test("companion agents have bounded non-overlapping authority", () => {
     assert.match(agent.body, /\.\.\/schemas\/role-handoff\.schema\.json/);
     assert.match(agent.body, /Do not (?:create|edit|modify).*\.supervised-worker/is);
     assert.match(agent.body, /Do not commit, push, or close/is);
+    assert.match(agent.body, /Reference Implementation/);
+    assert.match(agent.body, /\.github\/supervised-worker\.json/);
     assert.doesNotMatch(agent.body, /\b(?:ProbOS|Captain|AD-\d|BF-\d)\b/);
   }
   assert.doesNotMatch(architect.metadata.tools.join(" "), /edit/);
@@ -92,13 +96,12 @@ test("main worker is the sole durable-plan owner and names every handoff", () =>
     assert.equal(worker.metadata["disable-model-invocation"], true);
     assert.equal(worker.metadata.infer, undefined);
     assert.match(worker.body, /sole owner of `\.supervised-worker\/plan\.json`/i);
-    for (const id of [
-      "seangalliher-supervised-architect",
-      "seangalliher-supervised-builder",
-      "seangalliher-supervised-diff-reviewer",
-    ]) {
-      assert.match(worker.body, new RegExp(`\\b${id}\\b`));
-    }
+    assert.match(worker.body, /workflow roles/);
+    assert.match(worker.body, /effective `architect` role/);
+    assert.match(worker.body, /effective `builder` role/);
+    assert.match(worker.body, /effective `reviewer` role/);
+    assert.match(worker.body, /ask the user to run.*workflow accept/is);
+    assert.match(worker.body, /Do not run that acceptance command yourself/);
     assert.match(worker.body, /simple.*directly/is);
     assert.match(worker.body, /contract hash/i);
     assert.match(worker.body, /staged-tree hash/i);

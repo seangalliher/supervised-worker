@@ -21,9 +21,9 @@
     ]
   },
   "roles": {
-    "architect": "seangalliher-supervised-architect",
-    "builder": "seangalliher-supervised-builder",
-    "reviewer": "seangalliher-supervised-diff-reviewer"
+    "architect": "architect",
+    "builder": "builder",
+    "reviewer": "diff-reviewer"
   },
   "validation": {
     "focused": "replace with the repository's focused test command",

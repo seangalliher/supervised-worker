@@ -8,7 +8,7 @@ mistaking activity for completion. Copilot still plans, edits, runs tools, and
 reasons. This plugin supplies durable state, queue semantics, review discipline,
 metadata-only lifecycle records, and a bounded completion gate.
 
-> Status: `0.1.1-alpha.1`. Suitable for local evaluation in trusted
+> Status: `0.1.2-alpha.1`. Suitable for local evaluation in trusted
 > repositories. It is not yet a security boundary or an unattended production
 > scheduler.
 
@@ -31,7 +31,8 @@ Supervised Worker makes those transitions explicit and inspectable.
 - A preferred namespaced `seangalliher-supervised-worker` agent that owns queue
   and release state, plus the established `supervised-worker` compatibility selector.
 - Namespaced `Supervised Architect`, `Supervised Builder`, and `Supervised Diff
-  Reviewer` companion agents with non-overlapping authority.
+  Reviewer` reference agents with non-overlapping authority and repository-level
+  mapping to specialized replacements.
 - A `governed-queue` skill with a durable plan and banking contract.
 - A typed, hash-bound contract for architecture, build, and review handoffs.
 - Cross-platform lifecycle hooks for recovery, metadata-only run ledgers,
@@ -91,6 +92,41 @@ project or user agent can still shadow any plugin agent with the same filename.
 Before a governed run, inspect `/env` and verify the selected agent is sourced
 from this plugin. This provenance check is operational hygiene, not a security
 boundary against a malicious same-user repository.
+
+### Specialized Roles
+
+Repositories can map the three companion roles in the protected workflow file
+`.github/supervised-worker.json`:
+
+```json
+{
+  "roles": {
+    "architect": "architect",
+    "builder": "builder",
+    "reviewer": "diff-reviewer"
+  }
+}
+```
+
+The file is a complete workflow document, not only this fragment. Start from
+[the specialized example](examples/workflow.specialized.json), then inspect the
+effective mapping from the target repository:
+
+```bash
+node /absolute/path/to/supervised-worker/src/cli.mjs workflow roles
+```
+
+Repository overrides fail closed when invalid and return a `workflowHash` that
+must be explicitly accepted by the user before use:
+
+```bash
+node /absolute/path/to/supervised-worker/src/cli.mjs workflow accept <workflowHash>
+```
+
+Every handoff records that hash, so old artifacts cannot be replayed under a
+newly accepted mapping. Specialized agents must preserve the
+reference role's authority and typed handoff contract. See
+[Customizing Companion Roles](docs/customizing-roles.md).
 
 ## Local Evaluation
 
@@ -167,6 +203,8 @@ npm run validate
 npm test
 npm run doctor
 node src/cli.mjs status
+node src/cli.mjs workflow roles
+node src/cli.mjs workflow accept <workflowHash>
 ```
 
 `doctor` validates the package and reports durable plan state for the current
