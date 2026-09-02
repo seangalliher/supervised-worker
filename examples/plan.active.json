@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "mode": "active",
+  "goal": "Complete the authenticated issue queue.",
+  "items": [
+    {
+      "id": "issue-123",
+      "title": "Example bounded item",
+      "status": "in_progress"
+    }
+  ],
+  "completion": null
+}

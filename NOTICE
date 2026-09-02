@@ -1,0 +1,9 @@
+Supervised Worker
+Copyright 2026 Sean Galliher
+
+This project originated as a standalone extraction of operational practices
+developed while building ProbOS (https://github.com/seangalliher/ProbOS).
+
+The design acknowledges public patterns described by Planning with Files,
+OpenAI Symphony, Ralph, Foreman, and Agent Orchestrator. No source code from
+those projects is included in this initial release.

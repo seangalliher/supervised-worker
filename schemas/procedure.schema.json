@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/seangalliher/supervised-worker/schemas/procedure.schema.json",
+  "title": "Supervised Worker Learned Procedure",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "scope",
+    "trigger",
+    "actionIds",
+    "invariants",
+    "sourceEpisodeIds",
+    "confidence",
+    "status",
+    "successCount",
+    "failureCount"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9.-]*$" },
+    "scope": { "type": "string", "minLength": 1 },
+    "trigger": { "type": "string", "minLength": 1 },
+    "actionIds": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9.-]*$" }
+    },
+    "invariants": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "fallbacks": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "sourceEpisodeIds": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "confidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alpha", "beta"],
+      "properties": {
+        "alpha": { "type": "number", "exclusiveMinimum": 0 },
+        "beta": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "status": { "enum": ["candidate", "shadow", "advisory", "suspended", "archived"] },
+    "successCount": { "type": "integer", "minimum": 0 },
+    "failureCount": { "type": "integer", "minimum": 0 },
+    "lastUsedAt": { "type": ["string", "null"], "format": "date-time" },
+    "supersedes": { "type": ["string", "null"] },
+    "contradictionIds": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "decay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["demoteAfterDays", "archiveAfterDays"],
+      "properties": {
+        "demoteAfterDays": { "type": "integer", "minimum": 1 },
+        "archiveAfterDays": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

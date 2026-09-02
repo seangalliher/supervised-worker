@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/seangalliher/supervised-worker/schemas/policy-proposal.schema.json",
+  "title": "Supervised Worker Policy Patch Proposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "target",
+    "baseHash",
+    "effectClass",
+    "rationale",
+    "typedDiff",
+    "evidence",
+    "replay",
+    "review",
+    "humanApproval",
+    "status"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "target": { "type": "string", "minLength": 1 },
+    "baseHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "effectClass": { "enum": ["clarification", "workflow", "authority", "security"] },
+    "rationale": { "type": "string", "minLength": 1 },
+    "typedDiff": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation", "path", "value"],
+        "properties": {
+          "operation": { "enum": ["add", "replace", "remove"] },
+          "path": { "type": "string", "pattern": "^/" },
+          "value": {}
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "replay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "cases"],
+      "properties": {
+        "status": { "enum": ["not-run", "passed", "failed"] },
+        "cases": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["pending", "approved", "rejected"] },
+        "reviewer": { "type": "string" }
+      }
+    },
+    "humanApproval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["required", "approved", "rejected"] },
+        "approvedBy": { "type": "string" },
+        "approvedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "status": { "enum": ["candidate", "validated", "approved", "rejected", "superseded"] }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "validated" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "replay": {
+            "properties": {
+              "status": { "const": "passed" },
+              "cases": { "type": "integer", "minimum": 1 }
+            }
+          },
+          "review": {
+            "required": ["status", "reviewer"],
+            "properties": {
+              "status": { "const": "approved" },
+              "reviewer": { "type": "string", "minLength": 1 }
+            }
+          },
+          "humanApproval": {
+            "properties": { "status": { "const": "required" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "const": "approved" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "replay": {
+            "properties": {
+              "status": { "const": "passed" },
+              "cases": { "type": "integer", "minimum": 1 }
+            }
+          },
+          "review": {
+            "required": ["status", "reviewer"],
+            "properties": {
+              "status": { "const": "approved" },
+              "reviewer": { "type": "string", "minLength": 1 }
+            }
+          },
+          "humanApproval": {
+            "required": ["status", "approvedBy", "approvedAt"],
+            "properties": {
+              "status": { "const": "approved" },
+              "approvedBy": { "type": "string", "minLength": 1 },
+              "approvedAt": { "type": "string", "format": "date-time" }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

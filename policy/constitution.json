@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "policyId": "supervised-worker-default",
+  "version": "0.1.0-alpha.1",
+  "description": "Non-learnable safety and release constraints for the Supervised Worker plugin.",
+  "immutableRules": [
+    {
+      "id": "SW-C001",
+      "rule": "A failed, partial, truncated, or unavailable authority must never be represented as an empty result."
+    },
+    {
+      "id": "SW-C002",
+      "rule": "Learned state cannot grant tools, widen scope, weaken policy, satisfy evidence gates, or attest completion."
+    },
+    {
+      "id": "SW-C003",
+      "rule": "Destructive production-data operations and access to live production systems require explicit human authority."
+    },
+    {
+      "id": "SW-C004",
+      "rule": "Security, privacy, authorization, consensus, audit, and safety controls cannot be weakened by delegated or learned decisions."
+    },
+    {
+      "id": "SW-C005",
+      "rule": "Public or persisted compatibility cannot be broken without an explicit, tested migration path."
+    },
+    {
+      "id": "SW-C006",
+      "rule": "Source changes require focused validation and independent review before release evidence is accepted."
+    },
+    {
+      "id": "SW-C007",
+      "rule": "A queue is complete only after a fresh complete enumeration proves zero actionable entries or every remainder is durably parked behind an allowed boundary."
+    },
+    {
+      "id": "SW-C008",
+      "rule": "Policy changes proposed by learning require replay validation, independent review, and explicit human approval."
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "supervised-worker",
+  "version": "0.1.0-alpha.1",
+  "description": "Evidence-gated queue execution and durable completion checks for GitHub Copilot.",
+  "author": {
+    "name": "Sean Galliher",
+    "url": "https://github.com/seangalliher"
+  },
+  "homepage": "https://github.com/seangalliher/supervised-worker",
+  "repository": "https://github.com/seangalliher/supervised-worker",
+  "license": "Apache-2.0",
+  "keywords": [
+    "agent-governance",
+    "backlog",
+    "github-copilot",
+    "queue-execution"
+  ]
+}

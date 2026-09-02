@@ -1,0 +1,184 @@
+# Supervised Worker
+
+Evidence-gated queue execution for GitHub Copilot.
+
+Supervised Worker is a small Agent Plugins 1.0 package that helps an existing
+GitHub Copilot agent finish a bounded task or authenticated issue queue without
+mistaking activity for completion. Copilot still plans, edits, runs tools, and
+reasons. This plugin supplies durable state, queue semantics, review discipline,
+metadata-only lifecycle records, and a bounded completion gate.
+
+> Status: `0.1.0-alpha.1`. Suitable for local evaluation in trusted
+> repositories. It is not yet a security boundary or an unattended production
+> scheduler.
+
+## Why It Exists
+
+Long-running coding sessions commonly fail between otherwise-correct steps:
+
+- one completed issue is reported as a completed backlog;
+- a failed enumeration is mistaken for an empty queue;
+- an architecture decision is needlessly returned to the user;
+- a reviewer validates the changed component but not its consumer;
+- passing test output disappears with a temporary worktree;
+- the pushed commit differs from the reviewed commit;
+- useful lessons remain trapped in one conversation.
+
+Supervised Worker makes those transitions explicit and inspectable.
+
+## What It Provides
+
+- A `Supervised Worker` custom agent.
+- A `governed-queue` skill with a durable plan and banking contract.
+- Cross-platform lifecycle hooks for recovery, metadata-only run ledgers,
+  compaction markers, plan ownership, and bounded Stop enforcement.
+- A runtime-dependency-free Node helper with repository validation and plan status.
+- Constitutional policy and schemas for future evidence-gated learning. The
+  alpha does not yet capture outcome episodes or activate learned procedures.
+
+## Product Boundary
+
+Supervised Worker is a governance layer, not a coding runtime. It does not ship
+an LLM client, execute an autonomous model loop, poll trackers in a daemon,
+manage a worktree fleet, or replace GitHub Copilot.
+
+The alpha helper records only lifecycle and tool-result metadata. It does not
+store prompts, command arguments, source code, or tool output.
+
+## Local Evaluation
+
+Requirements:
+
+- GitHub Copilot CLI 1.0.74 or newer for Agent Plugins v1 manifest support,
+  the custom agent, and lifecycle hooks
+- An Agent Plugins 1.0 host can load the portable `governed-queue` skill
+- Node.js 20 or newer for the alpha helper
+- PowerShell 7 or newer (`pwsh`) when running Copilot CLI on Windows
+- Git for normal coding workflows
+
+Clone and validate:
+
+```bash
+git clone https://github.com/seangalliher/supervised-worker.git
+cd supervised-worker
+npm ci
+npm test
+npm run validate
+```
+
+Load the checkout directly in a supported Copilot CLI:
+
+```bash
+copilot --plugin-dir=/absolute/path/to/supervised-worker --agent=supervised-worker
+```
+
+From an interactive Copilot CLI session, a GitHub-hosted plugin can also be
+installed with:
+
+```text
+/plugin install https://github.com/seangalliher/supervised-worker
+```
+
+The immutable release and marketplace installation path will be documented when
+the first public alpha is tagged.
+
+## Durable Plan
+
+For a queue or multi-step task, the agent creates:
+
+```text
+.supervised-worker/
+|-- plan.json
+|-- runs/
+`-- runtime/
+```
+
+Keep this directory untracked. `plan.json` is the durable source of current work
+and completion evidence. Run ledgers contain hashes, event names, tool names,
+success flags, and counters, but no raw tool payloads.
+
+The session that creates or updates `plan.json` through a file-editing tool is
+attached to the plan. Other Copilot sessions in the repository remain inert:
+they are not logged and their Stop events are not blocked.
+
+See [the active example](examples/plan.active.json), [the complete
+example](examples/plan.complete.json), and [the plan schema](schemas/plan.schema.json).
+
+## Commands
+
+Run these from the plugin checkout during development:
+
+```bash
+npm run validate
+npm test
+npm run doctor
+node src/cli.mjs status
+```
+
+`doctor` validates the package and reports durable plan state for the current
+directory. The lifecycle host invokes `hook EVENT` automatically.
+
+If a prior attached session is known to be stale, run the helper from the target
+repository, not the plugin checkout:
+
+```bash
+node /absolute/path/to/supervised-worker/src/cli.mjs release
+```
+
+This is an explicit recovery operation. Do not release an attachment while its
+owning session is still active.
+
+## Completion Gate
+
+The Stop hook is inert when no durable plan exists. For an active incomplete
+plan it:
+
+1. blocks the initial stop;
+2. blocks one unchanged continuation and tells the agent it is the final bounded
+  attempt before release;
+3. then releases rather than looping forever and attempts to record
+  `completion_unverified_release` before detaching.
+
+Progress changes reset the stagnant-block count, subject to a total per-session
+cap. A mechanically complete plan must contain a complete authenticated
+enumeration with zero actionable entries and at least one evidence reference.
+If the final ledger write fails, release still occurs because an unavailable
+ledger must not turn a bounded reliability control into an infinite loop. The
+preceding blocked continuation is the portable visible warning.
+
+This is a reliability control, not a defense against a malicious process running
+as the same operating-system user.
+
+## Learning Direction
+
+Recursive improvement is deliberately proposal-gated:
+
+```text
+typed episodes -> candidate lessons -> shadow procedures -> advisory procedures
+                                      `-> policy patch proposals -> human approval
+```
+
+Learned procedures can recommend ordering and checks. They cannot grant tools,
+widen scope, waive review, satisfy evidence gates, or rewrite installed policy.
+Human corrections suspend conflicting advice. See [Architecture](docs/architecture.md)
+and [Roadmap](docs/roadmap.md).
+
+## Origins
+
+This project is a standalone spin-off of the operating discipline developed
+while building [ProbOS](https://github.com/seangalliher/ProbOS). It has no ProbOS
+runtime dependency and does not copy ProbOS application code.
+
+It also learns from the public patterns demonstrated by Planning with Files,
+OpenAI Symphony, Ralph, Foreman, and Agent Orchestrator. Their product surfaces
+remain distinct; this project focuses on evidence-gated queue governance.
+
+## Security And Privacy
+
+Read [SECURITY.md](SECURITY.md) before using the plugin on sensitive code. Issue
+bodies, comments, repository files, tool output, and remembered episodes are
+untrusted inputs. Do not enable raw content capture merely to improve learning.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

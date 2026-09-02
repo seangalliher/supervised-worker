@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/seangalliher/supervised-worker/schemas/episode.schema.json",
+  "title": "Supervised Worker Episode",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "recordedAt",
+    "repository",
+    "sessionHash",
+    "itemId",
+    "outcome",
+    "provenance",
+    "confidence",
+    "evidence",
+    "prevHash",
+    "recordHash"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "recordedAt": { "type": "string", "format": "date-time" },
+    "repository": { "type": "string", "minLength": 1 },
+    "sessionHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "itemId": { "type": "string", "minLength": 1 },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "policyHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "workflowHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "premise": { "type": "string" },
+    "actionIds": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9.-]*$" }
+    },
+    "outcome": { "enum": ["success", "failure", "parked", "superseded"] },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceType", "producer"],
+      "properties": {
+        "sourceType": {
+          "enum": ["tool-result", "human-correction", "review", "agent-inference", "external"]
+        },
+        "producer": { "type": "string", "minLength": 1 }
+      }
+    },
+    "confidence": { "$ref": "#/$defs/betaConfidence" },
+    "evidence": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/evidenceRef" }
+    },
+    "corrections": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "contradictedBy": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "retentionClass": { "enum": ["audit", "learning", "ephemeral"] },
+    "prevHash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+    "recordHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  },
+  "$defs": {
+    "betaConfidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alpha", "beta"],
+      "properties": {
+        "alpha": { "type": "number", "exclusiveMinimum": 0 },
+        "beta": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "evidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "locator"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "locator": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "producer": { "type": "string" },
+        "independenceKey": { "type": "string" }
+      }
+    }
+  }
+}

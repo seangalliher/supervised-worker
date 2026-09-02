@@ -1,0 +1,292 @@
+import { readFileSync, readdirSync } from "node:fs";
+import path from "node:path";
+
+import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
+import { parseDocument } from "yaml";
+
+const PLUGIN_SCHEMA_ID = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
+const PLUGIN_KEYS = new Set([
+  "$schema",
+  "name",
+  "version",
+  "description",
+  "author",
+  "homepage",
+  "repository",
+  "license",
+  "keywords",
+  "extensions",
+]);
+const SKILL_KEYS = new Set([
+  "name",
+  "description",
+  "license",
+  "compatibility",
+  "metadata",
+  "allowed-tools",
+]);
+const SCHEMA_FILES = [
+  "episode.schema.json",
+  "plan.schema.json",
+  "policy-proposal.schema.json",
+  "procedure.schema.json",
+  "workflow.schema.json",
+];
+const EXAMPLE_SCHEMAS = [
+  ["examples/workflow.json", "workflow.schema.json"],
+  ["examples/plan.active.json", "plan.schema.json"],
+  ["examples/plan.complete.json", "plan.schema.json"],
+];
+
+function isRecord(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function readJson(root, relativePath) {
+  return JSON.parse(readFileSync(path.join(root, relativePath), "utf8"));
+}
+
+function formatAjvErrors(label, errors) {
+  return (errors ?? []).map(
+    (error) => `${label}${error.instancePath || "/"} ${error.message ?? error.keyword}`,
+  );
+}
+
+export function validatePluginManifest(plugin) {
+  const errors = [];
+  if (!isRecord(plugin)) return ["plugin.json must contain an object"];
+  for (const key of Object.keys(plugin)) {
+    if (!PLUGIN_KEYS.has(key)) errors.push(`plugin.json contains unknown property: ${key}`);
+  }
+  if (plugin.$schema !== PLUGIN_SCHEMA_ID) {
+    errors.push("plugin.json targets an unsupported Agent Plugins schema");
+  }
+  if (
+    typeof plugin.name !== "string" ||
+    plugin.name.length < 1 ||
+    plugin.name.length > 64 ||
+    !/^[a-z0-9](?!.*(?:--|\.\.))[a-z0-9.-]*[a-z0-9]$|^[a-z0-9]$/.test(plugin.name)
+  ) {
+    errors.push("plugin.json name violates Agent Plugins 1.0 constraints");
+  }
+  for (const key of ["version", "description", "homepage", "repository", "license"]) {
+    if (plugin[key] !== undefined && typeof plugin[key] !== "string") {
+      errors.push(`plugin.json ${key} must be a string`);
+    }
+  }
+  if (plugin.author !== undefined) {
+    if (!isRecord(plugin.author)) {
+      errors.push("plugin.json author must be an object");
+    } else {
+      for (const [key, value] of Object.entries(plugin.author)) {
+        if (!["name", "email", "url"].includes(key)) {
+          errors.push(`plugin.json author contains unknown property: ${key}`);
+        } else if (typeof value !== "string") {
+          errors.push(`plugin.json author.${key} must be a string`);
+        }
+      }
+    }
+  }
+  if (
+    plugin.keywords !== undefined &&
+    (!Array.isArray(plugin.keywords) || plugin.keywords.some((value) => typeof value !== "string"))
+  ) {
+    errors.push("plugin.json keywords must be an array of strings");
+  }
+  if (plugin.extensions !== undefined) {
+    if (!isRecord(plugin.extensions)) {
+      errors.push("plugin.json extensions must be an object");
+    } else if (Object.values(plugin.extensions).some((value) => !isRecord(value))) {
+      errors.push("plugin.json extension values must be objects");
+    }
+  }
+  return errors;
+}
+
+export function validateSkillDocument(text, directoryName) {
+  const errors = [];
+  const frontmatter = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
+  if (!frontmatter) return [`skills/${directoryName}/SKILL.md has no YAML frontmatter`];
+  const document = parseDocument(frontmatter[1], { uniqueKeys: true });
+  if (document.errors.length > 0) {
+    return document.errors.map(
+      (error) => `skills/${directoryName}/SKILL.md has invalid YAML: ${error.message}`,
+    );
+  }
+  const metadata = document.toJS();
+  if (!isRecord(metadata)) return [`skills/${directoryName}/SKILL.md frontmatter must be a map`];
+  for (const key of Object.keys(metadata)) {
+    if (!SKILL_KEYS.has(key)) {
+      errors.push(`skills/${directoryName}/SKILL.md contains unsupported field: ${key}`);
+    }
+  }
+  if (
+    typeof metadata.name !== "string" ||
+    metadata.name.length < 1 ||
+    metadata.name.length > 64 ||
+    !/^(?!.*--)[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(metadata.name)
+  ) {
+    errors.push(`skills/${directoryName}/SKILL.md name violates Agent Skills constraints`);
+  } else if (metadata.name !== directoryName) {
+    errors.push(`skills/${directoryName}/SKILL.md name must match its directory`);
+  }
+  if (
+    typeof metadata.description !== "string" ||
+    metadata.description.length < 1 ||
+    metadata.description.length > 1_024
+  ) {
+    errors.push(`skills/${directoryName}/SKILL.md description must contain 1-1024 characters`);
+  }
+  if (metadata.license !== undefined && typeof metadata.license !== "string") {
+    errors.push(`skills/${directoryName}/SKILL.md license must be a string`);
+  }
+  if (
+    metadata.compatibility !== undefined &&
+    (typeof metadata.compatibility !== "string" ||
+      metadata.compatibility.length < 1 ||
+      metadata.compatibility.length > 500)
+  ) {
+    errors.push(`skills/${directoryName}/SKILL.md compatibility must contain 1-500 characters`);
+  }
+  if (metadata.metadata !== undefined) {
+    if (!isRecord(metadata.metadata)) {
+      errors.push(`skills/${directoryName}/SKILL.md metadata must be a map`);
+    } else if (Object.values(metadata.metadata).some((value) => typeof value !== "string")) {
+      errors.push(`skills/${directoryName}/SKILL.md metadata values must be strings`);
+    }
+  }
+  if (metadata["allowed-tools"] !== undefined && typeof metadata["allowed-tools"] !== "string") {
+    errors.push(`skills/${directoryName}/SKILL.md allowed-tools must be a string`);
+  }
+  return errors;
+}
+
+function approvedPolicyProposal() {
+  return {
+    schemaVersion: 1,
+    id: "proposal-1",
+    target: "policy/constitution.json",
+    baseHash: "a".repeat(64),
+    effectClass: "workflow",
+    rationale: "Verified change",
+    typedDiff: [{ operation: "replace", path: "/rule", value: "new value" }],
+    evidence: ["evaluation-1"],
+    replay: { status: "passed", cases: 1 },
+    review: { status: "approved", reviewer: "independent-reviewer" },
+    humanApproval: {
+      status: "approved",
+      approvedBy: "human-owner",
+      approvedAt: "2026-09-01T00:00:00Z",
+    },
+    status: "approved",
+  };
+}
+
+function validatePolicyGates(validate, errors) {
+  const baseline = approvedPolicyProposal();
+  if (!validate(baseline)) {
+    errors.push(...formatAjvErrors("policy-proposal valid baseline", validate.errors));
+    return;
+  }
+  const mutants = [
+    ["empty typedDiff", (value) => { value.typedDiff = []; }],
+    ["replay not passed", (value) => { value.replay = { status: "not-run", cases: 0 }; }],
+    ["review not approved", (value) => { value.review = { status: "pending" }; }],
+    ["human approval absent", (value) => { value.humanApproval = { status: "required" }; }],
+  ];
+  for (const [name, mutate] of mutants) {
+    const value = structuredClone(baseline);
+    mutate(value);
+    if (validate(value)) errors.push(`policy-proposal schema accepted unsafe state: ${name}`);
+  }
+}
+
+function validateWorkflowGates(validate, workflow, errors) {
+  for (const field of ["required", "independent"]) {
+    const value = structuredClone(workflow);
+    value.review[field] = false;
+    if (validate(value)) errors.push(`workflow schema permits review.${field}=false`);
+  }
+}
+
+export function validatePublishedSchemas(root) {
+  const errors = [];
+  const discovered = readdirSync(path.join(root, "schemas"))
+    .filter((name) => name.endsWith(".schema.json"))
+    .sort();
+  if (JSON.stringify(discovered) !== JSON.stringify(SCHEMA_FILES)) {
+    errors.push(`expected exactly these published schemas: ${SCHEMA_FILES.join(", ")}`);
+    return errors;
+  }
+
+  const ajv = new Ajv2020({
+    allErrors: true,
+    strictSchema: true,
+    strictTypes: false,
+    strictRequired: false,
+  });
+  addFormats(ajv);
+  const schemas = new Map();
+  for (const fileName of SCHEMA_FILES) {
+    try {
+      const schema = readJson(root, `schemas/${fileName}`);
+      if (!ajv.validateSchema(schema)) {
+        errors.push(...formatAjvErrors(`schemas/${fileName}`, ajv.errors));
+        continue;
+      }
+      ajv.addSchema(schema);
+      schemas.set(fileName, schema.$id);
+    } catch (error) {
+      errors.push(`schemas/${fileName} could not be compiled: ${error.message}`);
+    }
+  }
+
+  for (const [examplePath, schemaFile] of EXAMPLE_SCHEMAS) {
+    const schemaId = schemas.get(schemaFile);
+    const validate = schemaId ? ajv.getSchema(schemaId) : null;
+    if (!validate) {
+      errors.push(`${examplePath} has no compiled schema`);
+      continue;
+    }
+    try {
+      const example = readJson(root, examplePath);
+      if (!validate(example)) errors.push(...formatAjvErrors(examplePath, validate.errors));
+    } catch (error) {
+      errors.push(`${examplePath} could not be validated: ${error.message}`);
+    }
+  }
+
+  const policySchemaId = schemas.get("policy-proposal.schema.json");
+  const policyValidate = policySchemaId ? ajv.getSchema(policySchemaId) : null;
+  if (policyValidate) validatePolicyGates(policyValidate, errors);
+  else errors.push("policy-proposal schema safety gates could not be exercised");
+  const workflowSchemaId = schemas.get("workflow.schema.json");
+  const workflowValidate = workflowSchemaId ? ajv.getSchema(workflowSchemaId) : null;
+  if (workflowValidate) {
+    validateWorkflowGates(workflowValidate, readJson(root, "examples/workflow.json"), errors);
+  } else errors.push("workflow schema review gates could not be exercised");
+  return errors;
+}
+
+export function validateStandards(root) {
+  const errors = [];
+  try {
+    errors.push(...validatePluginManifest(readJson(root, "plugin.json")));
+  } catch (error) {
+    errors.push(`plugin.json could not be validated: ${error.message}`);
+  }
+
+  const skillsRoot = path.join(root, "skills");
+  for (const entry of readdirSync(skillsRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const skillPath = path.join(skillsRoot, entry.name, "SKILL.md");
+    try {
+      errors.push(...validateSkillDocument(readFileSync(skillPath, "utf8"), entry.name));
+    } catch (error) {
+      errors.push(`skills/${entry.name}/SKILL.md could not be validated: ${error.message}`);
+    }
+  }
+  errors.push(...validatePublishedSchemas(root));
+  return errors;
+}

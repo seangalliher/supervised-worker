@@ -1,0 +1,20 @@
+{
+  "name": "supervised-worker",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "description": "Development and validation tooling for the Supervised Worker GitHub Copilot plugin.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "doctor": "node src/cli.mjs doctor",
+    "test": "node --test",
+    "validate": "node src/cli.mjs validate"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "yaml": "2.9.0"
+  }
+}

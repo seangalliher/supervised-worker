@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "tracker": {
+    "kind": "github",
+    "scope": "owner/repository",
+    "query": "is:issue is:open"
+  },
+  "wip": {
+    "maxActive": 1,
+    "maxCoupled": 3
+  },
+  "authority": {
+    "mode": "supervised",
+    "boundaries": [
+      "live production access",
+      "destructive production data",
+      "security or privacy weakening",
+      "unmigrated compatibility break",
+      "new spending or credentials",
+      "unresolved critical or high risk"
+    ]
+  },
+  "validation": {
+    "focused": "replace with the repository's focused test command",
+    "broad": "replace with the repository's frozen broad gate",
+    "receiptGlobs": []
+  },
+  "review": {
+    "required": true,
+    "independent": true,
+    "agent": "code-review"
+  },
+  "filing": {
+    "maximumNewPerClosures": 1,
+    "closureDenominator": 3
+  }
+}

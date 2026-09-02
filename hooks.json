@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "bash": "node \"${PLUGIN_ROOT}/src/cli.mjs\" hook SessionStart",
+        "powershell": "node \"$env:PLUGIN_ROOT/src/cli.mjs\" hook SessionStart",
+        "timeoutSec": 5
+      }
+    ],
+    "PreToolUse": [
+      {
+        "type": "command",
+        "matcher": "Write|Edit|create|edit|apply_patch|create_file|str_replace_editor|insert|insert_edit_into_file|replace_string_in_file|multi_replace_string_in_file",
+        "bash": "node \"${PLUGIN_ROOT}/src/cli.mjs\" hook PreToolUse",
+        "powershell": "node \"$env:PLUGIN_ROOT/src/cli.mjs\" hook PreToolUse",
+        "timeoutSec": 5
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "bash": "node \"${PLUGIN_ROOT}/src/cli.mjs\" hook PostToolUse",
+        "powershell": "node \"$env:PLUGIN_ROOT/src/cli.mjs\" hook PostToolUse",
+        "timeoutSec": 5
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "type": "command",
+        "bash": "node \"${PLUGIN_ROOT}/src/cli.mjs\" hook PostToolUseFailure",
+        "powershell": "node \"$env:PLUGIN_ROOT/src/cli.mjs\" hook PostToolUseFailure",
+        "timeoutSec": 5
+      }
+    ],
+    "PreCompact": [
+      {
+        "type": "command",
+        "bash": "node \"${PLUGIN_ROOT}/src/cli.mjs\" hook PreCompact",
+        "powershell": "node \"$env:PLUGIN_ROOT/src/cli.mjs\" hook PreCompact",
+        "timeoutSec": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "bash": "node \"${PLUGIN_ROOT}/src/cli.mjs\" hook Stop",
+        "powershell": "node \"$env:PLUGIN_ROOT/src/cli.mjs\" hook Stop",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "mode": "complete",
+  "goal": "Complete the authenticated issue queue.",
+  "items": [
+    {
+      "id": "issue-123",
+      "title": "Example bounded item",
+      "status": "banked"
+    }
+  ],
+  "completion": {
+    "enumeration": {
+      "status": "complete",
+      "source": "Authenticated GitHub issue enumeration for owner/repository",
+      "checkedAt": "2026-09-01T00:00:00Z",
+      "remainingActionable": 0
+    },
+    "evidence": [
+      {
+        "kind": "gate-receipt",
+        "locator": "logs/gates/example-receipt.json"
+      }
+    ]
+  }
+}

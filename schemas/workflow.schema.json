@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/seangalliher/supervised-worker/schemas/workflow.schema.json",
+  "title": "Supervised Worker Workflow",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "tracker", "wip", "authority", "validation", "review"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "tracker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "scope"],
+      "properties": {
+        "kind": { "enum": ["github"] },
+        "scope": { "type": "string", "minLength": 3 },
+        "query": { "type": "string", "default": "is:issue is:open" }
+      }
+    },
+    "wip": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxActive", "maxCoupled"],
+      "properties": {
+        "maxActive": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "maxCoupled": { "type": "integer", "minimum": 1, "maximum": 3 }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "boundaries"],
+      "properties": {
+        "mode": { "enum": ["supervised", "delegated"] },
+        "boundaries": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["focused", "broad"],
+      "properties": {
+        "focused": { "type": "string", "minLength": 1 },
+        "broad": { "type": "string", "minLength": 1 },
+        "receiptGlobs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "independent"],
+      "properties": {
+        "required": { "const": true },
+        "independent": { "const": true },
+        "agent": { "type": "string", "minLength": 1 }
+      }
+    },
+    "filing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maximumNewPerClosures": { "type": "integer", "minimum": 0 },
+        "closureDenominator": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}
