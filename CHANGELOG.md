@@ -10,10 +10,18 @@
 	and direct Git-metadata edit guards.
 - Hardened protected paths against junctions, device namespaces, hard links,
 	mapped-drive aliases, case-only renames, and dangling links.
+- Compared resolved workspace prefixes by filesystem identity, accepting aliases
+	that identify the same directory while rejecting distinct case-sensitive roots,
+	redirected handoff roots, item directories, identity substitution, and
+	hard-linked artifacts.
 - Bound every contract-required check to the exact staged tree tested before
 	review.
-- Preserved the established `supervised-worker` selector, added
-	publisher-qualified companion IDs, and added a host-provenance preflight for
+- Added the preferred `seangalliher-supervised-worker` selector while preserving
+	the established `supervised-worker` compatibility selector, and enforced policy
+	parity between them.
+- Admitted both Worker selector identities as build-contract and build-report
+	producers across the published schema, runtime validator, and all CLI gates.
+- Added publisher-qualified companion IDs and a host-provenance preflight for
 	first-found-wins agent resolution.
 - Kept queue state, release actions, staging, and provider closure under the
 	Supervised Worker's sole authority.

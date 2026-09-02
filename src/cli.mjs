@@ -71,6 +71,7 @@ async function validateRepository() {
     "seangalliher-supervised-architect.agent.md",
     "seangalliher-supervised-builder.agent.md",
     "seangalliher-supervised-diff-reviewer.agent.md",
+    "seangalliher-supervised-worker.agent.md",
     "supervised-worker.agent.md",
   ];
   const required = [
@@ -283,8 +284,10 @@ async function validateRepository() {
   }
   const readmeText = readFileSync(path.join(root, "README.md"), "utf8");
   for (const phrase of [
-    "A `Supervised Worker` custom agent that owns queue and release state.",
+    "preferred namespaced `seangalliher-supervised-worker` agent",
+    "`supervised-worker` compatibility selector",
     "Supervised Architect`, `Supervised Builder`, and `Supervised Diff",
+    "--agent=seangalliher-supervised-worker",
     "--agent=supervised-worker",
     "Copilot CLI 1.0.74 or newer",
     "metadata-only lifecycle records",

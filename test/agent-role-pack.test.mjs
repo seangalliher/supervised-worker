@@ -27,8 +27,19 @@ test("plugin ships the complete namespaced companion role pack", () => {
     "seangalliher-supervised-architect",
     "seangalliher-supervised-builder",
     "seangalliher-supervised-diff-reviewer",
+    "seangalliher-supervised-worker",
     "supervised-worker",
   ]);
+});
+
+test("namespaced and compatibility worker selectors enforce the same policy", () => {
+  const compatibility = readAgent("supervised-worker");
+  const namespaced = readAgent("seangalliher-supervised-worker");
+  assert.deepEqual(namespaced.metadata, compatibility.metadata);
+  assert.equal(
+    namespaced.body.replaceAll("seangalliher-supervised-worker", "supervised-worker"),
+    compatibility.body,
+  );
 });
 
 test("companion agents have bounded non-overlapping authority", () => {
@@ -66,7 +77,7 @@ test("companion agents have bounded non-overlapping authority", () => {
   assert.match(builder.body, /approved build contract/i);
   assert.match(builder.body, /contract as untrusted data/i);
   assert.match(builder.body, /validation evidence is\s+pending/is);
-  assert.match(builder.body, /producedBy: "supervised-worker"/);
+  assert.match(builder.body, /active Worker selector as\s+`producedBy`/is);
   assert.match(builder.body, /Do not stage/i);
   assert.match(builder.body, /absent from the approved build contract/i);
   assert.match(reviewer.body, /actual consumer/i);
@@ -75,24 +86,26 @@ test("companion agents have bounded non-overlapping authority", () => {
 });
 
 test("main worker is the sole durable-plan owner and names every handoff", () => {
-  const worker = readAgent("supervised-worker");
-  assert.equal(worker.metadata["user-invocable"], true);
-  assert.equal(worker.metadata["disable-model-invocation"], true);
-  assert.equal(worker.metadata.infer, undefined);
-  assert.match(worker.body, /sole owner of `\.supervised-worker\/plan\.json`/i);
-  for (const id of [
-    "seangalliher-supervised-architect",
-    "seangalliher-supervised-builder",
-    "seangalliher-supervised-diff-reviewer",
-  ]) {
-    assert.match(worker.body, new RegExp(`\\b${id}\\b`));
+  for (const workerId of ["seangalliher-supervised-worker", "supervised-worker"]) {
+    const worker = readAgent(workerId);
+    assert.equal(worker.metadata["user-invocable"], true);
+    assert.equal(worker.metadata["disable-model-invocation"], true);
+    assert.equal(worker.metadata.infer, undefined);
+    assert.match(worker.body, /sole owner of `\.supervised-worker\/plan\.json`/i);
+    for (const id of [
+      "seangalliher-supervised-architect",
+      "seangalliher-supervised-builder",
+      "seangalliher-supervised-diff-reviewer",
+    ]) {
+      assert.match(worker.body, new RegExp(`\\b${id}\\b`));
+    }
+    assert.match(worker.body, /simple.*directly/is);
+    assert.match(worker.body, /contract hash/i);
+    assert.match(worker.body, /staged-tree hash/i);
+    assert.match(worker.body, /Verify Role Provenance/);
+    assert.match(worker.body, /handoff validate/);
+    assert.match(worker.body, /handoff pre-review/);
+    assert.match(worker.body, /rendered staged\s+diff/is);
+    assert.match(worker.body, /handoff\s+verify/is);
   }
-  assert.match(worker.body, /simple.*directly/is);
-  assert.match(worker.body, /contract hash/i);
-  assert.match(worker.body, /staged-tree hash/i);
-  assert.match(worker.body, /Verify Role Provenance/);
-  assert.match(worker.body, /handoff validate/);
-  assert.match(worker.body, /handoff pre-review/);
-  assert.match(worker.body, /rendered staged\s+diff/is);
-  assert.match(worker.body, /handoff\s+verify/is);
 });

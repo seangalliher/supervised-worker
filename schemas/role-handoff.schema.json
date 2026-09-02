@@ -132,7 +132,11 @@
         "kind": { "const": "build-contract" },
         "itemId": { "$ref": "#/$defs/nonBlank" },
         "producedBy": {
-          "enum": ["supervised-worker", "seangalliher-supervised-architect"]
+          "enum": [
+            "supervised-worker",
+            "seangalliher-supervised-worker",
+            "seangalliher-supervised-architect"
+          ]
         },
         "createdAt": { "type": "string", "format": "date-time" },
         "status": { "enum": ["approved", "escalation-required"] },
@@ -250,7 +254,11 @@
         "kind": { "const": "build-report" },
         "itemId": { "$ref": "#/$defs/nonBlank" },
         "producedBy": {
-          "enum": ["supervised-worker", "seangalliher-supervised-builder"]
+          "enum": [
+            "supervised-worker",
+            "seangalliher-supervised-worker",
+            "seangalliher-supervised-builder"
+          ]
         },
         "createdAt": { "type": "string", "format": "date-time" },
         "status": { "enum": ["implemented", "blocked"] },

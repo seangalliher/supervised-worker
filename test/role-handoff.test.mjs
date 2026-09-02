@@ -44,17 +44,18 @@ test("all role handoff examples validate", () => {
   }
 });
 
-test("stable Worker producer identity remains backward compatible", () => {
+test("both Worker selector identities produce valid handoffs", () => {
   const contract = clone(readJson("examples/handoff.build-contract.json"));
-  contract.producedBy = "supervised-worker";
-  assertValid(contract, "Worker-authored contract");
-
   const build = clone(readJson("examples/handoff.build-report.json"));
-  build.producedBy = "supervised-worker";
-  assertValid(build, "Worker-authored build report");
+  for (const producer of ["supervised-worker", "seangalliher-supervised-worker"]) {
+    contract.producedBy = producer;
+    assertValid(contract, `${producer} contract`);
+    build.producedBy = producer;
+    assertValid(build, `${producer} build report`);
+  }
 
-  contract.producedBy = "seangalliher-supervised-worker";
-  assertInvalid(contract, "nonexistent qualified Worker producer");
+  contract.producedBy = "other-worker";
+  assertInvalid(contract, "unknown Worker producer");
 });
 
 test("escalation blocked-build and changes-required branches validate", () => {

@@ -28,7 +28,8 @@ Supervised Worker makes those transitions explicit and inspectable.
 
 ## What It Provides
 
-- A `Supervised Worker` custom agent that owns queue and release state.
+- A preferred namespaced `seangalliher-supervised-worker` agent that owns queue
+  and release state, plus the established `supervised-worker` compatibility selector.
 - Namespaced `Supervised Architect`, `Supervised Builder`, and `Supervised Diff
   Reviewer` companion agents with non-overlapping authority.
 - A `governed-queue` skill with a durable plan and banking contract.
@@ -81,8 +82,10 @@ the frozen staged-tree hash. The agents do not pin model names. A different
 reviewer model family is preferred when available, but context isolation is the
 required independence boundary.
 
-The established main ID remains `supervised-worker` for backward compatibility;
-new companion IDs use the `seangalliher-supervised-*` publisher prefix to reduce
+The preferred main ID is `seangalliher-supervised-worker`; the established
+`supervised-worker` ID remains available for backward compatibility. Both enforce
+the same policy, with selector-specific provenance and `producedBy` identity.
+All new IDs use the `seangalliher-supervised-*` publisher prefix to reduce
 accidental collisions. GitHub Copilot uses first-found-wins precedence, so a
 project or user agent can still shadow any plugin agent with the same filename.
 Before a governed run, inspect `/env` and verify the selected agent is sourced
@@ -113,8 +116,10 @@ npm run validate
 Load the checkout directly in a supported Copilot CLI:
 
 ```bash
-copilot --plugin-dir=/absolute/path/to/supervised-worker --agent=supervised-worker
+copilot --plugin-dir=/absolute/path/to/supervised-worker --agent=seangalliher-supervised-worker
 ```
+
+Existing integrations may continue using `--agent=supervised-worker`.
 
 From an interactive Copilot CLI session, a GitHub-hosted plugin can also be
 installed with:

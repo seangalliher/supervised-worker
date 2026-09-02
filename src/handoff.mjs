@@ -64,6 +64,26 @@ function isContained(rootPath, candidatePath) {
     (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 }
 
+export function directoryIdentityMatches(leftPath, rightPath, left, right) {
+  if (leftPath === rightPath) return true;
+  return (
+    left.isDirectory() &&
+    right.isDirectory() &&
+    left.ino !== 0n &&
+    left.dev === right.dev &&
+    left.ino === right.ino
+  );
+}
+
+function sameDirectoryIdentity(leftPath, rightPath) {
+  return directoryIdentityMatches(
+    leftPath,
+    rightPath,
+    lstatSync(leftPath, { bigint: true }),
+    lstatSync(rightPath, { bigint: true }),
+  );
+}
+
 function unknownKeys(value, allowed, label, errors) {
   if (!isRecord(value)) return;
   for (const key of Object.keys(value)) {
@@ -215,7 +235,11 @@ function validateBuildContract(value, workspace) {
   validateCommon(
     value,
     "build-contract",
-    ["supervised-worker", "seangalliher-supervised-architect"],
+    [
+      "supervised-worker",
+      "seangalliher-supervised-worker",
+      "seangalliher-supervised-architect",
+    ],
     errors,
   );
   if (!["approved", "escalation-required"].includes(value.status)) {
@@ -295,7 +319,11 @@ function validateBuildReport(value, workspace) {
   validateCommon(
     value,
     "build-report",
-    ["supervised-worker", "seangalliher-supervised-builder"],
+    [
+      "supervised-worker",
+      "seangalliher-supervised-worker",
+      "seangalliher-supervised-builder",
+    ],
     errors,
   );
   if (!["implemented", "blocked"].includes(value.status)) errors.push("build-report status is invalid");
@@ -392,24 +420,88 @@ export function validateHandoffValue(value, workspace = process.cwd()) {
 
 function assertSafeArtifactPath(workspace, filePath) {
   const workspacePath = path.resolve(workspace);
-  const handoffsPath = path.join(stateDirectory(workspacePath), "handoffs");
-  const resolved = path.resolve(workspacePath, filePath);
-  if (!isContained(handoffsPath, resolved)) throw new Error("handoff file is outside the handoff directory");
-  const relative = path.relative(handoffsPath, resolved).split(path.sep);
-  if (relative.length !== 2 || !HASH_RE.test(relative[0]) || !ARTIFACT_FILE_NAMES.has(relative[1])) {
+  const requestedPath = path.resolve(workspacePath, filePath);
+  let workspaceRealPath;
+  try {
+    workspaceRealPath = realpathSync(workspacePath);
+  } catch {
+    throw new Error("handoff workspace cannot be resolved safely");
+  }
+
+  const requestedItemPath = path.dirname(requestedPath);
+  const requestedHandoffsPath = path.dirname(requestedItemPath);
+  const requestedStatePath = path.dirname(requestedHandoffsPath);
+  const requestedWorkspacePrefix = path.dirname(requestedStatePath);
+  const requestedItemHash = path.basename(requestedItemPath);
+  const requestedFileName = path.basename(requestedPath);
+  if (
+    path.basename(requestedStatePath) !== ".supervised-worker" ||
+    path.basename(requestedHandoffsPath) !== "handoffs" ||
+    !HASH_RE.test(requestedItemHash) ||
+    !ARTIFACT_FILE_NAMES.has(requestedFileName)
+  ) {
     throw new Error("handoff file path must be handoffs/<item-hash>/<artifact-name>");
   }
-  let current = workspacePath;
-  for (const segment of path.relative(workspacePath, resolved).split(path.sep)) {
-    current = path.join(current, segment);
-    if (!existsSync(current)) throw new Error("handoff file does not exist");
-    const stats = lstatSync(current);
-    if (stats.isSymbolicLink()) throw new Error("handoff path contains a symbolic link or junction");
+  let requestedWorkspaceRealPath;
+  try {
+    requestedWorkspaceRealPath = realpathSync(requestedWorkspacePrefix);
+  } catch {
+    throw new Error("handoff path prefix cannot be resolved safely");
   }
-  const stats = lstatSync(resolved);
-  if (!stats.isFile()) throw new Error("handoff path is not a regular file");
+  if (!sameDirectoryIdentity(requestedWorkspaceRealPath, workspaceRealPath)) {
+    throw new Error("handoff path prefix does not identify the active workspace");
+  }
+
+  const statePath = path.join(workspaceRealPath, ".supervised-worker");
+  const handoffsPath = path.join(statePath, "handoffs");
+  const itemPath = path.join(handoffsPath, requestedItemHash);
+  const artifactPath = path.join(itemPath, requestedFileName);
+  for (const [candidate, kind] of [
+    [statePath, "directory"],
+    [handoffsPath, "directory"],
+    [itemPath, "directory"],
+    [artifactPath, "file"],
+  ]) {
+    let stats;
+    try {
+      stats = lstatSync(candidate);
+    } catch {
+      throw new Error("handoff file does not exist or cannot be resolved safely");
+    }
+    if (stats.isSymbolicLink()) {
+      throw new Error("handoff path contains a symbolic link or junction");
+    }
+    if (kind === "directory" && !stats.isDirectory()) {
+      throw new Error("handoff path component is not a directory");
+    }
+    if (kind === "file" && !stats.isFile()) {
+      throw new Error("handoff path is not a regular file");
+    }
+  }
+
+  let resolved;
+  let handoffsRealPath;
+  try {
+    resolved = realpathSync(requestedPath);
+    handoffsRealPath = realpathSync(handoffsPath);
+  } catch {
+    throw new Error("handoff file does not exist or cannot be resolved safely");
+  }
+  if (!isContained(handoffsRealPath, resolved)) {
+    throw new Error("handoff file is outside the handoff directory");
+  }
+  const resolvedRelative = path.relative(handoffsRealPath, resolved).split(path.sep);
+  if (
+    resolvedRelative.length !== 2 ||
+    resolvedRelative[0] !== requestedItemHash ||
+    resolvedRelative[1] !== requestedFileName
+  ) {
+    throw new Error("handoff resolved identity differs from the requested item and artifact");
+  }
+  const stats = lstatSync(artifactPath);
+  if (stats.nlink > 1) throw new Error("handoff artifact has multiple hard links");
   if (stats.size > MAX_HANDOFF_BYTES) throw new Error("handoff file exceeds the size limit");
-  return { resolved, itemHash: relative[0], fileName: relative[1] };
+  return { resolved, itemHash: requestedItemHash, fileName: requestedFileName };
 }
 
 function loadHandoffFile(workspace, filePath, expectedKind = null) {

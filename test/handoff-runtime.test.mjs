@@ -3,8 +3,10 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   mkdirSync,
   linkSync,
+  lstatSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -17,6 +19,7 @@ import { fileURLToPath } from "node:url";
 
 import { sha256 } from "../src/core.mjs";
 import {
+  directoryIdentityMatches,
   inspectHandoffFile,
   validateHandoffValue,
   validateRepositoryPath,
@@ -42,8 +45,7 @@ function git(cwd, ...args) {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
-function chainFixture() {
-  const cwd = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-handoff-"));
+function chainFixture(cwd = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-handoff-"))) {
   git(cwd, "init", "--quiet");
   mkdirSync(path.join(cwd, "src"), { recursive: true });
   writeFileSync(path.join(cwd, "src", "module.js"), "export const value = 1;\n");
@@ -108,6 +110,19 @@ test("runtime validates and hash-binds a complete staged handoff chain", () => {
     assert.equal(result.verdict, "clean");
     assert.equal(result.stagedTreeHash, git(cwd, "write-tree"));
   });
+});
+
+test("directory identity distinguishes aliases, distinct roots, and zero-inode filesystems", () => {
+  const stats = (dev, ino, directory = true) => ({
+    dev: BigInt(dev),
+    ino: BigInt(ino),
+    isDirectory: () => directory,
+  });
+  assert.equal(directoryIdentityMatches("C:\\Root", "C:\\Root", stats(1, 0), stats(2, 0)), true);
+  assert.equal(directoryIdentityMatches("C:\\Root", "c:\\root", stats(1, 42), stats(1, 42)), true);
+  assert.equal(directoryIdentityMatches("C:\\Root", "c:\\root", stats(1, 42), stats(1, 43)), false);
+  assert.equal(directoryIdentityMatches("C:\\Root", "c:\\root", stats(1, 0), stats(1, 0)), false);
+  assert.equal(directoryIdentityMatches("C:\\Root", "c:\\root", stats(1, 42, false), stats(1, 42)), false);
 });
 
 test("runtime rejects cross-item reports at the hashed directory boundary", () => {
@@ -499,5 +514,229 @@ test("CLI validates one artifact and verifies the complete chain", () => {
     );
     assert.equal(verified.status, 0, verified.stderr || verified.stdout);
     assert.equal(JSON.parse(verified.stdout).ok, true);
+  });
+});
+
+test("preferred Worker producer passes every CLI handoff gate", () => {
+  withFixture((fixture) => {
+    fixture.contract.producedBy = "seangalliher-supervised-worker";
+    const contractHash = writeJson(fixture.contractPath, fixture.contract);
+    fixture.build.producedBy = "seangalliher-supervised-worker";
+    fixture.build.contractHash = contractHash;
+    const buildHash = writeJson(fixture.buildPath, fixture.build);
+    fixture.review.contractHash = contractHash;
+    fixture.review.buildReportHash = buildHash;
+    writeJson(fixture.reviewPath, fixture.review);
+
+    for (const args of [
+      ["handoff", "validate", fixture.contractPath],
+      ["handoff", "pre-review", fixture.contractPath, fixture.buildPath],
+      ["handoff", "verify", fixture.contractPath, fixture.buildPath, fixture.reviewPath],
+    ]) {
+      const result = spawnSync(process.execPath, [cli, ...args], {
+        cwd: fixture.cwd,
+        encoding: "utf8",
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.equal(JSON.parse(result.stdout).ok, true);
+    }
+  });
+});
+
+test("CLI accepts a filesystem alias that resolves inside the handoff directory", () => {
+  withFixture(({ cwd, contractPath }) => {
+    const aliasParent = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-alias-parent-"));
+    const alias = path.join(aliasParent, "workspace-alias");
+    try {
+      symlinkSync(cwd, alias, process.platform === "win32" ? "junction" : "dir");
+      const aliasContract = path.join(alias, path.relative(cwd, contractPath));
+      const inspected = spawnSync(process.execPath, [cli, "handoff", "validate", aliasContract], {
+        cwd,
+        encoding: "utf8",
+      });
+      assert.equal(inspected.status, 0, inspected.stderr || inspected.stdout);
+      assert.equal(JSON.parse(inspected.stdout).ok, true);
+    } finally {
+      rmSync(aliasParent, { recursive: true, force: true });
+    }
+  });
+});
+
+test("CLI accepts a case-only alias for a normal Windows workspace", {
+  skip: process.platform !== "win32",
+}, () => {
+  withFixture(({ cwd, contractPath }) => {
+    const aliasRoot = path.join(path.dirname(cwd), path.basename(cwd).toUpperCase());
+    const canonicalStats = lstatSync(realpathSync(cwd), { bigint: true });
+    const aliasStats = lstatSync(realpathSync(aliasRoot), { bigint: true });
+    assert.notEqual(aliasRoot, cwd, "the alias spelling must differ");
+    assert.equal(aliasStats.dev, canonicalStats.dev, "the alias must stay on the same device");
+    assert.equal(aliasStats.ino, canonicalStats.ino, "the alias must identify the same directory");
+
+    const aliasContract = path.join(aliasRoot, path.relative(cwd, contractPath));
+    const result = spawnSync(process.execPath, [cli, "handoff", "validate", aliasContract], {
+      cwd,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(JSON.parse(result.stdout).ok, true);
+  });
+});
+
+test("CLI rejects an external handoff-root junction", () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-root-link-"));
+  const outside = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-root-outside-"));
+  try {
+    const contract = readJson("examples/handoff.build-contract.json");
+    const itemHash = sha256(contract.itemId);
+    const outsideItem = path.join(outside, itemHash);
+    writeJson(path.join(outsideItem, "build-contract.json"), contract);
+    const state = path.join(cwd, ".supervised-worker");
+    mkdirSync(state, { recursive: true });
+    symlinkSync(outside, path.join(state, "handoffs"), process.platform === "win32" ? "junction" : "dir");
+
+    const requested = path.join(state, "handoffs", itemHash, "build-contract.json");
+    const result = spawnSync(process.execPath, [cli, "handoff", "validate", requested], {
+      cwd,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(JSON.parse(result.stdout).errors.join("\n"), /symbolic link or junction/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("CLI rejects an item-hash junction to a sibling item", () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-item-link-"));
+  try {
+    const contract = readJson("examples/handoff.build-contract.json");
+    contract.itemId = "item-b";
+    const itemBHash = sha256(contract.itemId);
+    const itemAHash = sha256("item-a");
+    const handoffs = path.join(cwd, ".supervised-worker", "handoffs");
+    const itemB = path.join(handoffs, itemBHash);
+    writeJson(path.join(itemB, "build-contract.json"), contract);
+    symlinkSync(itemB, path.join(handoffs, itemAHash), process.platform === "win32" ? "junction" : "dir");
+
+    const requested = path.join(handoffs, itemAHash, "build-contract.json");
+    const result = spawnSync(process.execPath, [cli, "handoff", "validate", requested], {
+      cwd,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(JSON.parse(result.stdout).errors.join("\n"), /symbolic link or junction/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("all CLI gates reject an external exact-suffix item alias", () => {
+  withFixture(({ cwd, contractPath, buildPath, reviewPath }) => {
+    const outside = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-external-item-"));
+    try {
+      const itemHash = path.basename(path.dirname(contractPath));
+      const externalItem = path.join(outside, ".supervised-worker", "handoffs", itemHash);
+      mkdirSync(path.dirname(externalItem), { recursive: true });
+      symlinkSync(
+        path.dirname(contractPath),
+        externalItem,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      const externalContract = path.join(externalItem, "build-contract.json");
+      const externalBuild = path.join(externalItem, "build-report.json");
+      const externalReview = path.join(externalItem, "review-report.json");
+      for (const args of [
+        ["handoff", "validate", externalContract],
+        ["handoff", "pre-review", externalContract, externalBuild],
+        ["handoff", "verify", externalContract, externalBuild, externalReview],
+      ]) {
+        const result = spawnSync(process.execPath, [cli, ...args], { cwd, encoding: "utf8" });
+        assert.equal(result.status, 1, result.stderr);
+        assert.match(
+          JSON.parse(result.stdout).errors.join("\n"),
+          /prefix does not identify the active workspace/,
+        );
+      }
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+test("all CLI gates reject a case-distinct external workspace", {
+  skip: process.platform !== "win32",
+}, (context) => {
+  const parent = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-case-root-"));
+  try {
+    try {
+      execFileSync("fsutil", ["file", "setCaseSensitiveInfo", parent, "enable"]);
+    } catch (error) {
+      const reason = error.code ?? error.status ?? error.message;
+      context.skip(`per-directory case sensitivity is unavailable: ${reason}`);
+      return;
+    }
+    const active = path.join(parent, "Workspace");
+    const external = path.join(parent, "workspace");
+    mkdirSync(active);
+    mkdirSync(external);
+    const fixture = chainFixture(active);
+    const activeReal = realpathSync(active);
+    const externalReal = realpathSync(external);
+    assert.notEqual(activeReal, externalReal, "case-sensitive roots must be distinct");
+
+    const itemHash = path.basename(path.dirname(fixture.contractPath));
+    const externalItem = path.join(external, ".supervised-worker", "handoffs", itemHash);
+    const externalContract = structuredClone(fixture.contract);
+    externalContract.objective = "External contract must not be consumed";
+    const externalContractPath = path.join(externalItem, "build-contract.json");
+    const externalContractHash = writeJson(externalContractPath, externalContract);
+    assert.notEqual(
+      externalContractHash,
+      sha256(readFileSync(fixture.contractPath)),
+      "external and canonical contract bytes must differ",
+    );
+
+    const externalBuild = structuredClone(fixture.build);
+    externalBuild.contractHash = externalContractHash;
+    const externalBuildPath = path.join(externalItem, "build-report.json");
+    const externalBuildHash = writeJson(externalBuildPath, externalBuild);
+    const externalReview = structuredClone(fixture.review);
+    externalReview.contractHash = externalContractHash;
+    externalReview.buildReportHash = externalBuildHash;
+    const externalReviewPath = path.join(externalItem, "review-report.json");
+    writeJson(externalReviewPath, externalReview);
+
+    for (const args of [
+      ["handoff", "validate", externalContractPath],
+      ["handoff", "pre-review", externalContractPath, externalBuildPath],
+      ["handoff", "verify", externalContractPath, externalBuildPath, externalReviewPath],
+    ]) {
+      const result = spawnSync(process.execPath, [cli, ...args], { cwd: active, encoding: "utf8" });
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.match(
+        JSON.parse(result.stdout).errors.join("\n"),
+        /prefix does not identify the active workspace/,
+      );
+    }
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("all CLI gates reject a hard-linked handoff artifact", () => {
+  withFixture(({ cwd, contractPath, buildPath, reviewPath }) => {
+    const alias = path.join(cwd, "contract-hardlink-copy.json");
+    linkSync(contractPath, alias);
+    for (const args of [
+      ["handoff", "validate", contractPath],
+      ["handoff", "pre-review", contractPath, buildPath],
+      ["handoff", "verify", contractPath, buildPath, reviewPath],
+    ]) {
+      const result = spawnSync(process.execPath, [cli, ...args], { cwd, encoding: "utf8" });
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(JSON.parse(result.stdout).errors.join("\n"), /multiple hard links/);
+    }
   });
 });

@@ -48,8 +48,8 @@ represent a skipped or failed check as passing.
 If the Supervised Worker has not supplied executable check results, return
 `status: "blocked"` with a non-empty blocker stating that validation evidence is
 pending. The Worker runs the commands and may either re-invoke you with the real
-evidence or author the final `producedBy: "supervised-worker"`
-report itself. Never infer a pass from the requested command.
+evidence or author the final report using its verified active Worker selector as
+`producedBy`. Never infer a pass from the requested command.
 
 ## Boundaries
 

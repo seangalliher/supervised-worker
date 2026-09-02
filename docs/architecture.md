@@ -47,11 +47,13 @@ write durable state, stage, commit, push, close provider items, or claim queue
 completion. Agent files do not pin models. A different reviewer model family is
 preferred when available, while context isolation remains mandatory.
 
-The established main ID remains `supervised-worker` for compatibility. New
-companion IDs use the `seangalliher-supervised-*` publisher prefix. This reduces
-accidental collisions but cannot prevent GitHub's higher-precedence project or
-user agents from shadowing a plugin file with the same ID. The Worker therefore
-requires a supported-host provenance check before creating state.
+The preferred main ID is `seangalliher-supervised-worker`; the established
+`supervised-worker` ID remains as a compatibility selector. A parity test permits
+only selector-specific provenance and `producedBy` identity to differ between
+them. Every new role uses the `seangalliher-supervised-*` publisher prefix. This
+reduces accidental collisions but cannot prevent GitHub's higher-precedence
+project or user agents from shadowing a plugin file with the same ID. The Worker
+therefore requires a supported-host provenance check before creating state.
 
 The handoff chain is bound as follows:
 
@@ -60,6 +62,15 @@ build-contract --sha256--> build-report --sha256--+
         |                                         |
         +-----------------------> review-report <-+-- staged-tree hash
 ```
+
+Persisted artifact reads resolve only the workspace prefix first and compare its
+filesystem identity. The helper then inspects `.supervised-worker`, `handoffs`,
+the item-hash directory, and the file without following links. Only after those
+components are known to be ordinary local paths does it resolve the requested
+artifact and compare canonical containment plus exact requested item/file
+identity. This accepts operating-system and case-only aliases that identify the
+same directory while rejecting distinct case-sensitive roots, redirected handoff
+roots, and redirected item directories.
 
 This alpha defines and tests the artifact contract. The dependency-free helper
 validates individual persisted responses and verifies cross-artifact hashes,
