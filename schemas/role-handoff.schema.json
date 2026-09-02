@@ -1,0 +1,411 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/seangalliher/supervised-worker/schemas/role-handoff.schema.json",
+  "title": "Supervised Worker Role Handoff",
+  "oneOf": [
+    { "$ref": "#/$defs/buildContract" },
+    { "$ref": "#/$defs/buildReport" },
+    { "$ref": "#/$defs/reviewReport" }
+  ],
+  "$defs": {
+    "nonBlank": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gitTreeHash": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "repoPath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*:)(?!.*\\\\)(?!.*\\/$)(?!(?:\\.[gG][iI][tT]|\\.[sS][uU][pP][eE][rR][vV][iI][sS][eE][dD]-[wW][oO][rR][kK][eE][rR])(?:/|$))(?!\\.\\.(?:/|$))(?!.*(?:/\\.\\.(?:/|$)))(?!.*//)(?!.*(?:[. ]/|[. ]$))(?!.*[\\x00-\\x1f\\x7f])(?!.*[*?{}\\[\\]])\\S(?:.*\\S)?$"
+    },
+    "evidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "locator"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/nonBlank" },
+        "locator": { "$ref": "#/$defs/nonBlank" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "premise": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim", "evidence"],
+      "properties": {
+        "claim": { "$ref": "#/$defs/nonBlank" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidenceRef" }
+        }
+      }
+    },
+    "option": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "summary", "rank"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9.-]*$"
+        },
+        "summary": { "$ref": "#/$defs/nonBlank" },
+        "rank": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "blockedBy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["boundary", "decision", "resumeWhen"],
+      "properties": {
+        "boundary": { "$ref": "#/$defs/nonBlank" },
+        "decision": { "$ref": "#/$defs/nonBlank" },
+        "resumeWhen": { "$ref": "#/$defs/nonBlank" }
+      }
+    },
+    "checkResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "outcome", "evidence"],
+      "properties": {
+        "command": { "$ref": "#/$defs/nonBlank" },
+        "outcome": { "enum": ["passed", "failed", "skipped"] },
+        "evidence": { "$ref": "#/$defs/evidenceRef" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "severity",
+        "summary",
+        "consumer",
+        "evidence",
+        "blocksCommit"
+      ],
+      "properties": {
+        "severity": { "enum": ["critical", "high", "medium", "low"] },
+        "summary": { "$ref": "#/$defs/nonBlank" },
+        "consumer": { "$ref": "#/$defs/nonBlank" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidenceRef" }
+        },
+        "blocksCommit": { "type": "boolean" }
+      }
+    },
+    "buildContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "itemId",
+        "producedBy",
+        "createdAt",
+        "status",
+        "premise",
+        "objective",
+        "authorityBoundaries",
+        "options",
+        "selectedApproach",
+        "targetFiles",
+        "consumers",
+        "acceptanceCriteria",
+        "focusedChecks",
+        "broadGate",
+        "exclusions",
+        "blockedBy"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "build-contract" },
+        "itemId": { "$ref": "#/$defs/nonBlank" },
+        "producedBy": {
+          "enum": ["supervised-worker", "seangalliher-supervised-architect"]
+        },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "status": { "enum": ["approved", "escalation-required"] },
+        "premise": { "$ref": "#/$defs/premise" },
+        "objective": { "$ref": "#/$defs/nonBlank" },
+        "authorityBoundaries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlank" },
+          "uniqueItems": true
+        },
+        "options": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/option" }
+        },
+        "selectedApproach": {
+          "oneOf": [
+            { "$ref": "#/$defs/nonBlank" },
+            { "type": "null" }
+          ]
+        },
+        "targetFiles": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/repoPath" },
+          "uniqueItems": true
+        },
+        "consumers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlank" },
+          "uniqueItems": true
+        },
+        "acceptanceCriteria": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlank" },
+          "uniqueItems": true
+        },
+        "focusedChecks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlank" },
+          "uniqueItems": true
+        },
+        "broadGate": {
+          "oneOf": [
+            { "$ref": "#/$defs/nonBlank" },
+            { "type": "null" }
+          ]
+        },
+        "exclusions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlank" },
+          "uniqueItems": true
+        },
+        "blockedBy": {
+          "oneOf": [
+            { "$ref": "#/$defs/blockedBy" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "approved" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "selectedApproach": { "$ref": "#/$defs/nonBlank" },
+              "targetFiles": { "type": "array", "minItems": 1 },
+              "consumers": { "type": "array", "minItems": 1 },
+              "acceptanceCriteria": { "type": "array", "minItems": 1 },
+              "focusedChecks": { "type": "array", "minItems": 1 },
+              "broadGate": { "$ref": "#/$defs/nonBlank" },
+              "blockedBy": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "escalation-required" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "selectedApproach": { "type": "null" },
+              "targetFiles": { "type": "array", "maxItems": 0 },
+              "focusedChecks": { "type": "array", "maxItems": 0 },
+              "broadGate": { "type": "null" },
+              "blockedBy": { "$ref": "#/$defs/blockedBy" }
+            }
+          }
+        }
+      ]
+    },
+    "buildReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "itemId",
+        "producedBy",
+        "createdAt",
+        "status",
+        "contractHash",
+        "testedTreeHash",
+        "changedFiles",
+        "checks",
+        "evidence",
+        "deviations",
+        "blocker"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "build-report" },
+        "itemId": { "$ref": "#/$defs/nonBlank" },
+        "producedBy": {
+          "enum": ["supervised-worker", "seangalliher-supervised-builder"]
+        },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "status": { "enum": ["implemented", "blocked"] },
+        "contractHash": { "$ref": "#/$defs/sha256" },
+        "testedTreeHash": {
+          "oneOf": [
+            { "$ref": "#/$defs/gitTreeHash" },
+            { "type": "null" }
+          ]
+        },
+        "changedFiles": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/repoPath" },
+          "uniqueItems": true
+        },
+        "checks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/checkResult" }
+        },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidenceRef" }
+        },
+        "deviations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlank" },
+          "uniqueItems": true
+        },
+        "blocker": {
+          "oneOf": [
+            { "$ref": "#/$defs/nonBlank" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "implemented" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "changedFiles": { "type": "array", "minItems": 1 },
+              "testedTreeHash": { "$ref": "#/$defs/gitTreeHash" },
+              "checks": {
+                "type": "array",
+                "minItems": 1,
+                "not": {
+                  "contains": {
+                    "type": "object",
+                    "properties": {
+                      "outcome": { "enum": ["failed", "skipped"] }
+                    },
+                    "required": ["outcome"]
+                  }
+                }
+              },
+              "blocker": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "blocked" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "testedTreeHash": { "type": "null" },
+              "blocker": { "$ref": "#/$defs/nonBlank" }
+            }
+          }
+        }
+      ]
+    },
+    "reviewReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "itemId",
+        "producedBy",
+        "createdAt",
+        "contractHash",
+        "buildReportHash",
+        "stagedTreeHash",
+        "claimedBehavior",
+        "consumers",
+        "modelSeparation",
+        "verdict",
+        "findings",
+        "notChecked"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "review-report" },
+        "itemId": { "$ref": "#/$defs/nonBlank" },
+        "producedBy": { "const": "seangalliher-supervised-diff-reviewer" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "contractHash": { "$ref": "#/$defs/sha256" },
+        "buildReportHash": { "$ref": "#/$defs/sha256" },
+        "stagedTreeHash": { "$ref": "#/$defs/gitTreeHash" },
+        "claimedBehavior": { "$ref": "#/$defs/nonBlank" },
+        "consumers": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/nonBlank" },
+          "uniqueItems": true
+        },
+        "modelSeparation": {
+          "enum": ["different-family", "same-family", "unknown"]
+        },
+        "verdict": { "enum": ["clean", "changes-required"] },
+        "findings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/finding" }
+        },
+        "notChecked": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlank" },
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "verdict": { "const": "clean" } },
+            "required": ["verdict"]
+          },
+          "then": {
+            "properties": { "findings": { "type": "array", "maxItems": 0 } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "verdict": { "const": "changes-required" } },
+            "required": ["verdict"]
+          },
+          "then": {
+            "properties": {
+              "findings": {
+                "type": "array",
+                "minItems": 1,
+                "contains": {
+                  "type": "object",
+                  "properties": { "blocksCommit": { "const": true } },
+                  "required": ["blocksCommit"]
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

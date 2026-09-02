@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "kind": "build-contract",
+  "itemId": "issue-42",
+  "producedBy": "seangalliher-supervised-architect",
+  "createdAt": "2026-09-02T12:00:00Z",
+  "status": "approved",
+  "premise": {
+    "claim": "The adapter drops the correlation identifier before delivery.",
+    "evidence": [
+      {
+        "kind": "focused-probe",
+        "locator": "test/adapter.test.js#correlation-probe"
+      }
+    ]
+  },
+  "objective": "Preserve correlation identifiers through the adapter boundary.",
+  "authorityBoundaries": [
+    "no public API break",
+    "no production access"
+  ],
+  "options": [
+    {
+      "id": "extend-existing-envelope",
+      "summary": "Carry the identifier through the existing envelope type.",
+      "rank": 1
+    },
+    {
+      "id": "add-side-channel",
+      "summary": "Add a separate metadata channel beside the envelope.",
+      "rank": 2
+    }
+  ],
+  "selectedApproach": "extend-existing-envelope",
+  "targetFiles": [
+    "src/adapter.js",
+    "test/adapter.test.js"
+  ],
+  "consumers": [
+    "delivery handler"
+  ],
+  "acceptanceCriteria": [
+    "The delivery handler receives the original correlation identifier.",
+    "Existing envelopes without an identifier remain valid."
+  ],
+  "focusedChecks": [
+    "node --test test/adapter.test.js"
+  ],
+  "broadGate": "npm test",
+  "exclusions": [
+    "Do not replace the transport."
+  ],
+  "blockedBy": null
+}

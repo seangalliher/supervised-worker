@@ -17,6 +17,14 @@ tests that would fail against the unprotected behavior.
   warning even when the ledger is unavailable.
 - Concurrent sessions cannot decrease checked progress or claim one item twice.
 - Windows, macOS, and Linux hooks produce equivalent decisions.
+- Only the Supervised Worker writes durable plan and handoff state.
+- Architect and Diff Reviewer cannot edit; Builder cannot exceed `targetFiles`.
+- Invalid contracts, skipped implemented checks, contradictory clean reviews,
+  and malformed staged-tree hashes are rejected by the handoff schema.
+- Exact-byte hash drift, cross-item reports, consumer drift, out-of-footprint
+  files, hidden unstaged/untracked edits, and non-clean final verdicts are
+  rejected by the dependency-free runtime verifier.
+- Role-pack agents contain no repository-specific terminology or model pins.
 
 ## Dogfood Threshold Before v0.1
 

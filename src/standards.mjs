@@ -5,6 +5,8 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { parseDocument } from "yaml";
 
+import { validateHandoffValue } from "./handoff.mjs";
+
 const PLUGIN_SCHEMA_ID = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 const PLUGIN_KEYS = new Set([
   "$schema",
@@ -31,12 +33,16 @@ const SCHEMA_FILES = [
   "plan.schema.json",
   "policy-proposal.schema.json",
   "procedure.schema.json",
+  "role-handoff.schema.json",
   "workflow.schema.json",
 ];
 const EXAMPLE_SCHEMAS = [
   ["examples/workflow.json", "workflow.schema.json"],
   ["examples/plan.active.json", "plan.schema.json"],
   ["examples/plan.complete.json", "plan.schema.json"],
+  ["examples/handoff.build-contract.json", "role-handoff.schema.json"],
+  ["examples/handoff.build-report.json", "role-handoff.schema.json"],
+  ["examples/handoff.review-report.json", "role-handoff.schema.json"],
 ];
 
 function isRecord(value) {
@@ -210,6 +216,59 @@ function validateWorkflowGates(validate, workflow, errors) {
   }
 }
 
+function validateRoleHandoffGates(validate, root, errors) {
+  const reject = (name, value) => {
+    if (validate(value)) errors.push(`role-handoff schema accepted unsafe state: ${name}`);
+    if (validateHandoffValue(value, root).length === 0) {
+      errors.push(`role-handoff runtime accepted unsafe state: ${name}`);
+    }
+  };
+  const contract = readJson(root, "examples/handoff.build-contract.json");
+  contract.targetFiles = [];
+  reject("empty approved footprint", contract);
+
+  for (const target of [".git/config", ".supervised-worker/plan.json", "../outside.js"]) {
+    const protectedContract = readJson(root, "examples/handoff.build-contract.json");
+    protectedContract.targetFiles = [target];
+    reject(`protected target ${target}`, protectedContract);
+  }
+
+  const build = readJson(root, "examples/handoff.build-report.json");
+  build.checks[0].outcome = "skipped";
+  reject("skipped implemented check", build);
+
+  const cleanReview = readJson(root, "examples/handoff.review-report.json");
+  cleanReview.findings.push({
+    severity: "medium",
+    summary: "Consumer rejected the value.",
+    consumer: "consumer",
+    evidence: [{ kind: "probe", locator: "local:probe" }],
+    blocksCommit: true,
+  });
+  reject("finding in clean review", cleanReview);
+
+  const requiredReview = readJson(root, "examples/handoff.review-report.json");
+  requiredReview.verdict = "changes-required";
+  reject("changes-required without findings", requiredReview);
+
+  const nonBlockingReview = readJson(root, "examples/handoff.review-report.json");
+  nonBlockingReview.verdict = "changes-required";
+  nonBlockingReview.findings.push({
+    severity: "low",
+    summary: "Follow-up available.",
+    consumer: "maintainer",
+    evidence: [{ kind: "reading", locator: "src/module.js" }],
+    blocksCommit: false,
+  });
+  reject("changes-required without commit blocker", nonBlockingReview);
+
+  const undeclared = readJson(root, "examples/handoff.build-contract.json");
+  undeclared.selectedApproach = "not-declared";
+  if (validateHandoffValue(undeclared, root).length === 0) {
+    errors.push("role-handoff runtime accepted an undeclared selectedApproach");
+  }
+}
+
 export function validatePublishedSchemas(root) {
   const errors = [];
   const discovered = readdirSync(path.join(root, "schemas"))
@@ -252,6 +311,10 @@ export function validatePublishedSchemas(root) {
     try {
       const example = readJson(root, examplePath);
       if (!validate(example)) errors.push(...formatAjvErrors(examplePath, validate.errors));
+      if (schemaFile === "role-handoff.schema.json") {
+        const runtimeErrors = validateHandoffValue(example, root);
+        errors.push(...runtimeErrors.map((error) => `${examplePath} runtime: ${error}`));
+      }
     } catch (error) {
       errors.push(`${examplePath} could not be validated: ${error.message}`);
     }
@@ -266,6 +329,10 @@ export function validatePublishedSchemas(root) {
   if (workflowValidate) {
     validateWorkflowGates(workflowValidate, readJson(root, "examples/workflow.json"), errors);
   } else errors.push("workflow schema review gates could not be exercised");
+  const roleHandoffSchemaId = schemas.get("role-handoff.schema.json");
+  const roleHandoffValidate = roleHandoffSchemaId ? ajv.getSchema(roleHandoffSchemaId) : null;
+  if (roleHandoffValidate) validateRoleHandoffGates(roleHandoffValidate, root, errors);
+  else errors.push("role-handoff safety gates could not be exercised");
   return errors;
 }
 

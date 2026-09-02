@@ -23,6 +23,10 @@ helper deterministic and the plugin small.
 - Hooks must support Windows, macOS, and Linux.
 - Hook output is one valid JSON object on stdout; diagnostics go to stderr.
 - Raw prompts, tool arguments, and tool results are not stored by default.
+- The Supervised Worker alone owns durable plan and handoff state. Companion
+	agents return schema-conforming JSON and never stage or release changes.
+- Architect and Diff Reviewer remain read-only. Builder edits only the approved
+	`targetFiles` footprint.
 - Learned procedures are advisory and cannot modify constitutional policy.
 - New public behavior requires focused tests and a cross-platform lifecycle test.
 - A claim that something is absent requires an enumerating check.

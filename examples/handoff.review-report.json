@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "kind": "review-report",
+  "itemId": "issue-42",
+  "producedBy": "seangalliher-supervised-diff-reviewer",
+  "createdAt": "2026-09-02T12:30:00Z",
+  "contractHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "buildReportHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "stagedTreeHash": "cccccccccccccccccccccccccccccccccccccccc",
+  "claimedBehavior": "Correlation identifiers survive adapter delivery.",
+  "consumers": [
+    "delivery handler"
+  ],
+  "modelSeparation": "unknown",
+  "verdict": "clean",
+  "findings": [],
+  "notChecked": [
+    "Live production transport was not contacted."
+  ]
+}

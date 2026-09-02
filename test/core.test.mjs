@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
+  linkSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -11,7 +12,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import test, { afterEach } from "node:test";
 
 import { handleHook, planPath, sha256, validatePlan } from "../src/core.mjs";
@@ -63,6 +64,25 @@ function attachPlan(cwd, sessionId = "11111111-1111-4111-8111-111111111111") {
     },
     "PostToolUse",
   );
+}
+
+function writerPayloadCases() {
+  return [
+    ["create", (target) => ({ path: target })],
+    ["edit", (target) => ({ path: target })],
+    ["Write", (target) => ({ file_path: target })],
+    ["create_file", (target) => ({ filePath: target })],
+    ["str_replace_editor", (target) => ({ path: target })],
+    ["insert", (target) => ({ path: target })],
+    ["insert_edit_into_file", (target) => ({ filePath: target })],
+    ["replace_string_in_file", (target) => ({ filePath: target })],
+    ["multi_replace_string_in_file", (target) => ({ replacements: [{ filePath: target }] })],
+    ["apply_patch", (target) => `*** Begin Patch\n*** Add File: ${target}\n+{}\n*** End Patch`],
+    ["apply_patch", (target) => ({ patch: `*** Begin Patch\n*** Add File: ${target}\n+{}\n*** End Patch` })],
+    ["apply_patch", (target) => ({ input: `*** Begin Patch\n*** Add File: ${target}\n+{}\n*** End Patch` })],
+    ["apply_patch", (target) => ({ raw: `*** Begin Patch\n*** Add File: ${target}\n+{}\n*** End Patch` })],
+    ["Edit", (target) => ({ input: `*** Begin Patch\n*** Add File: ${target}\n+{}\n*** End Patch` })],
+  ];
 }
 
 test("plan validation rejects parked work without a resumption condition", () => {
@@ -134,6 +154,284 @@ test("PreToolUse denies a plan write without a session identifier", () => {
   assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
   assert.match(output.permissionDecisionReason, /no session identifier/);
   assert.equal(existsSync(path.join(cwd, ".supervised-worker", "attachment.json")), false);
+});
+
+test("only the attached session may edit durable handoff state", () => {
+  const cwd = workspace();
+  writePlan(cwd);
+  attachPlan(cwd, "owner-session");
+  const handoffPath = path.join(
+    cwd,
+    ".supervised-worker",
+    "handoffs",
+    "a".repeat(64),
+    "build-contract.json",
+  );
+
+  assert.deepEqual(
+    handleHook(
+      {
+        hook_event_name: "PreToolUse",
+        session_id: "owner-session",
+        cwd,
+        tool_name: "Write",
+        tool_input: { file_path: handoffPath },
+      },
+      "PreToolUse",
+    ),
+    {},
+  );
+  const denied = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: "companion-session",
+      cwd,
+      tool_name: "Write",
+      tool_input: { file_path: handoffPath },
+    },
+    "PreToolUse",
+  );
+  assert.equal(denied.permissionDecision, "deny");
+  assert.equal(denied.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /Only the session attached/);
+});
+
+test("PreToolUse denies direct edits to Git metadata", () => {
+  const cwd = workspace();
+  const output = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: "writer-session",
+      cwd,
+      tool_name: "Edit",
+      tool_input: {
+        input: `*** Begin Patch\n*** Update File: ${path.join(cwd, ".git", "config")}\n-old\n+new\n*** End Patch`,
+      },
+    },
+    "PreToolUse",
+  );
+  assert.equal(output.permissionDecision, "deny");
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(output.permissionDecisionReason, /Git metadata/);
+});
+
+test("PreToolUse denies Windows-canonicalized Git metadata aliases", {
+  skip: process.platform !== "win32",
+}, () => {
+  const cwd = workspace();
+  const output = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: "writer-session",
+      cwd,
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, ".git.", "config") },
+    },
+    "PreToolUse",
+  );
+  assert.equal(output.permissionDecision, "deny");
+  assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("PreToolUse denies junction aliases to Git metadata and durable state", () => {
+  const cwd = workspace();
+  mkdirSync(path.join(cwd, ".git"), { recursive: true });
+  writePlan(cwd);
+  attachPlan(cwd, "owner-session");
+  const linkType = process.platform === "win32" ? "junction" : "dir";
+  const gitAlias = path.join(cwd, "git-alias");
+  const stateAlias = path.join(cwd, "state-alias");
+  symlinkSync(path.join(cwd, ".git"), gitAlias, linkType);
+  symlinkSync(path.join(cwd, ".supervised-worker"), stateAlias, linkType);
+
+  const gitDenied = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: "companion-session",
+      cwd,
+      tool_name: "Write",
+      tool_input: { file_path: path.join(gitAlias, "config") },
+    },
+    "PreToolUse",
+  );
+  assert.equal(gitDenied.permissionDecision, "deny");
+  assert.match(gitDenied.permissionDecisionReason, /resolved safely|Git metadata/);
+
+  const stateDenied = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: "companion-session",
+      cwd,
+      tool_name: "Write",
+      tool_input: { file_path: path.join(stateAlias, "handoffs", "x.json") },
+    },
+    "PreToolUse",
+  );
+  assert.equal(stateDenied.permissionDecision, "deny");
+  assert.match(stateDenied.permissionDecisionReason, /resolved safely|Only the session attached/);
+});
+
+test("PreToolUse denies Windows device-namespace edit targets", {
+  skip: process.platform !== "win32",
+}, () => {
+  const cwd = workspace();
+  const namespacedPath = `\\\\?\\${path.join(cwd, ".git", "config")}`;
+  const output = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: "writer-session",
+      cwd,
+      tool_name: "Write",
+      tool_input: { file_path: namespacedPath },
+    },
+    "PreToolUse",
+  );
+  assert.equal(output.permissionDecision, "deny");
+  assert.match(output.permissionDecisionReason, /could not be resolved safely/);
+});
+
+test("PreToolUse denies hard-link aliases across every writer payload", () => {
+  const cwd = workspace();
+  const gitDirectory = path.join(cwd, ".git");
+  mkdirSync(gitDirectory, { recursive: true });
+  const protectedFile = path.join(gitDirectory, "config");
+  writeFileSync(protectedFile, "protected\n");
+
+  for (const [index, [toolName, makeInput]] of writerPayloadCases().entries()) {
+    const alias = path.join(cwd, `hard-link-${index}.txt`);
+    linkSync(protectedFile, alias);
+    const output = handleHook(
+      {
+        hook_event_name: "PreToolUse",
+        session_id: "companion-session",
+        cwd,
+        tool_name: toolName,
+        tool_input: makeInput(alias),
+      },
+      "PreToolUse",
+    );
+    assert.equal(output.permissionDecision, "deny", toolName);
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny", toolName);
+    assert.match(output.permissionDecisionReason, /resolved safely/, toolName);
+  }
+});
+
+test("PreToolUse denies a hard-link alias to durable plan state", () => {
+  const cwd = workspace();
+  writePlan(cwd);
+  const alias = path.join(cwd, "plan-alias.json");
+  linkSync(planPath(cwd), alias);
+  const output = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: "companion-session",
+      cwd,
+      tool_name: "Write",
+      tool_input: { file_path: alias },
+    },
+    "PreToolUse",
+  );
+  assert.equal(output.permissionDecision, "deny");
+  assert.match(output.permissionDecisionReason, /resolved safely/);
+});
+
+test("PreToolUse denies subst-drive aliases to protected roots", () => {
+  if (process.platform !== "win32") return;
+  const cwd = workspace();
+  mkdirSync(path.join(cwd, ".git"), { recursive: true });
+  writeFileSync(path.join(cwd, ".git", "config"), "protected\n");
+  writePlan(cwd);
+  const drive = [..."ZYXWVUTSRQPONMLKJIHGFED"].find((letter) => !existsSync(`${letter}:\\`));
+  assert.ok(drive, "a free drive letter is required for the subst regression");
+  execFileSync("subst.exe", [`${drive}:`, cwd]);
+  try {
+    for (const target of [`${drive}:\\.git\\config`, `${drive}:\\.supervised-worker\\plan.json`]) {
+      const output = handleHook(
+        {
+          hook_event_name: "PreToolUse",
+          session_id: "companion-session",
+          cwd,
+          tool_name: "Write",
+          tool_input: { file_path: target },
+        },
+        "PreToolUse",
+      );
+      assert.equal(output.permissionDecision, "deny", target);
+    }
+  } finally {
+    execFileSync("subst.exe", [`${drive}:`, "/D"]);
+    assert.equal(existsSync(`${drive}:\\`), false);
+  }
+});
+
+test("PreToolUse denies actual linked-worktree Git directories", () => {
+  const repository = workspace();
+  const worktree = workspace();
+  rmSync(worktree, { recursive: true, force: true });
+  execFileSync("git", ["init", "--quiet"], { cwd: repository });
+  writeFileSync(path.join(repository, "tracked.txt"), "baseline\n");
+  execFileSync("git", ["add", "--", "tracked.txt"], { cwd: repository });
+  execFileSync(
+    "git",
+    [
+      "-c",
+      "user.name=Test User",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "--quiet",
+      "-m",
+      "baseline",
+    ],
+    { cwd: repository },
+  );
+  execFileSync("git", ["worktree", "add", "--quiet", "--detach", worktree], {
+    cwd: repository,
+  });
+  temporaryWorkspaces.add(worktree);
+
+  const gitDirectory = execFileSync(
+    "git",
+    ["rev-parse", "--path-format=absolute", "--git-dir"],
+    { cwd: worktree, encoding: "utf8" },
+  ).trim();
+  const commonDirectory = execFileSync(
+    "git",
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    { cwd: worktree, encoding: "utf8" },
+  ).trim();
+
+  for (const target of [path.join(gitDirectory, "HEAD"), path.join(commonDirectory, "config")]) {
+    const output = handleHook(
+      {
+        hook_event_name: "PreToolUse",
+        session_id: "companion-session",
+        cwd: worktree,
+        tool_name: "Write",
+        tool_input: { file_path: target },
+      },
+      "PreToolUse",
+    );
+    assert.equal(output.permissionDecision, "deny", target);
+    assert.match(output.permissionDecisionReason, /Git metadata/, target);
+  }
+});
+
+test("PreToolUse remains inert for ordinary source edits", () => {
+  const cwd = workspace();
+  assert.deepEqual(
+    handleHook(
+      {
+        hook_event_name: "PreToolUse",
+        session_id: "writer-session",
+        cwd,
+        tool_name: "Write",
+        tool_input: { file_path: path.join(cwd, "src", "module.js") },
+      },
+      "PreToolUse",
+    ),
+    {},
+  );
 });
 
 test("PostToolUse reports an ungoverned plan write without a session identifier", () => {
@@ -495,28 +793,12 @@ test("PreToolUse denies a plan write when state containment is unsafe", () => {
     "PreToolUse",
   );
   assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
-  assert.match(output.hookSpecificOutput.permissionDecisionReason, /could not verify/);
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /resolved safely|could not verify/);
   assert.deepEqual(readdirSync(outside), []);
 });
 
 test("every supported writer payload claims the plan", () => {
-  const cases = [
-    ["create", (plan) => ({ path: plan })],
-    ["edit", (plan) => ({ path: plan })],
-    ["Write", (plan) => ({ file_path: plan })],
-    ["create_file", (plan) => ({ filePath: plan })],
-    ["str_replace_editor", (plan) => ({ path: plan })],
-    ["insert", (plan) => ({ path: plan })],
-    ["insert_edit_into_file", (plan) => ({ filePath: plan })],
-    ["replace_string_in_file", (plan) => ({ filePath: plan })],
-    ["multi_replace_string_in_file", (plan) => ({ replacements: [{ filePath: plan }] })],
-    ["apply_patch", (plan) => `*** Begin Patch\n*** Add File: ${plan}\n+{}\n*** End Patch`],
-    ["apply_patch", (plan) => ({ patch: `*** Begin Patch\n*** Add File: ${plan}\n+{}\n*** End Patch` })],
-    ["apply_patch", (plan) => ({ input: `*** Begin Patch\n*** Add File: ${plan}\n+{}\n*** End Patch` })],
-    ["apply_patch", (plan) => ({ raw: `*** Begin Patch\n*** Add File: ${plan}\n+{}\n*** End Patch` })],
-    ["Edit", (plan) => ({ input: `*** Begin Patch\n*** Add File: ${plan}\n+{}\n*** End Patch` })],
-  ];
-  for (const [toolName, makeInput] of cases) {
+  for (const [toolName, makeInput] of writerPayloadCases()) {
     const cwd = workspace();
     const plan = planPath(cwd);
     const session = `writer-${toolName}-${Math.random()}`;

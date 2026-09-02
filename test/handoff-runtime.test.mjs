@@ -1,0 +1,503 @@
+import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import {
+  mkdirSync,
+  linkSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+import { sha256 } from "../src/core.mjs";
+import {
+  inspectHandoffFile,
+  validateHandoffValue,
+  validateRepositoryPath,
+  verifyBuildHandoff,
+  verifyHandoffChain,
+} from "../src/handoff.mjs";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const cli = path.join(root, "src", "cli.mjs");
+
+function readJson(relativePath) {
+  return JSON.parse(readFileSync(path.join(root, relativePath), "utf8"));
+}
+
+function writeJson(filePath, value) {
+  const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  writeFileSync(filePath, bytes);
+  return sha256(bytes);
+}
+
+function git(cwd, ...args) {
+  return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+}
+
+function chainFixture() {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-handoff-"));
+  git(cwd, "init", "--quiet");
+  mkdirSync(path.join(cwd, "src"), { recursive: true });
+  writeFileSync(path.join(cwd, "src", "module.js"), "export const value = 1;\n");
+  git(cwd, "add", "--", "src/module.js");
+
+  const itemId = "issue-42";
+  const directory = path.join(cwd, ".supervised-worker", "handoffs", sha256(itemId));
+  const contractPath = path.join(directory, "build-contract.json");
+  const buildPath = path.join(directory, "build-report.json");
+  const reviewPath = path.join(directory, "review-report.json");
+
+  const contract = readJson("examples/handoff.build-contract.json");
+  contract.itemId = itemId;
+  contract.targetFiles = ["src/module.js"];
+  contract.consumers = ["module importer"];
+  const contractHash = writeJson(contractPath, contract);
+
+  const build = readJson("examples/handoff.build-report.json");
+  build.itemId = itemId;
+  build.contractHash = contractHash;
+  build.testedTreeHash = git(cwd, "write-tree");
+  build.changedFiles = ["src/module.js"];
+  build.checks = [...contract.focusedChecks, contract.broadGate].map((command) => ({
+    command,
+    outcome: "passed",
+    evidence: { kind: "test-output", locator: `local:${command}` },
+  }));
+  const buildReportHash = writeJson(buildPath, build);
+
+  const review = readJson("examples/handoff.review-report.json");
+  review.itemId = itemId;
+  review.contractHash = contractHash;
+  review.buildReportHash = buildReportHash;
+  review.stagedTreeHash = git(cwd, "write-tree");
+  review.consumers = ["module importer"];
+  writeJson(reviewPath, review);
+
+  return { cwd, contractPath, buildPath, reviewPath, contract, build, review };
+}
+
+function withFixture(run) {
+  const fixture = chainFixture();
+  try {
+    return run(fixture);
+  } finally {
+    rmSync(fixture.cwd, { recursive: true, force: true });
+  }
+}
+
+test("runtime validates and hash-binds a complete staged handoff chain", () => {
+  withFixture(({ cwd, contractPath, buildPath, reviewPath }) => {
+    const inspected = inspectHandoffFile(cwd, contractPath);
+    assert.equal(inspected.ok, true, inspected.errors.join("\n"));
+    assert.match(inspected.sha256, /^[0-9a-f]{64}$/);
+
+    const preReview = verifyBuildHandoff(cwd, contractPath, buildPath);
+    assert.equal(preReview.ok, true, preReview.errors.join("\n"));
+    assert.equal(preReview.stagedTreeHash, git(cwd, "write-tree"));
+
+    const result = verifyHandoffChain(cwd, contractPath, buildPath, reviewPath);
+    assert.equal(result.ok, true, result.errors.join("\n"));
+    assert.equal(result.verdict, "clean");
+    assert.equal(result.stagedTreeHash, git(cwd, "write-tree"));
+  });
+});
+
+test("runtime rejects cross-item reports at the hashed directory boundary", () => {
+  withFixture((fixture) => {
+    fixture.review.itemId = "other-item";
+    writeJson(fixture.reviewPath, fixture.review);
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /directory does not match/);
+  });
+});
+
+test("runtime rejects a stale contract hash", () => {
+  withFixture((fixture) => {
+    fixture.review.contractHash = "d".repeat(64);
+    writeJson(fixture.reviewPath, fixture.review);
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /contractHash does not match/);
+  });
+});
+
+test("runtime rejects a stale build-report hash", () => {
+  withFixture((fixture) => {
+    fixture.review.buildReportHash = "d".repeat(64);
+    writeJson(fixture.reviewPath, fixture.review);
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /buildReportHash does not match/);
+  });
+});
+
+test("runtime requires every contract gate against the current staged tree", () => {
+  withFixture((fixture) => {
+    fixture.contract.focusedChecks = ["node --test focused.test.mjs"];
+    fixture.contract.broadGate = "npm test";
+    const contractHash = writeJson(fixture.contractPath, fixture.contract);
+    fixture.build.contractHash = contractHash;
+    fixture.build.testedTreeHash = "d".repeat(40);
+    fixture.build.checks = [
+      {
+        command: "echo irrelevant",
+        outcome: "passed",
+        evidence: { kind: "test-output", locator: "local:irrelevant" },
+      },
+    ];
+    const buildHash = writeJson(fixture.buildPath, fixture.build);
+    fixture.review.contractHash = contractHash;
+    fixture.review.buildReportHash = buildHash;
+    writeJson(fixture.reviewPath, fixture.review);
+
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /required contract check did not pass: node --test/);
+    assert.match(result.errors.join("\n"), /required contract check did not pass: npm test/);
+    assert.match(result.errors.join("\n"), /testedTreeHash does not match/);
+  });
+});
+
+test("runtime rejects changed files outside the approved footprint", () => {
+  withFixture((fixture) => {
+    fixture.build.changedFiles = ["src/outside.js"];
+    const contractHash = sha256(readFileSync(fixture.contractPath));
+    fixture.build.contractHash = contractHash;
+    const buildHash = writeJson(fixture.buildPath, fixture.build);
+    fixture.review.contractHash = contractHash;
+    fixture.review.buildReportHash = buildHash;
+    writeJson(fixture.reviewPath, fixture.review);
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /outside targetFiles/);
+  });
+});
+
+test("runtime rejects a review of a different staged tree", () => {
+  withFixture((fixture) => {
+    fixture.review.stagedTreeHash = "e".repeat(40);
+    writeJson(fixture.reviewPath, fixture.review);
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /does not match the current Git index/);
+  });
+});
+
+test("runtime rejects consumer drift and unapproved build deviations", () => {
+  withFixture((fixture) => {
+    fixture.build.deviations = ["Changed an additional behavior."];
+    const buildHash = writeJson(fixture.buildPath, fixture.build);
+    fixture.review.buildReportHash = buildHash;
+    fixture.review.consumers = ["different consumer"];
+    writeJson(fixture.reviewPath, fixture.review);
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /unapproved deviations/);
+    assert.match(result.errors.join("\n"), /consumers do not match/);
+  });
+});
+
+test("final verification rejects a valid changes-required verdict", () => {
+  withFixture((fixture) => {
+    fixture.review.verdict = "changes-required";
+    fixture.review.findings.push({
+      severity: "high",
+      summary: "The consumer rejects the generated value.",
+      consumer: "module importer",
+      evidence: [{ kind: "probe", locator: "local:consumer-probe" }],
+      blocksCommit: true,
+    });
+    writeJson(fixture.reviewPath, fixture.review);
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.verdict, "changes-required");
+    assert.match(result.errors.join("\n"), /verdict requires changes/);
+  });
+});
+
+test("runtime rejects staged paths omitted from the build report", () => {
+  withFixture((fixture) => {
+    writeFileSync(path.join(fixture.cwd, "extra.js"), "export const extra = true;\n");
+    git(fixture.cwd, "add", "--", "extra.js");
+    fixture.review.stagedTreeHash = git(fixture.cwd, "write-tree");
+    writeJson(fixture.reviewPath, fixture.review);
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /staged paths do not exactly match/);
+  });
+});
+
+test("runtime rejects hidden unstaged and untracked edits", () => {
+  withFixture((fixture) => {
+    writeFileSync(path.join(fixture.cwd, "src", "module.js"), "export const value = 2;\n");
+    writeFileSync(path.join(fixture.cwd, "unreported.js"), "export const hidden = true;\n");
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /unstaged tracked changes/);
+    assert.match(result.errors.join("\n"), /untracked files outside/);
+  });
+});
+
+test("runtime rejects undeclared approaches and duplicate option identities", () => {
+  const contract = readJson("examples/handoff.build-contract.json");
+  contract.selectedApproach = "not-declared";
+  contract.options.push({ ...contract.options[0] });
+  const errors = validateHandoffValue(contract, root);
+  assert.match(errors.join("\n"), /selectedApproach must identify/);
+  assert.match(errors.join("\n"), /id duplicates/);
+  assert.match(errors.join("\n"), /rank duplicates/);
+});
+
+test("runtime rejects impossible calendar timestamps", () => {
+  const contract = readJson("examples/handoff.build-contract.json");
+  contract.createdAt = "2026-02-30T12:00:00Z";
+  assert.match(validateHandoffValue(contract, root).join("\n"), /createdAt/);
+});
+
+test("repository paths reject protected and escaping links", () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-path-"));
+  const outside = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-outside-"));
+  try {
+    const link = path.join(cwd, "linked");
+    symlinkSync(outside, link, process.platform === "win32" ? "junction" : "dir");
+    assert.match(validateRepositoryPath(cwd, ".git/config").join("\n"), /protected/);
+    assert.match(
+      validateRepositoryPath(cwd, ".supervised-worker/plan.json").join("\n"),
+      /protected/,
+    );
+    assert.match(validateRepositoryPath(cwd, "linked/file.js").join("\n"), /symbolic link/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("contract and build paths reject dangling links", () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-dangling-"));
+  const target = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-target-"));
+  try {
+    const dangling = path.join(cwd, "dangling");
+    symlinkSync(target, dangling, process.platform === "win32" ? "junction" : "dir");
+    rmSync(target, { recursive: true, force: true });
+
+    const contract = readJson("examples/handoff.build-contract.json");
+    contract.targetFiles = ["dangling/file.js"];
+    assert.match(validateHandoffValue(contract, cwd).join("\n"), /symbolic link/);
+
+    const build = readJson("examples/handoff.build-report.json");
+    build.changedFiles = ["dangling/file.js"];
+    assert.match(validateHandoffValue(build, cwd).join("\n"), /symbolic link/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("contract and build paths reject hard-linked regular files", () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-hardlink-"));
+  try {
+    mkdirSync(path.join(cwd, ".git"), { recursive: true });
+    mkdirSync(path.join(cwd, "src"), { recursive: true });
+    const protectedFile = path.join(cwd, ".git", "config");
+    writeFileSync(protectedFile, "protected\n");
+    linkSync(protectedFile, path.join(cwd, "src", "alias.txt"));
+
+    const contract = readJson("examples/handoff.build-contract.json");
+    contract.targetFiles = ["src/alias.txt"];
+    assert.match(validateHandoffValue(contract, cwd).join("\n"), /multiple hard links/);
+
+    const build = readJson("examples/handoff.build-report.json");
+    build.changedFiles = ["src/alias.txt"];
+    assert.match(validateHandoffValue(build, cwd).join("\n"), /multiple hard links/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("rename verification requires both source and destination paths", () => {
+  withFixture((fixture) => {
+    git(
+      fixture.cwd,
+      "-c",
+      "user.name=Test User",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "--quiet",
+      "-m",
+      "baseline",
+    );
+    const source = path.join(fixture.cwd, "src", "module.js");
+    const destination = path.join(fixture.cwd, "src", "renamed.js");
+    renameSync(source, destination);
+    git(fixture.cwd, "add", "--all", "--", "src");
+
+    fixture.contract.targetFiles = ["src/module.js", "src/renamed.js"];
+    const contractHash = writeJson(fixture.contractPath, fixture.contract);
+    fixture.build.contractHash = contractHash;
+    fixture.build.testedTreeHash = git(fixture.cwd, "write-tree");
+    fixture.build.changedFiles = ["src/module.js", "src/renamed.js"];
+    const buildHash = writeJson(fixture.buildPath, fixture.build);
+    fixture.review.contractHash = contractHash;
+    fixture.review.buildReportHash = buildHash;
+    fixture.review.stagedTreeHash = git(fixture.cwd, "write-tree");
+    writeJson(fixture.reviewPath, fixture.review);
+    const accepted = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(accepted.ok, true, accepted.errors.join("\n"));
+
+    fixture.build.changedFiles = ["src/renamed.js"];
+    const incompleteHash = writeJson(fixture.buildPath, fixture.build);
+    fixture.review.buildReportHash = incompleteHash;
+    writeJson(fixture.reviewPath, fixture.review);
+    const rejected = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.errors.join("\n"), /staged paths do not exactly match/);
+  });
+});
+
+test("case-only rename keeps source and destination as distinct Git paths", () => {
+  withFixture((fixture) => {
+    git(
+      fixture.cwd,
+      "-c",
+      "user.name=Test User",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "--quiet",
+      "-m",
+      "baseline",
+    );
+    writeFileSync(path.join(fixture.cwd, "src", "Foo.js"), "export const value = 1;\n");
+    git(fixture.cwd, "add", "--", "src/Foo.js");
+    git(
+      fixture.cwd,
+      "-c",
+      "user.name=Test User",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "--quiet",
+      "-m",
+      "add case source",
+    );
+    git(fixture.cwd, "mv", "-f", "--", "src/Foo.js", "src/foo.js");
+
+    fixture.contract.targetFiles = ["src/Foo.js", "src/foo.js"];
+    const contractHash = writeJson(fixture.contractPath, fixture.contract);
+    fixture.build.contractHash = contractHash;
+    fixture.build.testedTreeHash = git(fixture.cwd, "write-tree");
+    fixture.build.changedFiles = ["src/Foo.js", "src/foo.js"];
+    const buildHash = writeJson(fixture.buildPath, fixture.build);
+    fixture.review.contractHash = contractHash;
+    fixture.review.buildReportHash = buildHash;
+    fixture.review.stagedTreeHash = git(fixture.cwd, "write-tree");
+    writeJson(fixture.reviewPath, fixture.review);
+    assert.equal(
+      verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath).ok,
+      true,
+    );
+
+    fixture.build.changedFiles = ["src/foo.js"];
+    writeJson(fixture.buildPath, fixture.build);
+    const rejected = verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath);
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.errors.join("\n"), /staged paths do not exactly match/);
+  });
+});
+
+test("CLI validates one artifact and verifies the complete chain", () => {
+  withFixture(({ cwd, contractPath, buildPath, reviewPath }) => {
+    const inspected = spawnSync(process.execPath, [cli, "handoff", "validate", contractPath], {
+      cwd,
+      encoding: "utf8",
+    });
+    assert.equal(inspected.status, 0, inspected.stderr || inspected.stdout);
+    assert.equal(JSON.parse(inspected.stdout).ok, true);
+
+    const preReview = spawnSync(
+      process.execPath,
+      [cli, "handoff", "pre-review", contractPath, buildPath],
+      { cwd, encoding: "utf8" },
+    );
+    assert.equal(preReview.status, 0, preReview.stderr || preReview.stdout);
+    assert.equal(JSON.parse(preReview.stdout).ok, true);
+
+    const verified = spawnSync(
+      process.execPath,
+      [cli, "handoff", "verify", contractPath, buildPath, reviewPath],
+      { cwd, encoding: "utf8" },
+    );
+    assert.equal(verified.status, 0, verified.stderr || verified.stdout);
+    assert.equal(JSON.parse(verified.stdout).ok, true);
+  });
+});

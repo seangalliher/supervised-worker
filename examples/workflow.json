@@ -28,7 +28,7 @@
   "review": {
     "required": true,
     "independent": true,
-    "agent": "code-review"
+    "agent": "seangalliher-supervised-diff-reviewer"
   },
   "filing": {
     "maximumNewPerClosures": 1,

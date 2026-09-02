@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "kind": "build-report",
+  "itemId": "issue-42",
+  "producedBy": "seangalliher-supervised-builder",
+  "createdAt": "2026-09-02T12:15:00Z",
+  "status": "implemented",
+  "contractHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "testedTreeHash": "cccccccccccccccccccccccccccccccccccccccc",
+  "changedFiles": [
+    "src/adapter.js",
+    "test/adapter.test.js"
+  ],
+  "checks": [
+    {
+      "command": "node --test test/adapter.test.js",
+      "outcome": "passed",
+      "evidence": {
+        "kind": "test-output",
+        "locator": "local:test/adapter.test.js"
+      }
+    }
+  ],
+  "evidence": [
+    {
+      "kind": "consumer-probe",
+      "locator": "test/adapter.test.js#delivery-handler"
+    }
+  ],
+  "deviations": [],
+  "blocker": null
+}

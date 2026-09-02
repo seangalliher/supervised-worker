@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { PLAN_WRITER_TOOLS } from "../src/core.mjs";
+import { PLAN_WRITER_MATCHER, PLAN_WRITER_TOOLS } from "../src/core.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const hooks = JSON.parse(
@@ -14,10 +14,25 @@ const hooks = JSON.parse(
 ).hooks;
 
 test("packaged PreTool matcher covers the runtime writer vocabulary", () => {
-  const matcher = new Set(
-    hooks.PreToolUse[0].matcher.split("|").map((name) => name.toLowerCase()),
+  const expected = [
+    "Write",
+    "Edit",
+    "create",
+    "edit",
+    "apply_patch",
+    "create_file",
+    "str_replace_editor",
+    "insert",
+    "insert_edit_into_file",
+    "replace_string_in_file",
+    "multi_replace_string_in_file",
+  ];
+  assert.equal(hooks.PreToolUse[0].matcher, PLAN_WRITER_MATCHER);
+  assert.deepEqual(hooks.PreToolUse[0].matcher.split("|"), expected);
+  assert.deepEqual(
+    new Set(expected.map((name) => name.toLowerCase())),
+    new Set([...PLAN_WRITER_TOOLS]),
   );
-  assert.deepEqual(matcher, new Set([...PLAN_WRITER_TOOLS]));
 });
 
 function workspace() {
@@ -189,5 +204,60 @@ test("packaged PowerShell PreToolUse denies a second plan writer", {
     assert.equal(denied.hookSpecificOutput.permissionDecision, "deny");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("packaged PowerShell PreToolUse denies linked-worktree Git roots", {
+  skip: process.platform !== "win32",
+}, () => {
+  const repository = workspace();
+  const worktree = workspace();
+  rmSync(worktree, { recursive: true, force: true });
+  try {
+    execFileSync("git", ["init", "--quiet"], { cwd: repository });
+    writeFileSync(path.join(repository, "tracked.txt"), "baseline\n");
+    execFileSync("git", ["add", "--", "tracked.txt"], { cwd: repository });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=Test User",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "baseline",
+      ],
+      { cwd: repository },
+    );
+    execFileSync("git", ["worktree", "add", "--quiet", "--detach", worktree], {
+      cwd: repository,
+    });
+    const gitDirectory = execFileSync(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-dir"],
+      { cwd: worktree, encoding: "utf8" },
+    ).trim();
+    const commonDirectory = execFileSync(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { cwd: worktree, encoding: "utf8" },
+    ).trim();
+    for (const target of [path.join(gitDirectory, "HEAD"), path.join(commonDirectory, "config")]) {
+      const denied = invokePowerShell(
+        "PreToolUse",
+        {
+          ...payload(worktree, "PreToolUse"),
+          tool_name: "Write",
+          tool_input: { file_path: target },
+        },
+        worktree,
+      );
+      assert.equal(denied.permissionDecision, "deny", target);
+    }
+  } finally {
+    rmSync(worktree, { recursive: true, force: true });
+    rmSync(repository, { recursive: true, force: true });
   }
 });

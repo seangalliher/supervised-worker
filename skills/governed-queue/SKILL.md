@@ -47,17 +47,52 @@ or receive Stop decisions.
 Store runtime state under `.supervised-worker/`. Keep that directory out of Git
 unless the user deliberately chooses to publish sanitized evaluation fixtures.
 
+## Role Handoffs
+
+The Supervised Worker is the only role that writes durable workflow state.
+Architect, Builder, and Diff Reviewer companions return JSON objects conforming
+to `schemas/role-handoff.schema.json`; they never edit `.supervised-worker/`.
+
+For each active item, compute `sha256(itemId)` and store validated artifacts in:
+
+```text
+.supervised-worker/handoffs/<sha256(itemId)>/
+|-- build-contract.json
+|-- build-report.json
+`-- review-report.json
+```
+
+Hash each artifact after writing it. Bind the build report to the contract hash,
+and bind the review report to both artifact hashes plus the frozen staged-tree
+hash. Never use a raw provider item ID as a path segment. Store typed summaries
+and evidence locators, not raw issue bodies, prompts, or tool payloads.
+
+Validate each file with the dependency-free helper:
+
+```text
+node <plugin-root>/src/cli.mjs handoff validate <artifact-path>
+node <plugin-root>/src/cli.mjs handoff pre-review <contract> <build-report>
+node <plugin-root>/src/cli.mjs handoff verify <contract> <build-report> <review-report>
+```
+
+The chain verifier compares exact file-byte hashes, item IDs, consumers,
+`changedFiles` against `targetFiles`, staged paths, unstaged drift, and the
+review report's tree hash against the current Git index.
+
 ## Item Lifecycle
 
 1. **Admit:** Prove the item belongs to the authorized queue and its dependencies
    permit work now.
 2. **Verify premise:** Run a check that would fail if the reported behavior or
    missing artifact were not real.
-3. **Design:** Prefer the repository's established pattern. Rank alternatives for
-   structural decisions.
-4. **Build:** Keep one bounded implementation surface active.
-5. **Validate:** Run focused checks, independent review, then the repository's
-   frozen broad gate.
+3. **Design:** Prefer the repository's established pattern. Use the Supervised
+   Architect for structural decisions and hash the approved build contract.
+4. **Build:** Give one approved contract to the Supervised Builder, or implement
+   a simple local contract directly. Keep one bounded implementation surface active.
+5. **Validate:** Freeze the staged tree; run every focused check and the broad
+   gate against that tree; record `testedTreeHash`; require `handoff pre-review`
+   to pass; run the Supervised Diff Reviewer; then require final `handoff verify`.
+   A repair changes the tree and invalidates the gates and review.
 6. **Bank:** Bind evidence to the exact commit, push target, issue, and closure
    state. Preserve durable receipts before deleting temporary workspaces.
 7. **Reconcile:** Re-enumerate the queue and immediately select the next item.

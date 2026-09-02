@@ -17,6 +17,7 @@ export const PLAN_FILE = "plan.json";
 export const MAX_SAME_PROGRESS_BLOCKS = 2;
 export const MAX_SESSION_BLOCKS = 6;
 export const MAX_PLAN_BYTES = 1_048_576;
+const MAX_GIT_POINTER_BYTES = 4_096;
 
 const ITEM_STATUSES = new Set(["pending", "in_progress", "banked", "parked"]);
 const PLAN_MODES = new Set(["active", "complete", "inactive"]);
@@ -25,18 +26,11 @@ const ITEM_KEYS = new Set(["id", "title", "status", "resumeWhen"]);
 const COMPLETION_KEYS = new Set(["enumeration", "evidence"]);
 const ENUMERATION_KEYS = new Set(["status", "source", "checkedAt", "remainingActionable"]);
 const EVIDENCE_KEYS = new Set(["kind", "locator", "sha256"]);
-export const PLAN_WRITER_TOOLS = new Set([
-  "apply_patch",
-  "create",
-  "create_file",
-  "edit",
-  "insert",
-  "insert_edit_into_file",
-  "multi_replace_string_in_file",
-  "replace_string_in_file",
-  "str_replace_editor",
-  "write",
-]);
+export const PLAN_WRITER_MATCHER =
+  "Write|Edit|create|edit|apply_patch|create_file|str_replace_editor|insert|insert_edit_into_file|replace_string_in_file|multi_replace_string_in_file";
+export const PLAN_WRITER_TOOLS = new Set(
+  PLAN_WRITER_MATCHER.split("|").map((name) => name.toLowerCase()),
+);
 const PATH_KEYS = new Set(["filePath", "file_path", "path"]);
 
 export function sha256(value) {
@@ -384,11 +378,11 @@ function pathEquals(left, right) {
   return normalize(left) === normalize(right);
 }
 
-function toolTouchesPlan(input, cwd) {
+function toolTargetCandidates(input) {
   const rawToolName = input?.tool_name ?? input?.toolName ?? "";
   const toolName = rawToolName.toLowerCase().split(/[./]/).at(-1);
   if (!PLAN_WRITER_TOOLS.has(toolName)) {
-    return false;
+    return [];
   }
   const toolInput = input?.tool_input ?? input?.toolArgs ?? input?.toolInput;
   const candidates = [];
@@ -412,11 +406,6 @@ function toolTouchesPlan(input, cwd) {
       }
     }
   }
-  if (candidates.some((candidate) =>
-    pathEquals(path.isAbsolute(candidate) ? candidate : path.join(cwd, candidate), planPath(cwd)),
-  )) {
-    return true;
-  }
   if (toolName === "apply_patch" || toolName === "edit") {
     const patchTexts = [
       typeof toolInput === "string" ? toolInput : null,
@@ -432,11 +421,194 @@ function toolTouchesPlan(input, cwd) {
         return moveHeader ? [moveHeader] : [];
       }),
     );
-    return targets.some((target) =>
-      pathEquals(path.isAbsolute(target) ? target : path.join(cwd, target), planPath(cwd)),
-    );
+    candidates.push(...targets);
   }
-  return false;
+  return candidates;
+}
+
+function pathWithin(candidatePath, rootPath) {
+  const normalize = (value) => {
+    const resolved = path.resolve(value);
+    if (process.platform !== "win32") return resolved;
+    return resolved
+      .split(path.sep)
+      .map((segment) => segment.replace(/[. ]+$/g, ""))
+      .join(path.sep)
+      .toLowerCase();
+  };
+  return isContained(normalize(rootPath), normalize(candidatePath));
+}
+
+function isWindowsDevicePath(value) {
+  const normalized = value.replaceAll("/", "\\");
+  return normalized.startsWith("\\\\?\\") ||
+    normalized.startsWith("\\\\.\\") ||
+    normalized.startsWith("\\??\\");
+}
+
+function fileIdentity(stats) {
+  const inode = stats.ino;
+  if (inode === 0n) return null;
+  return `${stats.dev}:${inode}`;
+}
+
+function canonicalizeDeepestExisting(candidatePath) {
+  const unresolved = [];
+  let current = path.resolve(candidatePath);
+  while (true) {
+    try {
+      const stats = lstatSync(current, { bigint: true });
+      if (stats.isSymbolicLink()) {
+        try {
+          const canonicalPath = path.resolve(realpathSync(current), ...unresolved);
+          return {
+            path: canonicalPath,
+            unsafe: false,
+            exactExists: unresolved.length === 0,
+            selfIdentity: fileIdentity(lstatSync(canonicalPath, { bigint: true })),
+            ancestorIdentities: existingAncestorIdentities(canonicalPath),
+          };
+        } catch {
+          return pathInspectionFailure(current);
+        }
+      }
+      const canonicalPath = path.resolve(realpathSync(current), ...unresolved);
+      return {
+        path: canonicalPath,
+        unsafe: stats.isFile() && stats.nlink > 1n,
+        exactExists: unresolved.length === 0,
+        selfIdentity: unresolved.length === 0 ? fileIdentity(stats) : null,
+        ancestorIdentities: existingAncestorIdentities(current),
+      };
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") {
+        return pathInspectionFailure(current);
+      }
+      const parent = path.dirname(current);
+      if (parent === current) return pathInspectionFailure(current);
+      unresolved.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+function pathInspectionFailure(candidatePath) {
+  return {
+    path: candidatePath,
+    unsafe: true,
+    exactExists: false,
+    selfIdentity: null,
+    ancestorIdentities: new Set(),
+  };
+}
+
+function existingAncestorIdentities(candidatePath) {
+  const identities = new Set();
+  let current = path.resolve(candidatePath);
+  while (true) {
+    try {
+      const stats = lstatSync(current, { bigint: true });
+      const identity = fileIdentity(stats);
+      if (identity) identities.add(identity);
+      if (stats.isFile() && stats.nlink > 1n) identities.add("multi-linked-regular-file");
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") {
+        identities.add("unresolvable-filesystem-identity");
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return identities;
+}
+
+function inspectToolTargets(input, cwd) {
+  const targets = toolTargetCandidates(input).map((candidate) => {
+    if (isWindowsDevicePath(candidate)) {
+      return { lexical: candidate, canonical: candidate, unsafe: true };
+    }
+    const lexical = path.resolve(path.isAbsolute(candidate) ? candidate : path.join(cwd, candidate));
+    const canonical = canonicalizeDeepestExisting(lexical);
+    return {
+      lexical,
+      canonical: canonical.path,
+      unsafe: canonical.unsafe ||
+        canonical.ancestorIdentities.has("multi-linked-regular-file") ||
+        canonical.ancestorIdentities.has("unresolvable-filesystem-identity"),
+      ancestorIdentities: canonical.ancestorIdentities,
+    };
+  });
+  return { targets, unsafe: targets.some((target) => target.unsafe) };
+}
+
+function targetWithin(target, rootPath) {
+  const canonicalRoot = canonicalizeDeepestExisting(rootPath);
+  return pathWithin(target.lexical, rootPath) ||
+    (!target.unsafe && !canonicalRoot.unsafe && pathWithin(target.canonical, canonicalRoot.path)) ||
+    (canonicalRoot.exactExists &&
+      canonicalRoot.selfIdentity !== null &&
+      target.ancestorIdentities.has(canonicalRoot.selfIdentity));
+}
+
+function readGitPointer(filePath, prefix = null) {
+  let stats;
+  try {
+    stats = lstatSync(filePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stats.isFile() || stats.size > MAX_GIT_POINTER_BYTES) return null;
+  const text = readFileSync(filePath, "utf8");
+  if (text.includes("\0")) return null;
+  const value = prefix
+    ? text.match(new RegExp(`^${prefix}: (.+?)(?:\\r?\\n)?$`))?.[1]
+    : text.match(/^(.+?)(?:\r?\n)?$/)?.[1];
+  if (!value) return null;
+  return path.resolve(path.dirname(filePath), value);
+}
+
+function gitMetadataRoots(cwd) {
+  const dotGit = path.join(path.resolve(cwd), ".git");
+  const roots = [dotGit];
+  let stats;
+  try {
+    stats = lstatSync(dotGit);
+  } catch (error) {
+    if (error?.code === "ENOENT") return roots;
+    throw error;
+  }
+  if (!stats.isFile()) return roots;
+
+  const gitDirectory = readGitPointer(dotGit, "gitdir");
+  if (!gitDirectory) return roots;
+  roots.push(gitDirectory);
+  const commonDirectory = readGitPointer(path.join(gitDirectory, "commondir"));
+  if (commonDirectory) roots.push(commonDirectory);
+  return roots;
+}
+
+function toolTouchesPlan(input, cwd) {
+  const root = planPath(cwd);
+  const canonicalRoot = canonicalizeDeepestExisting(root);
+  return inspectToolTargets(input, cwd).targets.some((target) =>
+    pathEquals(target.lexical, root) ||
+    (!target.unsafe && !canonicalRoot.unsafe && pathEquals(target.canonical, canonicalRoot.path)),
+  );
+}
+
+function toolTouchesState(input, cwd) {
+  return inspectToolTargets(input, cwd).targets.some((target) =>
+    targetWithin(target, stateDirectory(cwd)),
+  );
+}
+
+function toolTouchesGitMetadata(input, cwd) {
+  const targets = inspectToolTargets(input, cwd).targets;
+  return gitMetadataRoots(cwd).some((rootPath) =>
+    targets.some((target) => targetWithin(target, rootPath)),
+  );
 }
 
 function claimSession(cwd, input) {
@@ -659,14 +831,41 @@ function handleHookUnsafe(input, eventName, cwd) {
       );
     }
     case "PreToolUse": {
-      if (!toolTouchesPlan(input, cwd)) return {};
-      assertSafeStatePath(cwd, planPath(cwd));
+      const inspectedTargets = inspectToolTargets(input, cwd);
+      if (inspectedTargets.unsafe) {
+        return preToolDecision(
+          input,
+          "deny",
+          "Supervised Worker denied a file edit because its target path could not be resolved safely.",
+        );
+      }
+      const touchesPlan = toolTouchesPlan(input, cwd);
+      const touchesState = toolTouchesState(input, cwd);
+      if (toolTouchesGitMetadata(input, cwd)) {
+        return preToolDecision(
+          input,
+          "deny",
+          "Supervised Worker denied a direct edit to Git metadata. Use reviewed Git commands from the owning worker instead.",
+        );
+      }
+      if (!touchesState) return {};
+      assertSafeStatePath(cwd, touchesPlan ? planPath(cwd) : stateDirectory(cwd));
       if (sessionHash(input) === null) {
         return preToolDecision(
           input,
           "deny",
-          "Supervised Worker cannot establish plan ownership because this hook payload has no session identifier.",
+          "Supervised Worker cannot establish durable-state ownership because this hook payload has no session identifier.",
         );
+      }
+      if (!touchesPlan) {
+        if (!isAttached(cwd, input)) {
+          return preToolDecision(
+            input,
+            "deny",
+            "Only the session attached to .supervised-worker/plan.json may edit durable workflow state.",
+          );
+        }
+        return {};
       }
       const claim = claimSession(cwd, input);
       if (claim.conflict) {

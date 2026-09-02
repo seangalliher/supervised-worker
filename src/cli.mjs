@@ -4,7 +4,14 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { handleHook, releaseAttachment, summarizePlan, validatePlan } from "./core.mjs";
+import {
+  handleHook,
+  PLAN_WRITER_MATCHER,
+  releaseAttachment,
+  summarizePlan,
+  validatePlan,
+} from "./core.mjs";
+import { inspectHandoffFile, verifyBuildHandoff, verifyHandoffChain } from "./handoff.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const MAX_STDIN_BYTES = 1_048_576;
@@ -60,6 +67,12 @@ function hookInputFailure(eventName, message) {
 }
 
 async function validateRepository() {
+  const expectedAgentFiles = [
+    "seangalliher-supervised-architect.agent.md",
+    "seangalliher-supervised-builder.agent.md",
+    "seangalliher-supervised-diff-reviewer.agent.md",
+    "supervised-worker.agent.md",
+  ];
   const required = [
     ".github/copilot-instructions.md",
     ".github/workflows/ci.yml",
@@ -72,7 +85,7 @@ async function validateRepository() {
     "plugin.json",
     "package.json",
     "package-lock.json",
-    "agents/supervised-worker.agent.md",
+    ...expectedAgentFiles.map((fileName) => `agents/${fileName}`),
     "hooks.json",
     "docs/architecture.md",
     "docs/evaluation.md",
@@ -80,20 +93,35 @@ async function validateRepository() {
     "examples/plan.active.json",
     "examples/plan.complete.json",
     "examples/workflow.json",
+    "examples/handoff.build-contract.json",
+    "examples/handoff.build-report.json",
+    "examples/handoff.review-report.json",
     "policy/constitution.json",
     "schemas/episode.schema.json",
     "schemas/plan.schema.json",
     "schemas/policy-proposal.schema.json",
     "schemas/procedure.schema.json",
+    "schemas/role-handoff.schema.json",
     "schemas/workflow.schema.json",
     "skills/governed-queue/SKILL.md",
     "src/core.mjs",
     "src/cli.mjs",
+    "src/handoff.mjs",
     "src/standards.mjs",
   ];
   const errors = required
     .filter((relativePath) => !existsSync(path.join(root, relativePath)))
     .map((relativePath) => `missing ${relativePath}`);
+  try {
+    const actualAgentFiles = readdirSync(path.join(root, "agents"))
+      .filter((fileName) => fileName.endsWith(".agent.md"))
+      .sort();
+    if (JSON.stringify(actualAgentFiles) !== JSON.stringify(expectedAgentFiles)) {
+      errors.push(`agent role pack differs: ${actualAgentFiles.join(", ")}`);
+    }
+  } catch (error) {
+    errors.push(`agent role pack cannot be enumerated: ${error.message}`);
+  }
   let pluginVersion = null;
   try {
     const plugin = JSON.parse(readFileSync(path.join(root, "plugin.json"), "utf8"));
@@ -132,6 +160,9 @@ async function validateRepository() {
     if (JSON.stringify(Object.keys(hooks.hooks ?? {})) !== JSON.stringify(expectedEvents)) {
       errors.push("hooks.json event set or ordering is invalid");
     }
+    if (hooks.hooks?.PreToolUse?.[0]?.matcher !== PLAN_WRITER_MATCHER) {
+      errors.push("PreToolUse matcher differs from the case-sensitive writer vocabulary");
+    }
     for (const event of expectedEvents) {
       for (const entry of hooks.hooks?.[event] ?? []) {
         if (!entry.bash?.includes("${PLUGIN_ROOT}/src/cli.mjs")) {
@@ -149,7 +180,7 @@ async function validateRepository() {
     errors.push(`hooks.json is invalid: ${error.message}`);
   }
   for (const relativePath of [
-    "agents/supervised-worker.agent.md",
+    ...expectedAgentFiles.map((fileName) => `agents/${fileName}`),
     "skills/governed-queue/SKILL.md",
   ]) {
     try {
@@ -252,7 +283,9 @@ async function validateRepository() {
   }
   const readmeText = readFileSync(path.join(root, "README.md"), "utf8");
   for (const phrase of [
-    "A `Supervised Worker` custom agent.",
+    "A `Supervised Worker` custom agent that owns queue and release state.",
+    "Supervised Architect`, `Supervised Builder`, and `Supervised Diff",
+    "--agent=supervised-worker",
     "Copilot CLI 1.0.74 or newer",
     "metadata-only lifecycle records",
     "does not yet capture outcome episodes or activate learned procedures",
@@ -283,7 +316,7 @@ function nonEmpty(value) {
 }
 
 async function main() {
-  const [command = "help", argument] = process.argv.slice(2);
+  const [command = "help", argument, ...argumentsAfter] = process.argv.slice(2);
   if (command === "hook") {
     let text;
     try {
@@ -349,6 +382,26 @@ async function main() {
     }
     return;
   }
+  if (command === "handoff") {
+    let report;
+    if (argument === "validate" && argumentsAfter.length === 1) {
+      report = inspectHandoffFile(process.cwd(), argumentsAfter[0]);
+    } else if (argument === "pre-review" && argumentsAfter.length === 2) {
+      report = verifyBuildHandoff(process.cwd(), ...argumentsAfter);
+    } else if (argument === "verify" && argumentsAfter.length === 3) {
+      report = verifyHandoffChain(process.cwd(), ...argumentsAfter);
+    } else {
+      report = {
+        ok: false,
+        errors: [
+          "Usage: handoff validate <artifact> | handoff pre-review <contract> <build-report> | handoff verify <contract> <build-report> <review-report>",
+        ],
+      };
+    }
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    if (!report.ok) process.exitCode = 1;
+    return;
+  }
   if (command === "validate" || command === "doctor") {
     const errors = await validateRepository();
     const report = {
@@ -363,7 +416,7 @@ async function main() {
     return;
   }
   process.stdout.write(
-    "Usage: node src/cli.mjs <validate|doctor|status|release|hook EVENT>\n",
+    "Usage: node src/cli.mjs <validate|doctor|status|release|handoff|hook EVENT>\n",
   );
 }
 

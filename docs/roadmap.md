@@ -3,6 +3,9 @@
 ## v0.1 - Portable Governance
 
 - Agent Plugins 1.0 package
+- Namespaced Architect, Builder, and Diff Reviewer companion agents
+- Typed, hash-bound role handoff contract
+- Dependency-free staged-tree and cross-artifact handoff verifier
 - Cross-platform Copilot lifecycle hooks
 - Durable plan and session recovery
 - Complete-enumeration and queue-completion contract
@@ -12,8 +15,11 @@
 - Package doctor and cross-platform CI
 - Dogfood evidence from real queue campaigns
 
-The alpha in this repository implements the first executable slice. It does not
-yet verify GitHub pagination, commit pushes, or external gate receipts itself.
+The alpha in this repository implements the first executable slice and the
+role-separated companion pack. Persisted responses and their staged candidate
+are verified by the helper; the host does not yet reject malformed subagent JSON
+before it reaches the Worker. The alpha also does not yet verify GitHub
+pagination, commit pushes, or external gate receipts itself.
 
 ## v0.2 - Operational Reliability
 

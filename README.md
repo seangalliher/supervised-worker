@@ -8,7 +8,7 @@ mistaking activity for completion. Copilot still plans, edits, runs tools, and
 reasons. This plugin supplies durable state, queue semantics, review discipline,
 metadata-only lifecycle records, and a bounded completion gate.
 
-> Status: `0.1.0-alpha.1`. Suitable for local evaluation in trusted
+> Status: `0.1.1-alpha.1`. Suitable for local evaluation in trusted
 > repositories. It is not yet a security boundary or an unattended production
 > scheduler.
 
@@ -28,8 +28,11 @@ Supervised Worker makes those transitions explicit and inspectable.
 
 ## What It Provides
 
-- A `Supervised Worker` custom agent.
+- A `Supervised Worker` custom agent that owns queue and release state.
+- Namespaced `Supervised Architect`, `Supervised Builder`, and `Supervised Diff
+  Reviewer` companion agents with non-overlapping authority.
 - A `governed-queue` skill with a durable plan and banking contract.
+- A typed, hash-bound contract for architecture, build, and review handoffs.
 - Cross-platform lifecycle hooks for recovery, metadata-only run ledgers,
   compaction markers, plan ownership, and bounded Stop enforcement.
 - A runtime-dependency-free Node helper with repository validation and plan status.
@@ -44,6 +47,47 @@ manage a worktree fleet, or replace GitHub Copilot.
 
 The alpha helper records only lifecycle and tool-result metadata. It does not
 store prompts, command arguments, source code, or tool output.
+
+## Role-Separated Execution
+
+The main worker remains the sole queue governor and durable-state owner:
+
+```text
+Supervised Worker
+|-- Supervised Architect ----> verified build contract
+|-- Supervised Builder ------> bounded changes + provisional build report
+`-- Supervised Diff Reviewer -> frozen-tree consumer review
+```
+
+The Architect and Diff Reviewer are read-only. The Builder may edit only files
+listed in an approved contract. Companion agents never edit `.supervised-worker`,
+stage files, commit, push, close issues, or attest queue completion. Simple local
+changes may stay in the main worker; it still creates compact contract and build
+artifacts before independent review.
+
+Delegated builds run in a clean isolated worktree. Final verification rejects
+unstaged tracked changes, non-state untracked files, staged paths omitted from
+the build report, and reported changes outside `targetFiles`. This is a release
+evidence boundary, not a sandbox against a compromised same-user process.
+Because companions have no shell tool, the main Worker runs executable checks.
+It may return their evidence to the Builder or author the final build report
+itself; a Builder without supplied results must report validation as pending.
+
+Companion responses conform to the [role handoff
+schema](schemas/role-handoff.schema.json). The main worker persists validated
+summaries under a directory derived from `sha256(itemId)`, then binds the build
+report to the contract hash and the review report to both artifact hashes plus
+the frozen staged-tree hash. The agents do not pin model names. A different
+reviewer model family is preferred when available, but context isolation is the
+required independence boundary.
+
+The established main ID remains `supervised-worker` for backward compatibility;
+new companion IDs use the `seangalliher-supervised-*` publisher prefix to reduce
+accidental collisions. GitHub Copilot uses first-found-wins precedence, so a
+project or user agent can still shadow any plugin agent with the same filename.
+Before a governed run, inspect `/env` and verify the selected agent is sourced
+from this plugin. This provenance check is operational hygiene, not a security
+boundary against a malicious same-user repository.
 
 ## Local Evaluation
 
@@ -89,6 +133,7 @@ For a queue or multi-step task, the agent creates:
 ```text
 .supervised-worker/
 |-- plan.json
+|-- handoffs/<sha256(itemId)>/
 |-- runs/
 `-- runtime/
 ```
@@ -96,6 +141,10 @@ For a queue or multi-step task, the agent creates:
 Keep this directory untracked. `plan.json` is the durable source of current work
 and completion evidence. Run ledgers contain hashes, event names, tool names,
 success flags, and counters, but no raw tool payloads.
+
+Handoff files contain typed summaries, source paths, commands, and evidence
+locators. They must not contain raw issue bodies, prompts, tool payloads,
+credentials, or source contents.
 
 The session that creates or updates `plan.json` through a file-editing tool is
 attached to the plan. Other Copilot sessions in the repository remain inert:
@@ -117,6 +166,26 @@ node src/cli.mjs status
 
 `doctor` validates the package and reports durable plan state for the current
 directory. The lifecycle host invokes `hook EVENT` automatically.
+
+The installed helper validates role artifacts without npm runtime dependencies:
+
+```bash
+node /absolute/path/to/supervised-worker/src/cli.mjs handoff validate \
+  .supervised-worker/handoffs/<item-hash>/build-contract.json
+node /absolute/path/to/supervised-worker/src/cli.mjs handoff pre-review \
+  .supervised-worker/handoffs/<item-hash>/build-contract.json \
+  .supervised-worker/handoffs/<item-hash>/build-report.json
+node /absolute/path/to/supervised-worker/src/cli.mjs handoff verify \
+  .supervised-worker/handoffs/<item-hash>/build-contract.json \
+  .supervised-worker/handoffs/<item-hash>/build-report.json \
+  .supervised-worker/handoffs/<item-hash>/review-report.json
+```
+
+`validate` reports the SHA-256 of the exact artifact bytes. `pre-review` checks
+the contract/report binding, approved file footprint, clean worktree, staged
+paths, every contract-required check, and `testedTreeHash` against the current
+staged tree before the read-only Reviewer receives a rendered diff. `verify`
+adds the review artifact, item and consumer identity, and final clean verdict.
 
 If a prior attached session is known to be stale, run the helper from the target
 repository, not the plugin checkout:
