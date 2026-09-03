@@ -44,10 +44,15 @@ test("all role handoff examples validate", () => {
   }
 });
 
-test("both Worker selector identities produce valid handoffs", () => {
+test("raw and plugin-qualified Worker selector identities produce valid handoffs", () => {
   const contract = clone(readJson("examples/handoff.build-contract.json"));
   const build = clone(readJson("examples/handoff.build-report.json"));
-  for (const producer of ["supervised-worker", "seangalliher-supervised-worker"]) {
+  for (const producer of [
+    "supervised-worker",
+    "seangalliher-supervised-worker",
+    "supervised-worker:supervised-worker",
+    "supervised-worker:seangalliher-supervised-worker",
+  ]) {
     contract.producedBy = producer;
     assertValid(contract, `${producer} contract`);
     build.producedBy = producer;
@@ -190,12 +195,17 @@ test("review report requires a real staged tree hash", () => {
 });
 
 test("legacy v1 handoffs remain valid only with bundled reference roles", () => {
-  for (const fileName of [
-    "handoff.build-contract.json",
-    "handoff.build-report.json",
-    "handoff.review-report.json",
-  ]) {
-    const legacy = clone(readJson(`examples/${fileName}`));
+  const legacyProducers = new Map([
+    ["handoff.build-contract.json", "seangalliher-supervised-architect"],
+    ["handoff.build-report.json", "seangalliher-supervised-builder"],
+    ["handoff.review-report.json", "seangalliher-supervised-diff-reviewer"],
+  ]);
+  for (const [fileName, producedBy] of legacyProducers) {
+    const previousV2 = clone(readJson(`examples/${fileName}`));
+    previousV2.producedBy = producedBy;
+    assertValid(previousV2, `previous version 2 ${fileName}`);
+
+    const legacy = clone(previousV2);
     legacy.schemaVersion = 1;
     delete legacy.workflowHash;
     assertValid(legacy, `legacy ${fileName}`);
@@ -223,4 +233,44 @@ test("schema and runtime reject the same noncanonical timestamps", () => {
       assertInvalid(value, `${fileName} timestamp ${timestamp}`);
     }
   }
+});
+
+test("review model resolution is schema and runtime validated", () => {
+  for (const mutate of [
+    (value) => { delete value.modelResolution.reviewer.evidence; },
+    (value) => {
+      value.modelResolution.reviewer.evidence = {
+        kind: "self-attested",
+        locator: "agent-output:claim",
+        sha256: "a".repeat(64),
+      };
+    },
+    (value) => { value.modelResolution.reviewer.model = "GPT 5.6 Sol"; },
+    (value) => { value.modelResolution.reviewer.model = 5; },
+    (value) => { value.modelResolution.builder.family = "Anthropic"; },
+    (value) => { value.modelResolution.builder.family = 5; },
+    (value) => { value.modelResolution.extra = {}; },
+  ]) {
+    const value = clone(readJson("examples/handoff.review-report.json"));
+    mutate(value);
+    assertInvalid(value, "invalid model resolution");
+  }
+});
+
+test("review model separation must agree with resolved families", () => {
+  const sameFamily = clone(readJson("examples/handoff.review-report.json"));
+  sameFamily.modelResolution.builder.family = "openai";
+  assert.equal(validate(sameFamily), true, ajv.errorsText(validate.errors));
+  assert.match(
+    validateHandoffValue(sameFamily, root).join("\n"),
+    /identical resolved model families/,
+  );
+
+  const differentFamilies = clone(readJson("examples/handoff.review-report.json"));
+  differentFamilies.modelSeparation = "same-family";
+  assert.equal(validate(differentFamilies), true, ajv.errorsText(validate.errors));
+  assert.match(
+    validateHandoffValue(differentFamilies, root).join("\n"),
+    /different resolved model families/,
+  );
 });

@@ -1,9 +1,15 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 
-import { sha256, stateDirectory } from "./core.mjs";
-import { resolveWorkflowRoles, WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
+import { atomicWriteJson, sha256, stateDirectory } from "./core.mjs";
+import {
+  LEGACY_DEFAULT_ROLES,
+  parseWorkflowJson,
+  resolveWorkflowRoles,
+  WORKFLOW_CONFIG_PATH,
+} from "./workflow.mjs";
 
 export const MAX_HANDOFF_BYTES = 1_048_576;
 
@@ -17,7 +23,31 @@ const PROTECTED_ROOTS = new Set([".git", ".supervised-worker"]);
 const HASH_RE = /^[0-9a-f]{64}$/;
 const TREE_HASH_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const ID_RE = /^[a-z0-9][a-z0-9.-]*$/;
-const WORKER_PRODUCERS = ["supervised-worker", "seangalliher-supervised-worker"];
+const MODEL_ID_RE = /^[a-z0-9](?:[a-z0-9._:/-]{0,126}[a-z0-9])?$/;
+const MODEL_FAMILY_RE = /^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/;
+const MODEL_RECEIPT_HOSTS = new Set([
+  "vscode",
+  "copilot-cli",
+  "github-copilot-app",
+  "copilot-cloud-agent",
+]);
+const REVIEW_ATTEMPT_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const REVIEW_CLOCK_SKEW_MS = 5 * 60 * 1_000;
+const REVIEW_ATTEMPT_KEYS = new Set([
+  "schemaVersion",
+  "itemId",
+  "reviewAttemptId",
+  "issuedAt",
+  "contractHash",
+  "buildReportHash",
+  "stagedTreeHash",
+]);
+const WORKER_PRODUCERS = [
+  "supervised-worker",
+  "seangalliher-supervised-worker",
+  "supervised-worker:supervised-worker",
+  "supervised-worker:seangalliher-supervised-worker",
+];
 
 function isRecord(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -235,6 +265,12 @@ function validateCommon(value, expectedKind, producers, workflow, errors) {
   return errors;
 }
 
+function companionProducers(workflow, role) {
+  const producers = [workflow[role]];
+  if (!workflow.configured) producers.push(LEGACY_DEFAULT_ROLES[role]);
+  return [...new Set(producers)];
+}
+
 function validateBuildContract(value, workspace, roles) {
   const errors = [];
   const keys = new Set([
@@ -248,7 +284,7 @@ function validateBuildContract(value, workspace, roles) {
   validateCommon(
     value,
     "build-contract",
-    [...WORKER_PRODUCERS, roles.architect],
+    [...WORKER_PRODUCERS, ...companionProducers(roles, "architect")],
     roles,
     errors,
   );
@@ -330,7 +366,7 @@ function validateBuildReport(value, workspace, roles) {
   validateCommon(
     value,
     "build-report",
-    [...WORKER_PRODUCERS, roles.builder],
+    [...WORKER_PRODUCERS, ...companionProducers(roles, "builder")],
     roles,
     errors,
   );
@@ -384,24 +420,97 @@ function validateFinding(value, label, errors) {
   if (typeof value.blocksCommit !== "boolean") errors.push(`${label}.blocksCommit must be boolean`);
 }
 
+function modelReceiptLocator(itemId, role) {
+  return `.supervised-worker/runtime/model-receipts/${sha256(itemId)}/${role}.json`;
+}
+
+function validateHostModelEvidence(value, itemId, role, label, errors) {
+  if (!requiredKeys(value, ["kind", "locator", "sha256"], label, errors)) return;
+  unknownKeys(value, new Set(["kind", "locator", "sha256"]), label, errors);
+  if (value.kind !== "host-model") errors.push(`${label}.kind must be host-model`);
+  if (value.locator !== modelReceiptLocator(itemId, role)) {
+    errors.push(`${label}.locator does not match the canonical model receipt path`);
+  }
+  if (!HASH_RE.test(value.sha256 ?? "")) errors.push(`${label}.sha256 must be a SHA-256 hash`);
+}
+
+function validateModelIdentity(value, itemId, role, label, errors) {
+  if (!requiredKeys(value, ["model", "family", "evidence"], label, errors)) return;
+  unknownKeys(value, new Set(["model", "family", "evidence"]), label, errors);
+  if (typeof value.model !== "string" || !MODEL_ID_RE.test(value.model)) {
+    errors.push(`${label}.model is invalid`);
+  }
+  if (typeof value.family !== "string" || !MODEL_FAMILY_RE.test(value.family)) {
+    errors.push(`${label}.family is invalid`);
+  }
+  validateHostModelEvidence(value.evidence, itemId, role, `${label}.evidence`, errors);
+}
+
+function validateModelResolution(value, itemId, errors) {
+  if (!requiredKeys(value, ["builder", "reviewer"], "modelResolution", errors)) return;
+  unknownKeys(value, new Set(["builder", "reviewer"]), "modelResolution", errors);
+  validateModelIdentity(value.builder, itemId, "builder", "modelResolution.builder", errors);
+  validateModelIdentity(value.reviewer, itemId, "reviewer", "modelResolution.reviewer", errors);
+}
+
 function validateReviewReport(value, roles) {
   const errors = [];
   const keys = new Set([
     "schemaVersion", "kind", "itemId", "producedBy", "workflowHash", "createdAt", "contractHash",
     "buildReportHash", "stagedTreeHash", "claimedBehavior", "consumers", "modelSeparation",
-    "verdict", "findings", "notChecked",
+    "reviewAttemptId", "modelResolution", "verdict", "findings", "notChecked",
   ]);
-  const required = [...keys].filter((key) => key !== "workflowHash" || value?.schemaVersion === 2);
+  const required = [...keys].filter(
+    (key) =>
+      key !== "modelResolution" &&
+      !(["workflowHash", "reviewAttemptId"].includes(key) && value?.schemaVersion !== 2),
+  );
   if (!requiredKeys(value, required, "review-report", errors)) return errors;
   unknownKeys(value, keys, "review-report", errors);
-  validateCommon(value, "review-report", [roles.reviewer], roles, errors);
+  validateCommon(
+    value,
+    "review-report",
+    companionProducers(roles, "reviewer"),
+    roles,
+    errors,
+  );
   if (!HASH_RE.test(value.contractHash ?? "")) errors.push("contractHash must be a SHA-256 hash");
   if (!HASH_RE.test(value.buildReportHash ?? "")) errors.push("buildReportHash must be a SHA-256 hash");
   if (!TREE_HASH_RE.test(value.stagedTreeHash ?? "")) errors.push("stagedTreeHash is invalid");
+  if (
+    value.schemaVersion === 2 &&
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      value.reviewAttemptId ?? "",
+    )
+  ) {
+    errors.push("reviewAttemptId is invalid");
+  }
   if (!nonBlank(value.claimedBehavior)) errors.push("claimedBehavior must be non-empty");
   stringArray(value.consumers, "consumers", errors, { minimum: 1, unique: true });
   if (!["different-family", "same-family", "unknown"].includes(value.modelSeparation)) {
     errors.push("modelSeparation is invalid");
+  }
+  if (value.modelResolution !== undefined) {
+    validateModelResolution(value.modelResolution, value.itemId, errors);
+  }
+  const reviewPolicy = roles.reviewPolicy ?? {};
+  const modelPolicyActive = Boolean(
+    reviewPolicy.requiredModel ||
+    reviewPolicy.requiredModelFamily ||
+    reviewPolicy.requireDifferentModelFamily,
+  );
+  if (modelPolicyActive && value.modelResolution === undefined) {
+    errors.push("modelResolution is required by the accepted workflow");
+  }
+  if (value.modelResolution !== undefined) {
+    const builderFamily = value.modelResolution?.builder?.family;
+    const reviewerFamily = value.modelResolution?.reviewer?.family;
+    if (value.modelSeparation === "different-family" && builderFamily === reviewerFamily) {
+      errors.push("modelSeparation conflicts with identical resolved model families");
+    }
+    if (value.modelSeparation === "same-family" && builderFamily !== reviewerFamily) {
+      errors.push("modelSeparation conflicts with different resolved model families");
+    }
   }
   if (!["clean", "changes-required"].includes(value.verdict)) errors.push("verdict is invalid");
   if (!Array.isArray(value.findings)) errors.push("findings must be an array");
@@ -409,6 +518,20 @@ function validateReviewReport(value, roles) {
   stringArray(value.notChecked, "notChecked", errors, { unique: true });
   if (value.verdict === "clean" && value.findings?.length !== 0) {
     errors.push("clean review cannot contain findings");
+  }
+  if (value.verdict === "clean" && modelPolicyActive) {
+    if (value.modelResolution?.reviewer?.model !== reviewPolicy.requiredModel) {
+      errors.push("clean review did not use the workflow-required reviewer model");
+    }
+    if (value.modelResolution?.reviewer?.family !== reviewPolicy.requiredModelFamily) {
+      errors.push("clean review did not use the workflow-required reviewer model family");
+    }
+    if (
+      reviewPolicy.requireDifferentModelFamily &&
+      value.modelSeparation !== "different-family"
+    ) {
+      errors.push("clean review requires a different Builder and Reviewer model family");
+    }
   }
   if (value.verdict === "changes-required") {
     if (!value.findings?.length) errors.push("changes-required review needs findings");
@@ -427,11 +550,196 @@ export function validateHandoffValue(value, workspace = process.cwd()) {
     ...workflow.roles,
     configured: workflow.configured,
     workflowHash: workflow.workflowHash,
+    reviewPolicy: workflow.reviewPolicy,
   };
   if (value.kind === "build-contract") return validateBuildContract(value, workspace, effectiveWorkflow);
   if (value.kind === "build-report") return validateBuildReport(value, workspace, effectiveWorkflow);
   if (value.kind === "review-report") return validateReviewReport(value, effectiveWorkflow);
   return ["handoff kind is unsupported"];
+}
+
+export function validateModelReceiptValue(value) {
+  const errors = [];
+  const keys = new Set([
+    "schemaVersion",
+    "itemId",
+    "role",
+    "agentSelector",
+    "model",
+    "family",
+    "workflowHash",
+    "reviewAttemptId",
+    "buildReportHash",
+    "stagedTreeHash",
+    "observedBy",
+    "observedAt",
+    "host",
+    "sessionHash",
+    "source",
+  ]);
+  if (!requiredKeys(value, [...keys], "model receipt", errors)) return errors;
+  unknownKeys(value, keys, "model receipt", errors);
+  if (value.schemaVersion !== 2) errors.push("model receipt schemaVersion must be 2");
+  if (!nonBlank(value.itemId)) errors.push("model receipt itemId must be non-empty");
+  if (!["builder", "reviewer"].includes(value.role)) errors.push("model receipt role is invalid");
+  if (!nonBlank(value.agentSelector)) errors.push("model receipt agentSelector must be non-empty");
+  if (typeof value.model !== "string" || !MODEL_ID_RE.test(value.model)) {
+    errors.push("model receipt model is invalid");
+  }
+  if (typeof value.family !== "string" || !MODEL_FAMILY_RE.test(value.family)) {
+    errors.push("model receipt family is invalid");
+  }
+  if (value.workflowHash !== null && !HASH_RE.test(value.workflowHash ?? "")) {
+    errors.push("model receipt workflowHash must be null or a SHA-256 hash");
+  }
+  if (
+    typeof value.reviewAttemptId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      value.reviewAttemptId,
+    )
+  ) {
+    errors.push("model receipt reviewAttemptId is invalid");
+  }
+  if (!HASH_RE.test(value.buildReportHash ?? "")) {
+    errors.push("model receipt buildReportHash is invalid");
+  }
+  if (!TREE_HASH_RE.test(value.stagedTreeHash ?? "")) {
+    errors.push("model receipt stagedTreeHash is invalid");
+  }
+  if (!WORKER_PRODUCERS.includes(value.observedBy)) {
+    errors.push("model receipt observedBy must identify the Supervised Worker");
+  }
+  if (!isDateTime(value.observedAt)) errors.push("model receipt observedAt must be RFC 3339");
+  if (!MODEL_RECEIPT_HOSTS.has(value.host)) errors.push("model receipt host is invalid");
+  if (!HASH_RE.test(value.sessionHash ?? "")) errors.push("model receipt sessionHash is invalid");
+  if (value.source !== "host") errors.push("model receipt source must be host");
+  return errors;
+}
+
+function reviewAttemptLocator(itemId) {
+  return `.supervised-worker/runtime/review-attempts/${sha256(itemId)}.json`;
+}
+
+function validateReviewAttemptValue(value) {
+  const errors = [];
+  if (!requiredKeys(value, [...REVIEW_ATTEMPT_KEYS], "review attempt", errors)) return errors;
+  unknownKeys(value, REVIEW_ATTEMPT_KEYS, "review attempt", errors);
+  if (value.schemaVersion !== 1) errors.push("review attempt schemaVersion must be 1");
+  if (!nonBlank(value.itemId)) errors.push("review attempt itemId must be non-empty");
+  if (
+    typeof value.reviewAttemptId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      value.reviewAttemptId,
+    )
+  ) {
+    errors.push("review attempt reviewAttemptId is invalid");
+  }
+  if (!isDateTime(value.issuedAt)) errors.push("review attempt issuedAt must be RFC 3339");
+  if (!HASH_RE.test(value.contractHash ?? "")) {
+    errors.push("review attempt contractHash is invalid");
+  }
+  if (!HASH_RE.test(value.buildReportHash ?? "")) {
+    errors.push("review attempt buildReportHash is invalid");
+  }
+  if (!TREE_HASH_RE.test(value.stagedTreeHash ?? "")) {
+    errors.push("review attempt stagedTreeHash is invalid");
+  }
+  return errors;
+}
+
+function loadRuntimeJson(workspace, relativeParts, label) {
+  const workspaceReal = realpathSync(path.resolve(workspace));
+  const stateRoot = stateDirectory(workspaceReal);
+  const runtimeRoot = path.join(stateRoot, "runtime");
+  const filePath = path.join(runtimeRoot, ...relativeParts);
+  const directories = [stateRoot, runtimeRoot];
+  let current = runtimeRoot;
+  for (const part of relativeParts.slice(0, -1)) {
+    current = path.join(current, part);
+    directories.push(current);
+  }
+  for (const candidate of [...directories, filePath]) {
+    let stats;
+    try {
+      stats = lstatSync(candidate);
+    } catch (error) {
+      throw new Error(`${label} path is unavailable: ${error.message}`);
+    }
+    if (stats.isSymbolicLink()) throw new Error(`${label} path contains a link`);
+    if (candidate !== filePath && !stats.isDirectory()) {
+      throw new Error(`${label} path component is not a directory`);
+    }
+    if (candidate === filePath && (!stats.isFile() || stats.nlink > 1)) {
+      throw new Error(`${label} is not a safe regular file`);
+    }
+    if (candidate === filePath && stats.size > MAX_HANDOFF_BYTES) {
+      throw new Error(`${label} exceeds the size limit`);
+    }
+  }
+  const resolved = realpathSync(filePath);
+  if (!isContained(realpathSync(runtimeRoot), resolved)) {
+    throw new Error(`${label} resolves outside the runtime root`);
+  }
+  const bytes = readFileSync(resolved);
+  try {
+    return { value: parseWorkflowJson(bytes), bytes };
+  } catch (error) {
+    throw new Error(`${label} is invalid JSON: ${error.message}`);
+  }
+}
+
+function loadReviewAttempt(workspace, itemId) {
+  const loaded = loadRuntimeJson(
+    workspace,
+    ["review-attempts", `${sha256(itemId)}.json`],
+    "review attempt",
+  );
+  const errors = validateReviewAttemptValue(loaded.value);
+  if (errors.length > 0) throw new Error(errors.join("; "));
+  return loaded.value;
+}
+
+function loadModelReceipt(workspace, review, workflow, role, attempt, now) {
+  const identity = review.modelResolution[role];
+  const expectedLocator = modelReceiptLocator(review.itemId, role);
+  if (identity.evidence.locator !== expectedLocator) {
+    throw new Error(`${role} model receipt locator is not canonical`);
+  }
+  const { bytes, value } = loadRuntimeJson(
+    workspace,
+    ["model-receipts", sha256(review.itemId), `${role}.json`],
+    `${role} model receipt`,
+  );
+  if (sha256(bytes) !== identity.evidence.sha256) {
+    throw new Error(`${role} model receipt hash does not match the review report`);
+  }
+  const errors = validateModelReceiptValue(value);
+  const expected = {
+    itemId: review.itemId,
+    role,
+    agentSelector: workflow.roles[role],
+    model: identity.model,
+    family: identity.family,
+    workflowHash: workflow.workflowHash,
+    reviewAttemptId: review.reviewAttemptId,
+    buildReportHash: review.buildReportHash,
+    stagedTreeHash: review.stagedTreeHash,
+  };
+  for (const [key, expectedValue] of Object.entries(expected)) {
+    if (value[key] !== expectedValue) errors.push(`${role} model receipt ${key} does not match`);
+  }
+  if (errors.length > 0) throw new Error(errors.join("; "));
+  const observedAt = Date.parse(value.observedAt);
+  if (observedAt > Date.parse(review.createdAt)) {
+    throw new Error(`${role} model receipt observedAt is after the review report`);
+  }
+  if (observedAt > now + REVIEW_CLOCK_SKEW_MS) {
+    throw new Error(`${role} model receipt observedAt is too far in the future`);
+  }
+  if (attempt && observedAt < Date.parse(attempt.issuedAt) - REVIEW_CLOCK_SKEW_MS) {
+    throw new Error(`${role} model receipt observedAt is before the review attempt`);
+  }
+  return value;
 }
 
 function assertSafeArtifactPath(workspace, filePath) {
@@ -559,8 +867,48 @@ function setEquals(left, right) {
   return [...left].every((value) => right.has(value));
 }
 
+function resolveGitExecutable(workspace) {
+  const workspaceReal = realpathSync(path.resolve(workspace));
+  const pathValue = process.env.PATH ?? process.env.Path ?? "";
+  const executableName = process.platform === "win32" ? "git.exe" : "git";
+  for (const rawEntry of pathValue.split(path.delimiter)) {
+    const trimmed = rawEntry.trim();
+    const entry = trimmed.startsWith('"') && trimmed.endsWith('"')
+      ? trimmed.slice(1, -1)
+      : trimmed;
+    if (!path.isAbsolute(entry)) continue;
+    const candidate = path.join(entry, executableName);
+    try {
+      const resolved = realpathSync(candidate);
+      if (!lstatSync(resolved).isFile() || isContained(workspaceReal, resolved)) continue;
+      return resolved;
+    } catch {
+      // Continue to the next absolute PATH entry.
+    }
+  }
+  throw new Error("trusted Git executable is unavailable outside the workspace");
+}
+
+function runGit(workspace, args, encoding) {
+  const workspaceReal = realpathSync(path.resolve(workspace));
+  const executable = resolveGitExecutable(workspaceReal);
+  return execFileSync(
+    executable,
+    [
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "core.untrackedCache=false",
+      "-C",
+      workspaceReal,
+      ...args,
+    ],
+    { cwd: path.dirname(executable), encoding },
+  );
+}
+
 function gitPaths(workspace, args) {
-  const output = execFileSync("git", args, { cwd: workspace, encoding: "buffer" });
+  const output = runGit(workspace, args, "buffer");
   return output.toString("utf8").split("\0").filter(Boolean).map((value) => value.replaceAll("\\", "/"));
 }
 
@@ -602,15 +950,29 @@ function verifyBuildContext(workspace, contractPath, buildReportPath) {
 
   let stagedTreeHash = null;
   try {
-    stagedTreeHash = execFileSync("git", ["write-tree"], { cwd: workspace, encoding: "utf8" }).trim();
+    stagedTreeHash = runGit(workspace, ["write-tree"], "utf8").trim();
     if (build.value.testedTreeHash !== stagedTreeHash) {
       errors.push("build report testedTreeHash does not match the current Git index");
     }
     const staged = new Set(
-      gitPaths(workspace, ["diff", "--cached", "--no-renames", "--name-only", "-z"]).map(pathKey),
+      gitPaths(workspace, [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--cached",
+        "--no-renames",
+        "--name-only",
+        "-z",
+      ]).map(pathKey),
     );
     if (!setEquals(staged, changed)) errors.push("staged paths do not exactly match build report changedFiles");
-    const unstaged = new Set(gitPaths(workspace, ["diff", "--name-only", "-z"]).map(pathKey));
+    const unstaged = new Set(gitPaths(workspace, [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--name-only",
+      "-z",
+    ]).map(pathKey));
     if (unstaged.size > 0) errors.push("worktree contains unstaged tracked changes");
     const untracked = gitPaths(workspace, ["ls-files", "--others", "--exclude-standard", "-z"])
       .map(pathKey)
@@ -646,6 +1008,43 @@ export function verifyBuildHandoff(workspace, contractPath, buildReportPath) {
   };
 }
 
+export function issueReviewAttempt(workspace, contractPath, buildReportPath) {
+  const result = verifyBuildContext(workspace, contractPath, buildReportPath);
+  if (!result.ok) {
+    return {
+      ok: false,
+      itemId: result.itemId ?? null,
+      reviewAttemptId: null,
+      issuedAt: null,
+      contractHash: result.contractHash ?? null,
+      buildReportHash: result.buildReportHash ?? null,
+      stagedTreeHash: result.stagedTreeHash ?? null,
+      locator: null,
+      errors: result.errors,
+    };
+  }
+  const attempt = {
+    schemaVersion: 1,
+    itemId: result.itemId,
+    reviewAttemptId: randomUUID(),
+    issuedAt: new Date().toISOString(),
+    contractHash: result.contractHash,
+    buildReportHash: result.buildReportHash,
+    stagedTreeHash: result.stagedTreeHash,
+  };
+  const locator = reviewAttemptLocator(result.itemId);
+  try {
+    atomicWriteJson(
+      workspace,
+      path.join(path.resolve(workspace), ...locator.split("/")),
+      attempt,
+    );
+  } catch (error) {
+    return { ok: false, ...attempt, locator, errors: [error.message] };
+  }
+  return { ok: true, ...attempt, locator, errors: [] };
+}
+
 export function verifyHandoffChain(workspace, contractPath, buildReportPath, reviewReportPath) {
   const buildContext = verifyBuildContext(workspace, contractPath, buildReportPath);
   const errors = [...buildContext.errors];
@@ -653,6 +1052,9 @@ export function verifyHandoffChain(workspace, contractPath, buildReportPath, rev
   try {
     review = loadHandoffFile(workspace, reviewReportPath, "review-report");
     errors.push(...review.errors.map((error) => `review report: ${error}`));
+    if (review.value?.schemaVersion !== 2) {
+      errors.push("final verification requires review-report schemaVersion 2");
+    }
   } catch (error) {
     errors.push(error.message);
   }
@@ -674,6 +1076,61 @@ export function verifyHandoffChain(workspace, contractPath, buildReportPath, rev
   }
   if (!setEquals(new Set(contract.value.consumers), new Set(review.value.consumers))) {
     errors.push("review consumers do not match the build contract");
+  }
+  const now = Date.now();
+  let attempt = null;
+  if (review.value.schemaVersion === 2) {
+    try {
+      attempt = loadReviewAttempt(workspace, review.value.itemId);
+      if (attempt.itemId !== review.value.itemId) {
+        errors.push("review attempt itemId does not match the review report");
+      }
+      if (attempt.reviewAttemptId !== review.value.reviewAttemptId) {
+        errors.push("review report does not match the current review attempt");
+      }
+      if (attempt.contractHash !== contract.hash) {
+        errors.push("review attempt contractHash does not match contract bytes");
+      }
+      if (attempt.buildReportHash !== build.hash) {
+        errors.push("review attempt buildReportHash does not match build report bytes");
+      }
+      if (attempt.stagedTreeHash !== buildContext.stagedTreeHash) {
+        errors.push("review attempt stagedTreeHash does not match the current Git index");
+      }
+      const issuedAt = Date.parse(attempt.issuedAt);
+      const reviewCreatedAt = Date.parse(review.value.createdAt);
+      if (issuedAt > now + REVIEW_CLOCK_SKEW_MS) {
+        errors.push("review attempt issuedAt is too far in the future");
+      }
+      if (now - issuedAt > REVIEW_ATTEMPT_MAX_AGE_MS + REVIEW_CLOCK_SKEW_MS) {
+        errors.push("review attempt has expired");
+      }
+      if (reviewCreatedAt > now + REVIEW_CLOCK_SKEW_MS) {
+        errors.push("review report createdAt is too far in the future");
+      }
+      if (reviewCreatedAt < issuedAt - REVIEW_CLOCK_SKEW_MS) {
+        errors.push("review report createdAt is before the review attempt");
+      }
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+  const workflow = resolveWorkflowRoles(workspace, { requireAcceptance: true });
+  if (!workflow.ok) errors.push(...workflow.errors.map((error) => `workflow: ${error}`));
+  const reviewPolicy = workflow.reviewPolicy ?? {};
+  const modelPolicyActive = Boolean(
+    reviewPolicy.requiredModel ||
+    reviewPolicy.requiredModelFamily ||
+    reviewPolicy.requireDifferentModelFamily,
+  );
+  if (workflow.ok && review.value.modelResolution !== undefined) {
+    for (const role of ["builder", "reviewer"]) {
+      try {
+        loadModelReceipt(workspace, review.value, workflow, role, attempt, now);
+      } catch (error) {
+        errors.push(error.message);
+      }
+    }
   }
   if (review.value.verdict !== "clean") errors.push("review verdict requires changes");
 

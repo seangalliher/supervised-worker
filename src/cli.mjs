@@ -11,7 +11,14 @@ import {
   summarizePlan,
   validatePlan,
 } from "./core.mjs";
-import { inspectHandoffFile, verifyBuildHandoff, verifyHandoffChain } from "./handoff.mjs";
+import {
+  inspectHandoffFile,
+  issueReviewAttempt,
+  verifyBuildHandoff,
+  verifyHandoffChain,
+} from "./handoff.mjs";
+import { validateHookManifest } from "./hook-manifest.mjs";
+import { installLocalPlugin } from "./install.mjs";
 import { acceptWorkflowRoles, resolveWorkflowRoles } from "./workflow.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -88,7 +95,9 @@ async function validateRepository() {
     "package.json",
     "package-lock.json",
     ...expectedAgentFiles.map((fileName) => `agents/${fileName}`),
+    ...expectedAgentFiles.map((fileName) => `com.github.copilot/agents/${fileName}`),
     "hooks.json",
+    "com.github.copilot/hooks/hooks.json",
     "docs/architecture.md",
     "docs/customizing-roles.md",
     "docs/evaluation.md",
@@ -102,6 +111,7 @@ async function validateRepository() {
     "examples/handoff.review-report.json",
     "policy/constitution.json",
     "schemas/episode.schema.json",
+    "schemas/model-receipt.schema.json",
     "schemas/plan.schema.json",
     "schemas/policy-proposal.schema.json",
     "schemas/procedure.schema.json",
@@ -111,6 +121,9 @@ async function validateRepository() {
     "src/core.mjs",
     "src/cli.mjs",
     "src/handoff.mjs",
+    "src/hook-manifest.mjs",
+    "src/hook-launcher.mjs",
+    "src/install.mjs",
     "src/standards.mjs",
     "src/workflow.mjs",
   ];
@@ -153,39 +166,13 @@ async function validateRepository() {
     const hooks = JSON.parse(
       readFileSync(path.join(root, "hooks.json"), "utf8"),
     );
-    if (hooks.version !== 1) errors.push("hooks.json version must be 1");
-    const expectedEvents = [
-      "SessionStart",
-      "PreToolUse",
-      "PostToolUse",
-      "PostToolUseFailure",
-      "PreCompact",
-      "Stop",
-    ];
-    if (JSON.stringify(Object.keys(hooks.hooks ?? {})) !== JSON.stringify(expectedEvents)) {
-      errors.push("hooks.json event set or ordering is invalid");
-    }
-    if (hooks.hooks?.PreToolUse?.[0]?.matcher !== PLAN_WRITER_MATCHER) {
-      errors.push("PreToolUse matcher differs from the case-sensitive writer vocabulary");
-    }
-    for (const event of expectedEvents) {
-      for (const entry of hooks.hooks?.[event] ?? []) {
-        if (!entry.bash?.includes("${PLUGIN_ROOT}/src/cli.mjs")) {
-          errors.push(`${event} bash command must use PLUGIN_ROOT`);
-        }
-        if (!entry.powershell?.includes("$env:PLUGIN_ROOT/src/cli.mjs")) {
-          errors.push(`${event} PowerShell command must use PLUGIN_ROOT`);
-        }
-        if (!Number.isFinite(entry.timeoutSec) || entry.timeoutSec <= 0) {
-          errors.push(`${event} timeoutSec must be positive`);
-        }
-      }
-    }
+    errors.push(...validateHookManifest(hooks, PLAN_WRITER_MATCHER));
   } catch (error) {
     errors.push(`hooks.json is invalid: ${error.message}`);
   }
   for (const relativePath of [
     ...expectedAgentFiles.map((fileName) => `agents/${fileName}`),
+    ...expectedAgentFiles.map((fileName) => `com.github.copilot/agents/${fileName}`),
     "skills/governed-queue/SKILL.md",
   ]) {
     try {
@@ -288,10 +275,10 @@ async function validateRepository() {
   }
   const readmeText = readFileSync(path.join(root, "README.md"), "utf8");
   for (const phrase of [
-    "preferred namespaced `seangalliher-supervised-worker` agent",
-    "`supervised-worker` compatibility selector",
+    "`supervised-worker:seangalliher-supervised-worker`",
+    "`supervised-worker` compatibility definition",
     "Supervised Architect`, `Supervised Builder`, and `Supervised Diff",
-    "--agent=seangalliher-supervised-worker",
+    "--agent=supervised-worker:seangalliher-supervised-worker",
     "--agent=supervised-worker",
     "Copilot CLI 1.0.74 or newer",
     ".github/supervised-worker.json",
@@ -309,7 +296,7 @@ async function validateRepository() {
   if (!architectureText.includes("future episode and lesson consolidation")) {
     errors.push("architecture.md must distinguish future episodic learning");
   }
-  if (!architectureText.includes("root `hooks.json`")) {
+  if (!architectureText.includes("`com.github.copilot/hooks/hooks.json`")) {
     errors.push("architecture.md must describe Copilot's implemented hook discovery path");
   }
   if (!architectureText.includes("self-declared `producedBy`")) {
@@ -330,13 +317,14 @@ function nonEmpty(value) {
 
 async function main() {
   const [command = "help", argument, ...argumentsAfter] = process.argv.slice(2);
+  const hasNoArguments = argument === undefined && argumentsAfter.length === 0;
   const usage =
-    "Usage: node src/cli.mjs <validate|doctor|status|release|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
-  if (command === "help") {
+    "Usage: node src/cli.mjs <validate|doctor|install|status|release|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
+  if (command === "help" && hasNoArguments) {
     process.stdout.write(usage);
     return;
   }
-  if (command === "hook") {
+  if (command === "hook" && argument !== undefined && argumentsAfter.length === 0) {
     let text;
     try {
       text = await readStdin();
@@ -379,7 +367,18 @@ async function main() {
     process.stdout.write(`${JSON.stringify(handleHook(input, argument, input.cwd))}\n`);
     return;
   }
-  if (command === "status") {
+  if (command === "install" && hasNoArguments) {
+    try {
+      process.stdout.write(`${JSON.stringify(installLocalPlugin(root), null, 2)}\n`);
+    } catch (error) {
+      process.stdout.write(
+        `${JSON.stringify({ installed: false, error: error.message }, null, 2)}\n`,
+      );
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (command === "status" && hasNoArguments) {
     try {
       process.stdout.write(`${JSON.stringify(summarizePlan(process.cwd()), null, 2)}\n`);
     } catch {
@@ -390,7 +389,7 @@ async function main() {
     }
     return;
   }
-  if (command === "release") {
+  if (command === "release" && hasNoArguments) {
     try {
       process.stdout.write(`${JSON.stringify(releaseAttachment(process.cwd()), null, 2)}\n`);
     } catch {
@@ -407,13 +406,15 @@ async function main() {
       report = inspectHandoffFile(process.cwd(), argumentsAfter[0]);
     } else if (argument === "pre-review" && argumentsAfter.length === 2) {
       report = verifyBuildHandoff(process.cwd(), ...argumentsAfter);
+    } else if (argument === "issue-review" && argumentsAfter.length === 2) {
+      report = issueReviewAttempt(process.cwd(), ...argumentsAfter);
     } else if (argument === "verify" && argumentsAfter.length === 3) {
       report = verifyHandoffChain(process.cwd(), ...argumentsAfter);
     } else {
       report = {
         ok: false,
         errors: [
-          "Usage: handoff validate <artifact> | handoff pre-review <contract> <build-report> | handoff verify <contract> <build-report> <review-report>",
+          "Usage: handoff validate <artifact> | handoff pre-review <contract> <build-report> | handoff issue-review <contract> <build-report> | handoff verify <contract> <build-report> <review-report>",
         ],
       };
     }
@@ -433,7 +434,7 @@ async function main() {
     if (!report.ok) process.exitCode = 1;
     return;
   }
-  if (command === "validate" || command === "doctor") {
+  if ((command === "validate" || command === "doctor") && hasNoArguments) {
     const errors = await validateRepository();
     const report = {
       ok: errors.length === 0,

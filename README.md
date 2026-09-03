@@ -28,8 +28,9 @@ Supervised Worker makes those transitions explicit and inspectable.
 
 ## What It Provides
 
-- A preferred namespaced `seangalliher-supervised-worker` agent that owns queue
-  and release state, plus the established `supervised-worker` compatibility selector.
+- A preferred `seangalliher-supervised-worker` agent that owns queue and release
+  state, selected as `supervised-worker:seangalliher-supervised-worker` in
+  Copilot CLI, plus the established `supervised-worker` compatibility definition.
 - Namespaced `Supervised Architect`, `Supervised Builder`, and `Supervised Diff
   Reviewer` reference agents with non-overlapping authority and repository-level
   mapping to specialized replacements.
@@ -83,15 +84,16 @@ the frozen staged-tree hash. The agents do not pin model names. A different
 reviewer model family is preferred when available, but context isolation is the
 required independence boundary.
 
-The preferred main ID is `seangalliher-supervised-worker`; the established
-`supervised-worker` ID remains available for backward compatibility. Both enforce
-the same policy, with selector-specific provenance and `producedBy` identity.
-All new IDs use the `seangalliher-supervised-*` publisher prefix to reduce
-accidental collisions. GitHub Copilot uses first-found-wins precedence, so a
-project or user agent can still shadow any plugin agent with the same filename.
-Before a governed run, inspect `/env` and verify the selected agent is sourced
-from this plugin. This provenance check is operational hygiene, not a security
-boundary against a malicious same-user repository.
+The preferred filename ID is `seangalliher-supervised-worker`; the established
+`supervised-worker` ID remains available for backward compatibility. Copilot CLI
+qualifies plugin agents with the plugin name, yielding
+`supervised-worker:seangalliher-supervised-worker` and
+`supervised-worker:supervised-worker`. Both definitions enforce the same policy,
+with selector-specific provenance and `producedBy` identity. Other hosts may
+expose raw filename IDs and apply project or user precedence. Before a governed
+run, inspect `/env` and verify the selected agent is sourced from this plugin.
+This provenance check is operational hygiene, not a security boundary against a
+malicious same-user repository.
 
 ### Specialized Roles
 
@@ -110,7 +112,9 @@ Repositories can map the three companion roles in the protected workflow file
 
 The file is a complete workflow document, not only this fragment. Start from
 [the specialized example](examples/workflow.specialized.json), then inspect the
-effective mapping from the target repository:
+effective mapping from the target repository. Repository agents normally use a
+raw filename-derived selector such as `architect`; plugin agents use a qualified
+selector such as `company-tools:architect` in Copilot CLI.
 
 ```bash
 node /absolute/path/to/supervised-worker/src/cli.mjs workflow roles
@@ -132,9 +136,9 @@ reference role's authority and typed handoff contract. See
 
 Requirements:
 
-- GitHub Copilot CLI 1.0.74 or newer for Agent Plugins v1 manifest support,
-  the custom agent, and lifecycle hooks
-- An Agent Plugins 1.0 host can load the portable `governed-queue` skill
+- GitHub Copilot CLI 1.0.74 or newer, or a current VS Code build with Agent
+  Plugins enabled
+- An Agent Plugins 1.0 host that can load the portable `governed-queue` skill
 - Node.js 20 or newer for the alpha helper
 - PowerShell 7 or newer (`pwsh`) when running Copilot CLI on Windows
 - Git for normal coding workflows
@@ -149,13 +153,48 @@ npm test
 npm run validate
 ```
 
+Install a content-addressed local copy for VS Code:
+
+```bash
+npm run install:local
+```
+
+The command returns `installRoot`. Register that exact path in VS Code user
+settings:
+
+```json
+{
+  "chat.plugins.enabled": true,
+  "chat.pluginLocations": {
+    "/absolute/installRoot/from-the-command": true
+  }
+}
+```
+
+Reload the VS Code window, select the plugin-provided preferred Supervised
+Worker agent, and inspect the Agent Debug Log to verify its agents, skill, and
+hooks came from `installRoot`. VS Code reads the Copilot-specific components
+from `com.github.copilot/`. The generated Windows commands carry absolute paths
+to the installed launcher and the Node executable, and execute correctly when
+the host uses either PowerShell or `cmd.exe`. They never discover helper code
+from the task workspace. The shell clears `NODE_OPTIONS` and GitHub credential
+variables before Node starts.
+
+The checkout manifests require a host-provided `PLUGIN_ROOT` and fail visibly
+when it is absent. Do not register the checkout directly in VS Code 1.136,
+which does not provide that trusted root. Re-run `npm run install:local` after
+changing plugin source and update `chat.pluginLocations` to the newly returned
+content-addressed path.
+
 Load the checkout directly in a supported Copilot CLI:
 
 ```bash
-copilot --plugin-dir=/absolute/path/to/supervised-worker --agent=seangalliher-supervised-worker
+copilot --plugin-dir=/absolute/path/to/supervised-worker --agent=supervised-worker:seangalliher-supervised-worker
 ```
 
-Existing integrations may continue using `--agent=supervised-worker`.
+Use `/env` after startup to verify the Worker, companion agents,
+`governed-queue` skill, and lifecycle hooks came from this plugin. Hosts that
+expose unqualified plugin IDs may continue using `--agent=supervised-worker`.
 
 From an interactive Copilot CLI session, a GitHub-hosted plugin can also be
 installed with:
@@ -191,6 +230,33 @@ The session that creates or updates `plan.json` through a file-editing tool is
 attached to the plan. Other Copilot sessions in the repository remain inert:
 they are not logged and their Stop events are not blocked.
 
+Protected edit targets must be fully qualified. When VS Code reports the plugin
+root as the hook cwd, the first absolute plan edit writes a metadata-only
+session locator beneath that window's `workspaceStorage` directory. Later
+targetless hooks use the locator only when its session hash and random claim
+generation match the repository's own attachment. The claim starts provisional,
+is promoted after a successful plan write, and leaves a released routing
+tombstone when detached. No transcript content is read or retained.
+Because VS Code Copilot Chat 0.64 drops `PostToolUseFailure`, the supported
+`PostToolUse` hook verifies that a plan-targeting edit actually created
+`plan.json`; a missing plan is recorded as failure and releases the provisional
+claim. If ownership-state cleanup fails, the hook says so and leaves the claim
+recoverable instead of reporting release.
+VS Code 1.136 also drops the packaged `PreToolUse` matcher. Non-writer
+invocations therefore return immediately in the helper before locality checks,
+workspace routing, or lock creation.
+Hook path inspection accepts at most 256 unique targets per invocation and
+deduplicates repeats before touching the filesystem.
+Windows evaluation is limited to local drive-letter storage; UNC,
+network-mapped, and `subst` repository roots fail closed before filesystem
+inspection. Locality checks share a 1.5-second budget and allow at most three
+distinct drive letters per operation.
+
+Session locks are never reclaimed automatically. If a hook process terminates
+while holding one, the same session fails visibly until an operator confirms
+the owner is stale and removes that hashed workspace-storage lock; unrelated
+new sessions use different lock paths.
+
 See [the active example](examples/plan.active.json), [the complete
 example](examples/plan.complete.json), and [the plan schema](schemas/plan.schema.json).
 
@@ -218,6 +284,9 @@ node /absolute/path/to/supervised-worker/src/cli.mjs handoff validate \
 node /absolute/path/to/supervised-worker/src/cli.mjs handoff pre-review \
   .supervised-worker/handoffs/<item-hash>/build-contract.json \
   .supervised-worker/handoffs/<item-hash>/build-report.json
+node /absolute/path/to/supervised-worker/src/cli.mjs handoff issue-review \
+  .supervised-worker/handoffs/<item-hash>/build-contract.json \
+  .supervised-worker/handoffs/<item-hash>/build-report.json
 node /absolute/path/to/supervised-worker/src/cli.mjs handoff verify \
   .supervised-worker/handoffs/<item-hash>/build-contract.json \
   .supervised-worker/handoffs/<item-hash>/build-report.json \
@@ -227,18 +296,29 @@ node /absolute/path/to/supervised-worker/src/cli.mjs handoff verify \
 `validate` reports the SHA-256 of the exact artifact bytes. `pre-review` checks
 the contract/report binding, approved file footprint, clean worktree, staged
 paths, every contract-required check, and `testedTreeHash` against the current
-staged tree before the read-only Reviewer receives a rendered diff. `verify`
-adds the review artifact, item and consumer identity, and final clean verdict.
+staged tree. `issue-review` atomically establishes a fresh, 24-hour current
+attempt for those exact hashes before the read-only Reviewer receives a rendered
+diff. `verify` adds the review artifact, item and consumer identity, bounded
+timestamp checks, and final clean verdict.
+When the accepted workflow requires a reviewer model, `verify` requires
+Worker-owned receipts under `.supervised-worker/runtime/model-receipts/` and
+rejects fallback, same-family, missing, forged, hash-mismatched, replayed, or
+postdated evidence. Receipts bind the review attempt, build report, and staged
+tree in addition to the accepted workflow and host-observed model identity.
+Any review that supplies `modelResolution` is held to the same receipt check,
+even when the workflow does not require a model policy.
 
 If a prior attached session is known to be stale, run the helper from the target
-repository, not the plugin checkout:
+repository's canonical local path, not the plugin checkout or a filesystem
+alias:
 
 ```bash
 node /absolute/path/to/supervised-worker/src/cli.mjs release
 ```
 
 This is an explicit recovery operation. Do not release an attachment while its
-owning session is still active.
+owning session is still active. After release, start a new Copilot session before
+attaching this or another repository; the released session route is not rebound.
 
 ## Completion Gate
 
@@ -248,8 +328,8 @@ plan it:
 1. blocks the initial stop;
 2. blocks one unchanged continuation and tells the agent it is the final bounded
   attempt before release;
-3. then releases rather than looping forever and attempts to record
-  `completion_unverified_release` before detaching.
+3. then releases rather than looping forever, detaches ownership, and only
+  afterward records `completion_unverified_release`.
 
 Progress changes reset the stagnant-block count, subject to a total per-session
 cap. A mechanically complete plan must contain a complete authenticated

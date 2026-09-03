@@ -31,6 +31,7 @@ const SKILL_KEYS = new Set([
 ]);
 const SCHEMA_FILES = [
   "episode.schema.json",
+  "model-receipt.schema.json",
   "plan.schema.json",
   "policy-proposal.schema.json",
   "procedure.schema.json",
@@ -227,6 +228,15 @@ function validateWorkflowGates(validate, workflow, errors) {
     ["blank authority boundary", (value) => { value.authority.boundaries = [" "]; }],
     ["blank focused command", (value) => { value.validation.focused = "\t"; }],
     ["blank receipt glob", (value) => { value.validation.receiptGlobs = [" "]; }],
+    ["partial reviewer model policy", (value) => {
+      value.review.requiredModel = "gpt-5.6-sol";
+    }],
+    ["invalid model-family requirement", (value) => {
+      value.review.requireDifferentModelFamily = "true";
+    }],
+    ["separation without reviewer model policy", (value) => {
+      value.review.requireDifferentModelFamily = true;
+    }],
   ]) {
     const value = structuredClone(workflow);
     mutate(value);
@@ -235,10 +245,13 @@ function validateWorkflowGates(validate, workflow, errors) {
   for (const [name, mutate] of [
     ["duplicate role selectors", (value) => { value.roles.builder = value.roles.architect; }],
     ["Worker as companion", (value) => { value.roles.architect = "supervised-worker"; }],
+    ["qualified Worker as companion", (value) => {
+      value.roles.architect = "supervised-worker:seangalliher-supervised-worker";
+    }],
     ["conflicting reviewer aliases", (value) => { value.review.agent = "other-reviewer"; }],
     ["legacy reviewer duplicates Architect", (value) => {
       delete value.roles;
-      value.review.agent = "seangalliher-supervised-architect";
+      value.review.agent = "supervised-worker:seangalliher-supervised-architect";
     }],
   ]) {
     const value = structuredClone(workflow);
@@ -389,6 +402,39 @@ export function validateStandards(root) {
     } catch (error) {
       errors.push(`skills/${entry.name}/SKILL.md could not be validated: ${error.message}`);
     }
+  }
+
+  const rootAgents = path.join(root, "agents");
+  const copilotAgents = path.join(root, "com.github.copilot", "agents");
+  try {
+    const rootNames = readdirSync(rootAgents)
+      .filter((name) => name.endsWith(".agent.md"))
+      .sort();
+    const copilotNames = readdirSync(copilotAgents)
+      .filter((name) => name.endsWith(".agent.md"))
+      .sort();
+    if (JSON.stringify(copilotNames) !== JSON.stringify(rootNames)) {
+      errors.push("com.github.copilot/agents must mirror the root agent filename set");
+    }
+    for (const name of rootNames) {
+      const source = readFileSync(path.join(rootAgents, name));
+      const copy = readFileSync(path.join(copilotAgents, name));
+      if (!source.equals(copy)) {
+        errors.push(`com.github.copilot/agents/${name} differs from agents/${name}`);
+      }
+    }
+  } catch (error) {
+    errors.push(`Copilot agent compatibility copies could not be validated: ${error.message}`);
+  }
+
+  try {
+    const source = readFileSync(path.join(root, "hooks.json"));
+    const copy = readFileSync(path.join(root, "com.github.copilot", "hooks", "hooks.json"));
+    if (!source.equals(copy)) {
+      errors.push("com.github.copilot/hooks/hooks.json differs from hooks.json");
+    }
+  } catch (error) {
+    errors.push(`Copilot hook compatibility copy could not be validated: ${error.message}`);
   }
   errors.push(...validatePublishedSchemas(root));
   return errors;

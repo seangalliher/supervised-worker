@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  copyFileSync,
+  existsSync,
   mkdirSync,
   linkSync,
   lstatSync,
@@ -21,11 +23,13 @@ import { sha256 } from "../src/core.mjs";
 import {
   directoryIdentityMatches,
   inspectHandoffFile,
+  issueReviewAttempt,
   validateHandoffValue,
   validateRepositoryPath,
   verifyBuildHandoff,
   verifyHandoffChain,
 } from "../src/handoff.mjs";
+import { DEFAULT_ROLES } from "../src/workflow.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cli = path.join(root, "src", "cli.mjs");
@@ -39,6 +43,50 @@ function writeJson(filePath, value) {
   mkdirSync(path.dirname(filePath), { recursive: true });
   writeFileSync(filePath, bytes);
   return sha256(bytes);
+}
+
+function writeModelReceipts(cwd, review, workflowHash, roles) {
+  for (const role of ["builder", "reviewer"]) {
+    const locator =
+      `.supervised-worker/runtime/model-receipts/${sha256(review.itemId)}/${role}.json`;
+    const receipt = {
+      schemaVersion: 2,
+      itemId: review.itemId,
+      role,
+      agentSelector: roles[role],
+      model: review.modelResolution[role].model,
+      family: review.modelResolution[role].family,
+      workflowHash,
+      reviewAttemptId: review.reviewAttemptId,
+      buildReportHash: review.buildReportHash,
+      stagedTreeHash: review.stagedTreeHash,
+      observedBy: "supervised-worker:seangalliher-supervised-worker",
+      observedAt: review.createdAt,
+      host: "copilot-cli",
+      sessionHash: "d".repeat(64),
+      source: "host",
+    };
+    const receiptHash = writeJson(path.join(cwd, ...locator.split("/")), receipt);
+    review.modelResolution[role].evidence = {
+      kind: "host-model",
+      locator,
+      sha256: receiptHash,
+    };
+  }
+}
+
+function issueFixtureReview(fixture, workflowHash = null, roles = DEFAULT_ROLES) {
+  const attempt = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath);
+  assert.equal(attempt.ok, true, attempt.errors.join("\n"));
+  fixture.review.reviewAttemptId = attempt.reviewAttemptId;
+  fixture.review.createdAt = attempt.issuedAt;
+  fixture.review.contractHash = attempt.contractHash;
+  fixture.review.buildReportHash = attempt.buildReportHash;
+  fixture.review.stagedTreeHash = attempt.stagedTreeHash;
+  writeModelReceipts(fixture.cwd, fixture.review, workflowHash, roles);
+  writeJson(fixture.reviewPath, fixture.review);
+  fixture.attempt = attempt;
+  return attempt;
 }
 
 function git(cwd, ...args) {
@@ -81,9 +129,10 @@ function chainFixture(cwd = mkdtempSync(path.join(os.tmpdir(), "supervised-worke
   review.buildReportHash = buildReportHash;
   review.stagedTreeHash = git(cwd, "write-tree");
   review.consumers = ["module importer"];
-  writeJson(reviewPath, review);
 
-  return { cwd, contractPath, buildPath, reviewPath, contract, build, review };
+  const fixture = { cwd, contractPath, buildPath, reviewPath, contract, build, review };
+  issueFixtureReview(fixture);
+  return fixture;
 }
 
 function withFixture(run) {
@@ -109,6 +158,219 @@ test("runtime validates and hash-binds a complete staged handoff chain", () => {
     assert.equal(result.ok, true, result.errors.join("\n"));
     assert.equal(result.verdict, "clean");
     assert.equal(result.stagedTreeHash, git(cwd, "write-tree"));
+  });
+});
+
+test("handoff verification never executes a workspace-planted Git binary", {
+  skip: process.platform !== "win32",
+}, () => {
+  withFixture((fixture) => {
+    const external = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-git-probe-"));
+    try {
+      const markerPath = path.join(external, "workspace-git-ran.txt");
+      const probePath = path.join(external, "probe.mjs");
+      writeFileSync(
+        probePath,
+        `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(markerPath)}, "ran");\n`,
+      );
+      copyFileSync(process.execPath, path.join(fixture.cwd, "git.exe"));
+      const excludePath = path.join(fixture.cwd, ".git", "info", "exclude");
+      writeFileSync(excludePath, `${readFileSync(excludePath, "utf8")}\n/git.exe\n`);
+
+      const premise = spawnSync("git", [probePath], {
+        cwd: fixture.cwd,
+        encoding: "utf8",
+      });
+      assert.equal(premise.status, 0, premise.stderr);
+      assert.equal(existsSync(markerPath), true, "planted git.exe must win bare lookup");
+      rmSync(markerPath);
+
+      const result = verifyBuildHandoff(
+        fixture.cwd,
+        fixture.contractPath,
+        fixture.buildPath,
+      );
+      assert.equal(result.ok, true, result.errors.join("\n"));
+      assert.equal(existsSync(markerPath), false);
+    } finally {
+      rmSync(external, { recursive: true, force: true });
+    }
+  });
+});
+
+test("final verification always reopens supplied model receipts", () => {
+  withFixture(({ cwd, contractPath, buildPath, reviewPath, review }) => {
+    for (const role of ["builder", "reviewer"]) {
+      rmSync(path.join(cwd, ...review.modelResolution[role].evidence.locator.split("/")));
+    }
+    const result = verifyHandoffChain(cwd, contractPath, buildPath, reviewPath);
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /model receipt/);
+  });
+});
+
+test("final verification requires the current review-attempt record", () => {
+  withFixture((fixture) => {
+    rmSync(path.join(fixture.cwd, ...fixture.attempt.locator.split("/")));
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /review attempt path is unavailable/);
+  });
+});
+
+test("failed review issuance does not rotate the current attempt", () => {
+  withFixture((fixture) => {
+    const attemptPath = path.join(fixture.cwd, ...fixture.attempt.locator.split("/"));
+    const originalAttempt = readFileSync(attemptPath, "utf8");
+    fixture.build.changedFiles = ["src/outside.js"];
+    writeJson(fixture.buildPath, fixture.build);
+
+    const result = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath);
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /outside targetFiles/);
+    assert.equal(readFileSync(attemptPath, "utf8"), originalAttempt);
+  });
+});
+
+test("final verification rejects a previously valid bundle after attempt rotation", () => {
+  withFixture((fixture) => {
+    const previousAttemptId = fixture.review.reviewAttemptId;
+    const current = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath);
+    assert.equal(current.ok, true, current.errors.join("\n"));
+    assert.notEqual(current.reviewAttemptId, previousAttemptId);
+
+    const rejected = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.errors.join("\n"), /does not match the current review attempt/);
+
+    fixture.review.reviewAttemptId = current.reviewAttemptId;
+    fixture.review.createdAt = current.issuedAt;
+    writeModelReceipts(fixture.cwd, fixture.review, null, DEFAULT_ROLES);
+    writeJson(fixture.reviewPath, fixture.review);
+    const accepted = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(accepted.ok, true, accepted.errors.join("\n"));
+  });
+});
+
+test("final verification rejects a readable v1 review after attempt rotation", () => {
+  withFixture((fixture) => {
+    const rotated = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath);
+    assert.equal(rotated.ok, true, rotated.errors.join("\n"));
+    const legacyReview = structuredClone(fixture.review);
+    legacyReview.schemaVersion = 1;
+    delete legacyReview.workflowHash;
+    delete legacyReview.reviewAttemptId;
+    delete legacyReview.modelResolution;
+    legacyReview.modelSeparation = "unknown";
+    writeJson(fixture.reviewPath, legacyReview);
+    rmSync(
+      path.join(fixture.cwd, ".supervised-worker", "runtime", "model-receipts"),
+      { recursive: true, force: true },
+    );
+
+    const inspected = spawnSync(
+      process.execPath,
+      [cli, "handoff", "validate", fixture.reviewPath],
+      { cwd: fixture.cwd, encoding: "utf8" },
+    );
+    assert.equal(inspected.status, 0, inspected.stderr || inspected.stdout);
+    assert.equal(JSON.parse(inspected.stdout).ok, true);
+
+    const rejected = spawnSync(
+      process.execPath,
+      [
+        cli,
+        "handoff",
+        "verify",
+        fixture.contractPath,
+        fixture.buildPath,
+        fixture.reviewPath,
+      ],
+      { cwd: fixture.cwd, encoding: "utf8" },
+    );
+    assert.equal(rejected.status, 1, rejected.stderr || rejected.stdout);
+    assert.match(
+      JSON.parse(rejected.stdout).errors.join("\n"),
+      /final verification requires review-report schemaVersion 2/,
+    );
+  });
+});
+
+test("final verification rejects model evidence observed after the review report", () => {
+  withFixture((fixture) => {
+    const receiptPath = path.join(
+      fixture.cwd,
+      ...fixture.review.modelResolution.builder.evidence.locator.split("/"),
+    );
+    const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+    receipt.observedAt = new Date(Date.parse(fixture.review.createdAt) + 60_000).toISOString();
+    fixture.review.modelResolution.builder.evidence.sha256 = writeJson(receiptPath, receipt);
+    writeJson(fixture.reviewPath, fixture.review);
+
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /model receipt observedAt is after the review report/);
+  });
+});
+
+test("final verification rejects an internally consistent future-dated bundle", () => {
+  withFixture((fixture) => {
+    const attemptPath = path.join(fixture.cwd, ...fixture.attempt.locator.split("/"));
+    const attempt = JSON.parse(readFileSync(attemptPath, "utf8"));
+    attempt.issuedAt = "2099-01-01T00:10:00Z";
+    writeJson(attemptPath, attempt);
+    fixture.review.createdAt = "2099-01-01T00:30:00Z";
+    writeModelReceipts(fixture.cwd, fixture.review, null, DEFAULT_ROLES);
+    writeJson(fixture.reviewPath, fixture.review);
+
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /issuedAt is too far in the future/);
+    assert.match(result.errors.join("\n"), /createdAt is too far in the future/);
+    assert.match(result.errors.join("\n"), /observedAt is too far in the future/);
+  });
+});
+
+test("final verification rejects an expired review attempt", () => {
+  withFixture((fixture) => {
+    const attemptPath = path.join(fixture.cwd, ...fixture.attempt.locator.split("/"));
+    const attempt = JSON.parse(readFileSync(attemptPath, "utf8"));
+    attempt.issuedAt = new Date(Date.now() - 25 * 60 * 60 * 1_000).toISOString();
+    writeJson(attemptPath, attempt);
+
+    const result = verifyHandoffChain(
+      fixture.cwd,
+      fixture.contractPath,
+      fixture.buildPath,
+      fixture.reviewPath,
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /review attempt has expired/);
   });
 });
 
@@ -415,7 +677,7 @@ test("rename verification requires both source and destination paths", () => {
     fixture.review.contractHash = contractHash;
     fixture.review.buildReportHash = buildHash;
     fixture.review.stagedTreeHash = git(fixture.cwd, "write-tree");
-    writeJson(fixture.reviewPath, fixture.review);
+    issueFixtureReview(fixture);
     const accepted = verifyHandoffChain(
       fixture.cwd,
       fixture.contractPath,
@@ -427,6 +689,7 @@ test("rename verification requires both source and destination paths", () => {
     fixture.build.changedFiles = ["src/renamed.js"];
     const incompleteHash = writeJson(fixture.buildPath, fixture.build);
     fixture.review.buildReportHash = incompleteHash;
+    writeModelReceipts(fixture.cwd, fixture.review, null, DEFAULT_ROLES);
     writeJson(fixture.reviewPath, fixture.review);
     const rejected = verifyHandoffChain(
       fixture.cwd,
@@ -491,7 +754,8 @@ test("case-only rename keeps source and destination as distinct Git paths", () =
 });
 
 test("CLI validates one artifact and verifies the complete chain", () => {
-  withFixture(({ cwd, contractPath, buildPath, reviewPath }) => {
+  withFixture((fixture) => {
+    const { cwd, contractPath, buildPath, reviewPath } = fixture;
     const inspected = spawnSync(process.execPath, [cli, "handoff", "validate", contractPath], {
       cwd,
       encoding: "utf8",
@@ -506,6 +770,19 @@ test("CLI validates one artifact and verifies the complete chain", () => {
     );
     assert.equal(preReview.status, 0, preReview.stderr || preReview.stdout);
     assert.equal(JSON.parse(preReview.stdout).ok, true);
+
+    const issued = spawnSync(
+      process.execPath,
+      [cli, "handoff", "issue-review", contractPath, buildPath],
+      { cwd, encoding: "utf8" },
+    );
+    assert.equal(issued.status, 0, issued.stderr || issued.stdout);
+    const attempt = JSON.parse(issued.stdout);
+    assert.equal(attempt.ok, true, attempt.errors.join("\n"));
+    fixture.review.reviewAttemptId = attempt.reviewAttemptId;
+    fixture.review.createdAt = attempt.issuedAt;
+    writeModelReceipts(cwd, fixture.review, null, DEFAULT_ROLES);
+    writeJson(reviewPath, fixture.review);
 
     const verified = spawnSync(
       process.execPath,
@@ -526,7 +803,7 @@ test("preferred Worker producer passes every CLI handoff gate", () => {
     const buildHash = writeJson(fixture.buildPath, fixture.build);
     fixture.review.contractHash = contractHash;
     fixture.review.buildReportHash = buildHash;
-    writeJson(fixture.reviewPath, fixture.review);
+    issueFixtureReview(fixture);
 
     for (const args of [
       ["handoff", "validate", fixture.contractPath],
@@ -552,6 +829,9 @@ test("specialized workflow roles pass the complete CLI handoff chain", () => {
       reviewer: "diff-reviewer",
     };
     workflow.review.agent = "diff-reviewer";
+    workflow.review.requiredModel = "gpt-5.6-sol";
+    workflow.review.requiredModelFamily = "openai";
+    workflow.review.requireDifferentModelFamily = true;
     const workflowPath = path.join(fixture.cwd, ".github", "supervised-worker.json");
     writeJson(workflowPath, workflow);
     git(fixture.cwd, "add", "--", "src/module.js", ".github/supervised-worker.json");
@@ -591,6 +871,7 @@ test("specialized workflow roles pass the complete CLI handoff chain", () => {
     fixture.review.contractHash = contractHash;
     fixture.review.buildReportHash = buildHash;
     fixture.review.stagedTreeHash = git(fixture.cwd, "write-tree");
+    writeModelReceipts(fixture.cwd, fixture.review, roleReport.workflowHash, workflow.roles);
     writeJson(fixture.reviewPath, fixture.review);
 
     const handoffCommands = [
@@ -614,6 +895,7 @@ test("specialized workflow roles pass the complete CLI handoff chain", () => {
     );
     assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
     assert.equal(JSON.parse(accepted.stdout).accepted, true);
+    issueFixtureReview(fixture, roleReport.workflowHash, workflow.roles);
 
     for (const args of handoffCommands) {
       const result = spawnSync(process.execPath, [cli, ...args], {
@@ -623,6 +905,68 @@ test("specialized workflow roles pass the complete CLI handoff chain", () => {
       assert.equal(result.status, 0, result.stderr || result.stdout);
       assert.equal(JSON.parse(result.stdout).ok, true);
     }
+
+    const validReview = structuredClone(fixture.review);
+    const reviewerReceiptPath = path.join(
+      fixture.cwd,
+      ...validReview.modelResolution.reviewer.evidence.locator.split("/"),
+    );
+    const validReviewerReceipt = JSON.parse(readFileSync(reviewerReceiptPath, "utf8"));
+    const wrongReceiptHashReview = structuredClone(validReview);
+    wrongReceiptHashReview.modelResolution.reviewer.evidence.sha256 = "a".repeat(64);
+    writeJson(fixture.reviewPath, wrongReceiptHashReview);
+    let rejected = spawnSync(
+      process.execPath,
+      [cli, "handoff", "verify", fixture.contractPath, fixture.buildPath, fixture.reviewPath],
+      { cwd: fixture.cwd, encoding: "utf8" },
+    );
+    assert.equal(rejected.status, 1, rejected.stderr || rejected.stdout);
+    assert.match(JSON.parse(rejected.stdout).errors.join("\n"), /receipt hash does not match/);
+
+    const forgedReceipt = structuredClone(validReviewerReceipt);
+    forgedReceipt.model = "gpt-5.4";
+    const forgedReceiptHash = writeJson(reviewerReceiptPath, forgedReceipt);
+    const forgedReceiptReview = structuredClone(validReview);
+    forgedReceiptReview.modelResolution.reviewer.evidence.sha256 = forgedReceiptHash;
+    writeJson(fixture.reviewPath, forgedReceiptReview);
+    rejected = spawnSync(
+      process.execPath,
+      [cli, "handoff", "verify", fixture.contractPath, fixture.buildPath, fixture.reviewPath],
+      { cwd: fixture.cwd, encoding: "utf8" },
+    );
+    assert.equal(rejected.status, 1, rejected.stderr || rejected.stdout);
+    assert.match(JSON.parse(rejected.stdout).errors.join("\n"), /receipt model does not match/);
+    writeJson(reviewerReceiptPath, validReviewerReceipt);
+
+    for (const [name, mutate, expected] of [
+      [
+        "wrong reviewer model",
+        (review) => { review.modelResolution.reviewer.model = "gpt-5.4"; },
+        /workflow-required reviewer model/,
+      ],
+      [
+        "unknown model separation",
+        (review) => { review.modelSeparation = "unknown"; },
+        /requires a different Builder and Reviewer model family/,
+      ],
+      [
+        "same resolved family",
+        (review) => { review.modelResolution.builder.family = "openai"; },
+        /identical resolved model families/,
+      ],
+    ]) {
+      const invalidReview = structuredClone(validReview);
+      mutate(invalidReview);
+      writeJson(fixture.reviewPath, invalidReview);
+      const result = spawnSync(
+        process.execPath,
+        [cli, "handoff", "verify", fixture.contractPath, fixture.buildPath, fixture.reviewPath],
+        { cwd: fixture.cwd, encoding: "utf8" },
+      );
+      assert.equal(result.status, 1, `${name}: ${result.stderr || result.stdout}`);
+      assert.match(JSON.parse(result.stdout).errors.join("\n"), expected);
+    }
+    writeJson(fixture.reviewPath, validReview);
 
     writeFileSync(workflowPath, `${readFileSync(workflowPath, "utf8")}\n`);
     for (const args of handoffCommands) {

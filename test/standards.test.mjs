@@ -15,9 +15,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function fixture() {
   const target = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-standards-"));
-  for (const relativePath of ["examples", "schemas", "skills"]) {
+  for (const relativePath of ["agents", "com.github.copilot", "examples", "schemas", "skills"]) {
     cpSync(path.join(root, relativePath), path.join(target, relativePath), { recursive: true });
   }
+  cpSync(path.join(root, "hooks.json"), path.join(target, "hooks.json"));
   cpSync(path.join(root, "plugin.json"), path.join(target, "plugin.json"));
   return target;
 }
@@ -142,5 +143,32 @@ test("workflow schema and runtime both reject blank contract strings", () => {
     } finally {
       rmSync(target, { recursive: true, force: true });
     }
+  }
+});
+
+test("standards validation rejects drift in Copilot extension copies", () => {
+  const target = fixture();
+  try {
+    const copy = path.join(
+      target,
+      "com.github.copilot",
+      "agents",
+      "seangalliher-supervised-worker.agent.md",
+    );
+    writeFileSync(copy, `${readFileSync(copy, "utf8")}\nDrift.\n`);
+    assert.match(validateStandards(target).join("\n"), /differs from agents/);
+  } finally {
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("standards validation rejects drift in the Copilot hook manifest", () => {
+  const target = fixture();
+  try {
+    const copy = path.join(target, "com.github.copilot", "hooks", "hooks.json");
+    writeFileSync(copy, `${readFileSync(copy, "utf8")}\n`);
+    assert.match(validateStandards(target).join("\n"), /hooks\.json differs from hooks\.json/);
+  } finally {
+    rmSync(target, { recursive: true, force: true });
   }
 });

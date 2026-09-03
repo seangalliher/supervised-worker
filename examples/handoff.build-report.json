@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "kind": "build-report",
   "itemId": "issue-42",
-  "producedBy": "seangalliher-supervised-builder",
+  "producedBy": "supervised-worker:seangalliher-supervised-builder",
   "workflowHash": null,
   "createdAt": "2026-09-02T12:15:00Z",
   "status": "implemented",

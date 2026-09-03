@@ -1,17 +1,36 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { PLAN_WRITER_MATCHER, PLAN_WRITER_TOOLS } from "../src/core.mjs";
+import { PLAN_WRITER_MATCHER, PLAN_WRITER_TOOLS, sha256 } from "../src/core.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const hooks = JSON.parse(
-  readFileSync(path.join(root, "hooks.json"), "utf8"),
-).hooks;
+const rootHooksBytes = readFileSync(path.join(root, "hooks.json"));
+const copilotHooksBytes = readFileSync(
+  path.join(root, "com.github.copilot", "hooks", "hooks.json"),
+);
+assert.deepEqual(copilotHooksBytes, rootHooksBytes);
+const hooks = JSON.parse(copilotHooksBytes.toString("utf8")).hooks;
+const EXPECTED_HOOK_EVENTS = [
+  "SessionStart",
+  "PreToolUse",
+  "PostToolUse",
+  "PostToolUseFailure",
+  "PreCompact",
+  "Stop",
+];
 
 test("packaged PreTool matcher covers the runtime writer vocabulary", () => {
   const expected = [
@@ -33,6 +52,11 @@ test("packaged PreTool matcher covers the runtime writer vocabulary", () => {
     new Set(expected.map((name) => name.toLowerCase())),
     new Set([...PLAN_WRITER_TOOLS]),
   );
+  assert.deepEqual(Object.keys(hooks), EXPECTED_HOOK_EVENTS);
+  for (const eventName of EXPECTED_HOOK_EVENTS) {
+    assert.equal(hooks[eventName].length, 1, eventName);
+    assert.equal(hooks[eventName][0].timeoutSec, 5, eventName);
+  }
 });
 
 function workspace() {
@@ -65,18 +89,31 @@ function writeActivePlan(cwd) {
   return filePath;
 }
 
-function invokePowerShell(eventName, input, cwd) {
+function vscodeTranscriptPath(storageRoot, sessionId) {
+  const transcriptDirectory = path.join(storageRoot, "GitHub.copilot-chat", "transcripts");
+  mkdirSync(transcriptDirectory, { recursive: true });
+  writeFileSync(path.join(storageRoot, "workspace.json"), "{}\n");
+  const transcriptPath = path.join(transcriptDirectory, `${sessionId}.jsonl`);
+  writeFileSync(transcriptPath, "");
+  return transcriptPath;
+}
+
+function invokePowerShell(eventName, input, cwd, extraEnv = {}, pluginRoot = root) {
+  assert.notEqual(path.resolve(cwd), root, "repository cwd must differ from plugin cwd");
   const command = hooks[eventName][0].powershell;
   const result = spawnSync(
     "pwsh",
     ["-NoProfile", "-NonInteractive", "-Command", command],
     {
       cwd,
-      env: { ...process.env, PLUGIN_ROOT: root },
+      env: { ...process.env, ...extraEnv, PLUGIN_ROOT: pluginRoot },
       input: JSON.stringify(input),
       encoding: "utf8",
+      timeout: 4_000,
     },
   );
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(result.signal, null, result.stderr);
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout.trim() || "{}");
 }
@@ -93,18 +130,54 @@ function bashExecutable() {
   });
 }
 
-function invokeBash(eventName, input, cwd) {
+function invokeBash(
+  eventName,
+  input,
+  cwd,
+  extraEnv = {},
+  pluginRoot = root.replaceAll("\\", "/"),
+) {
+  assert.notEqual(path.resolve(cwd), root, "repository cwd must differ from plugin cwd");
   const executable = bashExecutable();
   assert.ok(executable, "Git Bash or bash is required for this test");
   const result = spawnSync(executable, ["-lc", hooks[eventName][0].bash], {
     cwd,
-    env: { ...process.env, PLUGIN_ROOT: root.replaceAll("\\", "/") },
+    env: { ...process.env, ...extraEnv, PLUGIN_ROOT: pluginRoot },
     input: JSON.stringify(input),
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout.trim() || "{}");
 }
+
+test("every checkout hook uses the trusted root and blocks Node startup injection", () => {
+  const cwd = workspace();
+  try {
+    const preloadMarker = path.join(cwd, "preload-ran.txt");
+    const preloadPath = path.join(cwd, "untrusted-preload.cjs");
+    writeFileSync(
+      preloadPath,
+      `require('node:fs').writeFileSync(${JSON.stringify(preloadMarker)}, 'ran');\n`,
+    );
+    for (const [name, invoke, suppliedRoot] of [
+      ["powershell", invokePowerShell, root],
+      ["bash", invokeBash, root.replaceAll("\\", "/")],
+    ]) {
+      for (const eventName of EXPECTED_HOOK_EVENTS) {
+        rmSync(preloadMarker, { force: true });
+        invoke(eventName, payload(cwd, eventName), cwd, {
+          COPILOT_GITHUB_TOKEN: "copilot-secret",
+          GH_TOKEN: "gh-secret",
+          GITHUB_TOKEN: "github-secret",
+          NODE_OPTIONS: `--require=${preloadPath}`,
+        }, suppliedRoot);
+        assert.equal(existsSync(preloadMarker), false, `${name} ${eventName}`);
+      }
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 function attach(invoke, cwd, planFile) {
   invoke(
@@ -163,6 +236,82 @@ test("packaged PowerShell SessionStart is inert without a plan", {
   }
 });
 
+test("packaged non-writer PreToolUse is inert before workspace state", {
+  skip: process.platform !== "win32",
+}, () => {
+  const repository = workspace();
+  const storageRoot = workspace();
+  try {
+    const sessionId = "packaged-non-writer";
+    const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+    const output = invokePowerShell(
+      "PreToolUse",
+      {
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: root,
+        tool_name: "read_file",
+        tool_input: { filePath: path.join(repository, "README.md") },
+      },
+      repository,
+    );
+    assert.deepEqual(output, {});
+    assert.equal(existsSync(path.join(storageRoot, "supervised-worker")), false);
+    assert.equal(existsSync(path.join(repository, ".supervised-worker")), false);
+  } finally {
+    rmSync(storageRoot, { recursive: true, force: true });
+    rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("packaged PowerShell denies an unreachable UNC target before its deadline", {
+  skip: process.platform !== "win32",
+}, () => {
+  const cwd = workspace();
+  try {
+    const output = invokePowerShell(
+      "PreToolUse",
+      {
+        ...payload(cwd, "PreToolUse"),
+        tool_name: "Write",
+        tool_input: {
+          file_path: "\\\\192.0.2.1\\missing-share\\repository\\.git\\config",
+        },
+      },
+      cwd,
+    );
+    assert.equal(output.permissionDecision, "deny");
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("packaged PowerShell denies a multi-drive target set before its deadline", {
+  skip: process.platform !== "win32",
+}, () => {
+  const cwd = workspace();
+  try {
+    const replacements = [..."EFGHIJKLMNOPQ"].map((drive, index) => ({
+      filePath: `${drive}:\\repository-${index}\\.git\\config`,
+    }));
+    const output = invokePowerShell(
+      "PreToolUse",
+      {
+        ...payload(cwd, "PreToolUse"),
+        tool_name: "multi_replace_string_in_file",
+        tool_input: { replacements },
+      },
+      cwd,
+    );
+    assert.equal(output.permissionDecision, "deny");
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("packaged PowerShell hook runs the attached Stop lifecycle", {
   skip: process.platform !== "win32",
 }, () => {
@@ -204,6 +353,176 @@ test("packaged PowerShell PreToolUse denies a second plan writer", {
     assert.equal(denied.hookSpecificOutput.permissionDecision, "deny");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("packaged PowerShell routes aliases and reports a missing bound route", {
+  skip: process.platform !== "win32",
+}, () => {
+  const repository = workspace();
+  const storageRoot = workspace();
+  try {
+    const sessionId = "packaged-vscode-routing";
+    const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+    const planFile = writeActivePlan(repository);
+    const common = {
+      hook_event_name: "PreToolUse",
+      session_id: sessionId,
+      transcript_path: transcriptPath,
+      cwd: root,
+    };
+    const claimed = invokePowerShell(
+      "PreToolUse",
+      {
+        ...common,
+        tool_name: "Write",
+        tool_input: { file_path: planFile },
+      },
+      repository,
+    );
+    assert.deepEqual(claimed, {});
+
+    mkdirSync(path.join(repository, ".git"));
+    writeFileSync(path.join(repository, ".git", "config"), "protected\n");
+    const gitAlias = path.join(repository, "git-alias");
+    symlinkSync(path.join(repository, ".git"), gitAlias, "junction");
+    const denied = invokePowerShell(
+      "PreToolUse",
+      {
+        ...common,
+        tool_name: "Write",
+        tool_input: { file_path: path.join(gitAlias, "config") },
+      },
+      repository,
+    );
+    assert.equal(denied.permissionDecision, "deny");
+
+    const firstStop = invokePowerShell(
+      "Stop",
+      { ...common, hook_event_name: "Stop" },
+      repository,
+    );
+    assert.equal(firstStop.decision, "block");
+    const routePath = path.join(
+      storageRoot,
+      "supervised-worker",
+      "session-roots",
+      sha256(sessionId),
+      "route.json",
+    );
+    rmSync(routePath);
+    const missingRoute = invokePowerShell(
+      "Stop",
+      { ...common, hook_event_name: "Stop" },
+      repository,
+    );
+    assert.equal(missingRoute.decision, "allow");
+    assert.match(missingRoute.systemMessage, /could not verify its local state/);
+    assert.equal(
+      existsSync(path.join(repository, ".supervised-worker", "attachment.json")),
+      true,
+    );
+  } finally {
+    rmSync(storageRoot, { recursive: true, force: true });
+    rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("packaged PostToolUseFailure releases a provisional routed claim", {
+  skip: process.platform !== "win32",
+}, () => {
+  const repository = workspace();
+  const storageRoot = workspace();
+  try {
+    const sessionId = "packaged-failed-plan";
+    const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+    const planFile = path.join(repository, ".supervised-worker", "plan.json");
+    const common = {
+      session_id: sessionId,
+      transcript_path: transcriptPath,
+      cwd: root,
+      tool_name: "Write",
+      tool_input: { file_path: planFile },
+    };
+    assert.deepEqual(
+      invokePowerShell(
+        "PreToolUse",
+        { ...common, hook_event_name: "PreToolUse" },
+        repository,
+      ),
+      {},
+    );
+    assert.deepEqual(
+      invokePowerShell(
+        "PostToolUseFailure",
+        { ...common, hook_event_name: "PostToolUseFailure" },
+        repository,
+      ),
+      {},
+    );
+    const routePath = path.join(
+      storageRoot,
+      "supervised-worker",
+      "session-roots",
+      sha256(sessionId),
+      "route.json",
+    );
+    assert.equal(JSON.parse(readFileSync(routePath, "utf8")).status, "released");
+    assert.equal(
+      existsSync(path.join(repository, ".supervised-worker", "attachment.json")),
+      false,
+    );
+  } finally {
+    rmSync(storageRoot, { recursive: true, force: true });
+    rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("packaged PostToolUse reconciles a missing plan as a failed write", {
+  skip: process.platform !== "win32",
+}, () => {
+  const repository = workspace();
+  const storageRoot = workspace();
+  try {
+    const sessionId = "packaged-missing-plan";
+    const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+    const planFile = path.join(repository, ".supervised-worker", "plan.json");
+    const common = {
+      session_id: sessionId,
+      transcript_path: transcriptPath,
+      cwd: root,
+      tool_name: "Write",
+      tool_input: { file_path: planFile },
+    };
+    assert.deepEqual(
+      invokePowerShell(
+        "PreToolUse",
+        { ...common, hook_event_name: "PreToolUse" },
+        repository,
+      ),
+      {},
+    );
+    const output = invokePowerShell(
+      "PostToolUse",
+      { ...common, hook_event_name: "PostToolUse" },
+      repository,
+    );
+    assert.match(output.additionalContext, /without materializing/);
+    const routePath = path.join(
+      storageRoot,
+      "supervised-worker",
+      "session-roots",
+      sha256(sessionId),
+      "route.json",
+    );
+    assert.equal(JSON.parse(readFileSync(routePath, "utf8")).status, "released");
+    assert.equal(
+      existsSync(path.join(repository, ".supervised-worker", "attachment.json")),
+      false,
+    );
+  } finally {
+    rmSync(storageRoot, { recursive: true, force: true });
+    rmSync(repository, { recursive: true, force: true });
   }
 });
 
@@ -259,5 +578,37 @@ test("packaged PowerShell PreToolUse denies linked-worktree Git roots", {
   } finally {
     rmSync(worktree, { recursive: true, force: true });
     rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("checkout PowerShell hook fails closed without PLUGIN_ROOT", {
+  skip: process.platform !== "win32",
+}, () => {
+  const cwd = workspace();
+  try {
+    const plantedDirectory = path.join(cwd, "src");
+    const markerPath = path.join(cwd, "planted-ran.txt");
+    mkdirSync(plantedDirectory);
+    writeFileSync(
+      path.join(plantedDirectory, "hook-launcher.mjs"),
+      `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(markerPath)}, "ran");\n`,
+    );
+    const result = spawnSync(
+      "pwsh",
+      ["-NoProfile", "-NonInteractive", "-Command", hooks.SessionStart[0].powershell],
+      {
+        cwd,
+        env: { ...process.env, PLUGIN_ROOT: "" },
+        input: JSON.stringify(payload(cwd, "SessionStart")),
+        encoding: "utf8",
+        timeout: 4_000,
+      },
+    );
+    assert.equal(result.error, undefined, result.error?.message);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /requires PLUGIN_ROOT/);
+    assert.equal(existsSync(markerPath), false);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });

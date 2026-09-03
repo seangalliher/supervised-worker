@@ -32,6 +32,15 @@ to protected state. Existing regular-file edit targets with more than one hard
 link are denied conservatively. Handoff paths apply the same link checks before
 they can enter an approved footprint.
 
+Windows lifecycle state is limited to local drive-letter storage. UNC,
+network-mapped, and `subst` roots are denied before synchronous path inspection;
+locality checks share a 1.5-second deadline and three-drive limit. The alpha does
+not govern repositories on remote filesystems.
+
+The explicit `release` command also requires the repository's canonical local
+path. Junction, symbolic-link, `subst`, mapped, and UNC roots are rejected before
+ownership state is removed.
+
 These are preflight reliability checks, not atomic filesystem transactions. A
 same-user process can race a path after validation, replace the installed hook,
 or mutate Git state through APIs outside the governed edit tools. That remains
@@ -55,10 +64,14 @@ outside the alpha security boundary.
 - Require explicit human approval for policy changes, production access,
   destructive data operations, spending, or weaker controls.
 - Review plugin code and release hashes before installation.
-- GitHub Copilot resolves custom-agent name conflicts by precedence. Verify in
-  the host environment view that `seangalliher-supervised-*` roles come from this
-  plugin before relying on their tool boundaries. Publisher-qualified names
-  reduce collisions but do not create a security namespace.
+- Register the content-addressed path returned by `npm run install:local` in VS
+  Code. Checkout manifests fail closed without trusted `PLUGIN_ROOT`; they never
+  execute helper code discovered from a task workspace cwd. Installed launchers
+  clear `NODE_OPTIONS` and GitHub credential variables before Node starts.
+- Verify in the host environment view that the raw or Copilot CLI-qualified
+  `supervised-worker:seangalliher-supervised-*` roles come from this plugin before
+  relying on their tool boundaries. Qualified selectors reduce ambiguity but do
+  not create a security namespace.
 - Treat `.github/supervised-worker.json` as authority-bearing repository content.
   Review and explicitly accept the exact `workflowHash` before using specialized
   role mappings. Built-in agent file edits are denied. Invalid mappings fail
@@ -75,6 +88,31 @@ The hook does not parse shell command text and cannot prove which agent authored
 a handoff. A same-user process or a shell-capable agent can mutate repository
 files outside built-in edit tools; exact workflow-hash acceptance and handoff
 checks detect later changes but are not host identity attestation.
+
+Handoff Git checks resolve an absolute executable from absolute `PATH` entries
+outside the target workspace, invoke it from its own directory, and pass the
+repository with `git -C`. A repository-local `git.exe` or relative `PATH` entry
+is never used; external diff, text conversion, and filesystem monitoring are
+disabled for the read-only index checks.
+
+An attachment or lifecycle ledger is likewise not proof that the host invoked a
+hook: a same-user process can call the helper directly and produce equivalent
+records. Host-backed evaluations must correlate those records with successful
+host hook logs for the same session.
+
+The VS Code session-root locator is routing metadata, not authority or host
+attestation. It is accepted only with the matching repository attachment, stores
+no transcript content, and carries the same random generation as the attachment.
+Normal Stop release retains it as a released tombstone after removing the
+attachment. An explicit manual release can leave an active locator without an
+attachment; that mismatch fails visibly and cannot select repository state.
+Start a new Copilot session after manual release; an existing session is not
+rebound to a different repository.
+
+Workspace session locks are not automatically expired or replaced. This favors
+exclusive ownership over unattended stale-lock recovery; operator-confirmed
+cleanup is required after an interrupted lock holder. Release paths report
+cleanup failure explicitly if route or attachment state cannot be updated.
 
 ## Reporting A Vulnerability
 

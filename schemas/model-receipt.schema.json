@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/seangalliher/supervised-worker/schemas/model-receipt.schema.json",
+  "title": "Supervised Worker Host Model Receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "itemId",
+    "role",
+    "agentSelector",
+    "model",
+    "family",
+    "workflowHash",
+    "reviewAttemptId",
+    "buildReportHash",
+    "stagedTreeHash",
+    "observedBy",
+    "observedAt",
+    "host",
+    "sessionHash",
+    "source"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 2 },
+    "itemId": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "role": { "enum": ["builder", "reviewer"] },
+    "agentSelector": { "$ref": "#/$defs/agentSelector" },
+    "model": { "$ref": "#/$defs/modelId" },
+    "family": { "$ref": "#/$defs/modelFamily" },
+    "workflowHash": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "reviewAttemptId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "buildReportHash": { "$ref": "#/$defs/sha256" },
+    "stagedTreeHash": { "$ref": "#/$defs/gitTreeHash" },
+    "observedBy": { "$ref": "#/$defs/agentSelector" },
+    "observedAt": { "$ref": "#/$defs/canonicalDateTime" },
+    "host": { "enum": ["vscode", "copilot-cli", "github-copilot-app", "copilot-cloud-agent"] },
+    "sessionHash": { "$ref": "#/$defs/sha256" },
+    "source": { "const": "host" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gitTreeHash": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "agentSelector": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^(?!.*(?:--|\\.\\.))[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$"
+        },
+        {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 193,
+          "pattern": "^(?!.*(?:--|\\.\\.))[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?:[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$"
+        }
+      ]
+    },
+    "modelId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9](?:[a-z0-9._:/-]{0,126}[a-z0-9])?$"
+    },
+    "modelFamily": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$"
+    },
+    "canonicalDateTime": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:(?!0000)\\d{4})-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12]\\d|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12]\\d|30)|02-(?:0[1-9]|1\\d|2[0-8]))|(?:\\d{2}(?:0[48]|[2468][048]|[13579][26])|(?:0[48]|[2468][048]|[13579][26])00)-02-29)T(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|[+-](?:[01]\\d|2[0-3]):[0-5]\\d)$"
+    }
+  }
+}

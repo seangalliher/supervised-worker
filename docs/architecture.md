@@ -60,15 +60,18 @@ attestation.
 
 Handoff schema version 2 carries `workflowHash`. The compatibility reader accepts
 version 1 artifacts only under bundled defaults, where the absent hash means
-`null`; a configured workflow never grants old artifacts new authority.
+`null`; a configured workflow never grants old artifacts new authority. Version
+1 remains inspectable for migration, but final `handoff verify` requires a
+version 2 review report bound to the current issued review attempt.
 
-The preferred main ID is `seangalliher-supervised-worker`; the established
-`supervised-worker` ID remains as a compatibility selector. A parity test permits
-only selector-specific provenance and `producedBy` identity to differ between
-them. Every new role uses the `seangalliher-supervised-*` publisher prefix. This
-reduces accidental collisions but cannot prevent GitHub's higher-precedence
-project or user agents from shadowing a plugin file with the same ID. The Worker
-therefore requires a supported-host provenance check before creating state.
+The preferred filename ID is `seangalliher-supervised-worker`; the established
+`supervised-worker` ID remains as a compatibility definition. Copilot CLI
+qualifies these as `supervised-worker:seangalliher-supervised-worker` and
+`supervised-worker:supervised-worker`. A parity test permits only
+selector-specific provenance and `producedBy` identity to differ between them.
+Every new role uses the `seangalliher-supervised-*` publisher prefix. The Worker
+requires a supported-host provenance check before creating state because
+selector text is not identity attestation.
 
 The handoff chain is bound as follows:
 
@@ -97,6 +100,12 @@ which must equal the current Git index. The Supervised Worker invokes that helpe
 after persistence; automatic host-level rejection before a subagent response
 reaches the Worker is not yet implemented.
 
+Git index checks resolve an absolute Git executable from an absolute `PATH`
+entry outside the workspace, run it from that executable's directory, and use
+`git -C <workspace>` with external diff, text conversion, and filesystem
+monitoring disabled. This keeps repository-local executable lookup out of the
+handoff trust boundary.
+
 ### Governed Queue Skill
 
 The skill defines the repository-neutral item lifecycle and plan shape. It is
@@ -108,31 +117,59 @@ The plugin uses PascalCase event names so Copilot CLI emits the VS Code-compatib
 snake_case payload. Current events are:
 
 - `SessionStart`: inject bounded counts from an active durable plan.
-- `PreToolUse`: atomically claim the first plan writer and deny later sessions.
-- `PostToolUse` and `PostToolUseFailure`: append metadata-only events.
+- `PreToolUse`: create a generation-bound provisional claim for the first plan
+        writer and deny later sessions.
+- `PostToolUse` and, on supporting hosts, `PostToolUseFailure`: append
+        metadata-only events and reconcile provisional plan claims.
 - `PreCompact`: record that a context transition is beginning.
 - `Stop`: check plan structure and bounded completion conditions.
 
-Every hook resolves code through `PLUGIN_ROOT` and has a five-second timeout.
+Checkout hooks resolve code only through a host-provided `PLUGIN_ROOT` and fail
+visibly when it is absent; process cwd is never helper authority. VS Code 1.136
+local evaluation uses `node src/cli.mjs install` to copy the trusted runtime to a
+content-addressed user-data directory and generate commands with absolute Node
+and launcher paths. The generated shell clears `NODE_OPTIONS` and GitHub
+credential variables before Node starts. The Windows installer validates the
+canonical system PowerShell executable and creates each install-base component
+only after verifying that its existing parent is not a link. Repository
+authority comes from a fully qualified protected edit target, a previously
+verified session locator, or the hook payload cwd only when neither is present.
+Helper discovery and durable-state ownership therefore remain separate. Each
+command has a five-second timeout.
 Control responses carry Copilot CLI's top-level fields and VS Code's nested
 `hookSpecificOutput` fields. PascalCase `Edit` payloads are inspected for both
 ordinary path arguments and `apply_patch` headers before plan ownership is
 decided.
+
+VS Code 1.136 does not retain the manifest's `PreToolUse.matcher`, so it invokes
+the command for non-writer tools too. The runtime checks the tool name before
+locality checks, session-context parsing, or lock acquisition and returns `{}`
+without creating state. Hosts that honor the matcher avoid that process launch.
 
 Edit targets are checked lexically and by filesystem identity. The hook denies
 device-namespace paths, unresolved link aliases, aliases whose existing
 ancestors identify `.git` or `.supervised-worker`, and existing regular files
 with multiple hard links. Repository handoff paths use exact case-sensitive Git
 identifiers, include both sides of renames, and reject link-bearing footprints.
+One invocation may name at most 256 unique edit targets; duplicates are folded
+before filesystem inspection, and larger sets fail closed before path traversal.
+On Windows, repository and transcript paths must be on local drive-letter
+storage. UNC, network-mapped, and `subst` roots are rejected before synchronous
+filesystem inspection. Locality checks share a 1.5-second aggregate deadline
+and admit at most three distinct drive letters per operation so the five-second
+hook deadline remains enforceable.
 
 On Windows, Copilot CLI runs the `powershell` hook field through PowerShell 7
 (`pwsh`). The packaged lifecycle test invokes that same host shell.
 
-Copilot CLI discovers the custom agents from `agents/` and lifecycle hooks from
-root `hooks.json`. The Agent Plugins v1 portable surface remains the closed root
-manifest plus `skills/`; Copilot's agent and hook loading is additive client
-behavior. Copilot CLI 1.0.74 or newer is required because that release added
-Agent Plugins v1 manifest support.
+Under the Agent Plugins v1 manifest, Copilot CLI discovers custom agents from
+`com.github.copilot/agents/` and lifecycle hooks from
+`com.github.copilot/hooks/hooks.json`. Byte-identical `agents/` and root
+`hooks.json` copies preserve compatibility with hosts using the older native
+layout, and package validation rejects drift between the two surfaces. The
+portable surface remains the closed root manifest plus `skills/`; Copilot's
+agent and hook loading is additive client behavior. Copilot CLI 1.0.74 or newer
+is required because that release added Agent Plugins v1 manifest support.
 
 ### Helper
 
@@ -154,15 +191,58 @@ The state directory belongs to the repository being worked on, not the plugin:
 |-- workflow-acceptance.json # exact accepted repository role-map hash
 |-- handoffs/       # typed summaries below sha256(itemId), never raw provider ids
 |-- runs/*.jsonl    # append-only metadata events by hashed session id
-|-- attachment.json # hash of the session currently governing the plan
+|-- attachment.json # session hash, claim generation, and provisional/active status
 `-- runtime/*.json  # bounded Stop counters
 ```
 
-The pre-tool hook atomically claims the session that first writes `plan.json`.
-The post-tool hook records successful writes and releases a failed first claim
-when no plan exists. Plan recovery, event logging, and Stop enforcement apply
-only to the attached session. This prevents an active queue campaign from
-interfering with unrelated Copilot sessions sharing the repository.
+When a review supplies resolved model evidence, runtime state contains
+metadata-only model receipts below
+`runtime/model-receipts/<sha256(itemId)>/`. The Worker records host-observed
+Builder and Reviewer model identities there before review. The final handoff
+gate verifies exact receipt hashes and item, role, selector, workflow, review
+attempt, build-report, staged-tree, model, family, and chronology bindings
+whether the workflow requires a model policy or the review voluntarily supplies
+`modelResolution`; copied model strings in an agent response are insufficient.
+Immediately before review, `handoff issue-review` also writes the one current
+attempt for the item below `runtime/review-attempts/`. It is atomically bound to
+the validated contract, build report, and staged tree. Issuing another attempt
+rotates the current UUID, and final verification rejects non-current, expired,
+or future-dated bundles with a five-minute clock-skew allowance.
+
+The pre-tool hook starts a provisional claim before the first `plan.json` write.
+A successful post-tool hook promotes the matching attachment and route
+generation to active; a failed write that leaves no materialized plan, or Stop
+without one, marks the route released and removes the attachment. Plan recovery,
+event logging, and Stop enforcement apply only to the attached session. This
+prevents an active queue campaign from interfering with unrelated Copilot
+sessions sharing the repository.
+
+VS Code Copilot Chat 0.64 does not dispatch the declared
+`PostToolUseFailure` event. Its supported `PostToolUse` path therefore checks
+that a plan-targeting tool actually materialized `plan.json` before promotion.
+When no plan exists, the hook records failure metadata and releases the
+provisional claim. Hosts that dispatch `PostToolUseFailure` use the same release
+path directly.
+
+VS Code may assign a plugin or workspace directory as the hook process and
+payload cwd. Neither is used to discover executable code. For a fully qualified
+protected edit, the helper derives the target repository and stores a small routing record at
+`workspaceStorage/<workspace>/supervised-worker/session-roots/<session-hash>/route.json`.
+The record contains the session hash, repository root and hash, random claim
+generation, lifecycle status, and timestamps; it contains no transcript
+content. Targetless events accept an active or provisional route only while the
+repository's `attachment.json` carries the same session hash and generation.
+Route and attachment transitions are serialized by a workspace-scoped session
+lock. An existing lock is never replaced automatically; an abandoned lock fails
+visibly and requires operator-confirmed cleanup, while a new session uses a
+different hashed lock path. Individual writes are atomic, while the shared
+generation and provisional state make a crash between files detectable and
+recoverable. A persistent hashed binding marker distinguishes a deleted route
+directory from a never-bound session; if an existing route loses its marker,
+the hook restores the marker and fails visibly. Normal Stop release removes the
+attachment and retains a released route tombstone for later reconciliation. If
+writing the tombstone or removing the attachment fails, the hook reports that
+cleanup failed and does not claim the ownership was released.
 
 The main worker derives each item handoff directory from `sha256(itemId)`. This
 keeps untrusted provider identifiers out of filesystem paths. Handoffs may carry

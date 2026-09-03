@@ -21,14 +21,55 @@ selectors to IDs the active Copilot host resolves:
 ```
 
 The actual file is a complete workflow document; `roles` cannot be partial.
-Selectors are filename-derived Copilot agent IDs, not frontmatter display names.
-They use lowercase letters, numbers, dots, and hyphens, must be distinct, and
-cannot name either Supervised Worker selector.
+Selectors are host-resolved Copilot agent IDs, not frontmatter display names.
+Repository and user agents normally use raw filename-derived IDs. Copilot CLI
+qualifies plugin agents as `plugin-name:filename-id`, so a role supplied by
+another plugin may be mapped as `company-tools:architect`. Each segment uses
+lowercase letters, numbers, dots, and hyphens. The three selectors must be
+distinct and cannot name either raw or qualified Supervised Worker selector.
 The legacy `review.agent` field remains supported when `roles` is absent. When
 both are present, `review.agent` must equal `roles.reviewer`.
 Pairwise role inequality and equality with the legacy reviewer alias are
 cross-field runtime invariants; JSON Schema validates each selector's shape,
 while `workflow roles` enforces those relationships.
+
+Repositories that require a specific independent review model can bind that
+policy into the same accepted workflow bytes:
+
+```json
+{
+  "review": {
+    "required": true,
+    "independent": true,
+    "agent": "diff-reviewer",
+    "requiredModel": "gpt-5.6-sol",
+    "requiredModelFamily": "openai",
+    "requireDifferentModelFamily": true
+  }
+}
+```
+
+Under this policy, a clean review must carry `modelResolution` with host-evidence
+locators for both Builder and Reviewer. The runtime rejects a clean report when
+the Reviewer model or family differs from the accepted policy, when the Builder
+and Reviewer families match, or when separation is unknown. Model metadata is
+evidence supplied and checked by the Worker; it is not trusted self-attestation.
+
+After `handoff pre-review` passes, the Worker runs `handoff issue-review
+<contract> <build-report>`. The command atomically records a fresh current
+attempt under `.supervised-worker/runtime/review-attempts/`, bound to the exact
+contract, build report, and staged tree. Before invoking the Reviewer, the
+Worker writes one metadata-only receipt per role under
+`.supervised-worker/runtime/model-receipts/<sha256(itemId)>/{builder|reviewer}.json`.
+Each receipt conforms to `schemas/model-receipt.schema.json` and binds the item,
+mapped selector, host-reported model and family, accepted workflow hash,
+fresh review-attempt UUID, build-report hash, staged-tree hash, observing Worker
+selector, host, hashed session identity, and timestamp. The review report carries
+the same attempt UUID plus each exact receipt locator and SHA-256. Final `handoff
+verify` reopens the safe local receipt path, checks its hash and chronology, and
+compares every binding with the current issued attempt before allowing a clean
+verdict to advance. Attempts expire after 24 hours; timestamps may be at most
+five minutes ahead to tolerate clock skew.
 
 Resolve the effective map from the target repository:
 
@@ -95,7 +136,9 @@ profile bytes; review specialized agent changes separately.
 
 Handoff version 1 remains readable for campaigns using bundled reference roles
 and has no `workflowHash` member. A configured specialized role map requires
-version 2. Version 1 artifacts never inherit a configured map implicitly.
+version 2. Version 1 artifacts never inherit a configured map implicitly and
+cannot satisfy final `handoff verify`; migrate the review report and issue a
+fresh review attempt before advancement.
 
 ## Reference Agents
 
@@ -104,6 +147,12 @@ The bundled definitions live in `agents/`:
 - `seangalliher-supervised-architect.agent.md`
 - `seangalliher-supervised-builder.agent.md`
 - `seangalliher-supervised-diff-reviewer.agent.md`
+
+Agent Plugins v1 exposes the same GitHub Copilot definitions from
+`com.github.copilot/agents/`. Copilot CLI therefore resolves the bundled
+defaults as `supervised-worker:seangalliher-supervised-architect`,
+`supervised-worker:seangalliher-supervised-builder`, and
+`supervised-worker:seangalliher-supervised-diff-reviewer`.
 
 Use them as behavioral references rather than modifying installed plugin files.
 Create repository- or user-scoped specialized agents under distinct IDs, then

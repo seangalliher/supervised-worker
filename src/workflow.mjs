@@ -16,10 +16,20 @@ import path from "node:path";
 export const WORKFLOW_CONFIG_PATH = ".github/supervised-worker.json";
 export const WORKFLOW_ACCEPTANCE_PATH = ".supervised-worker/workflow-acceptance.json";
 export const MAX_WORKFLOW_BYTES = 1_048_576;
-export const DEFAULT_ROLES = Object.freeze({
+export const LEGACY_DEFAULT_ROLES = Object.freeze({
   architect: "seangalliher-supervised-architect",
   builder: "seangalliher-supervised-builder",
   reviewer: "seangalliher-supervised-diff-reviewer",
+});
+export const DEFAULT_ROLES = Object.freeze({
+  architect: "supervised-worker:seangalliher-supervised-architect",
+  builder: "supervised-worker:seangalliher-supervised-builder",
+  reviewer: "supervised-worker:seangalliher-supervised-diff-reviewer",
+});
+export const DEFAULT_REVIEW_POLICY = Object.freeze({
+  requiredModel: null,
+  requiredModelFamily: null,
+  requireDifferentModelFamily: false,
 });
 
 const TOP_LEVEL_KEYS = new Set([
@@ -33,8 +43,16 @@ const TOP_LEVEL_KEYS = new Set([
   "filing",
 ]);
 const ROLE_KEYS = new Set(["architect", "builder", "reviewer"]);
-const WORKER_SELECTORS = new Set(["supervised-worker", "seangalliher-supervised-worker"]);
-const AGENT_SELECTOR_RE = /^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$/;
+const WORKER_SELECTORS = new Set([
+  "supervised-worker",
+  "seangalliher-supervised-worker",
+  "supervised-worker:supervised-worker",
+  "supervised-worker:seangalliher-supervised-worker",
+]);
+const PLUGIN_ID_RE = /^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/;
+const AGENT_ID_RE = /^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$/;
+const MODEL_ID_RE = /^[a-z0-9](?:[a-z0-9._:/-]{0,126}[a-z0-9])?$/;
+const MODEL_FAMILY_RE = /^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/;
 
 function isRecord(value) {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -153,7 +171,10 @@ function isRfc3339DateTime(value) {
 }
 
 function validSelector(value) {
-  return typeof value === "string" && AGENT_SELECTOR_RE.test(value);
+  if (typeof value !== "string") return false;
+  const parts = value.split(":");
+  if (parts.length === 1) return AGENT_ID_RE.test(parts[0]);
+  return parts.length === 2 && PLUGIN_ID_RE.test(parts[0]) && AGENT_ID_RE.test(parts[1]);
 }
 
 function unknownKeys(value, allowed, label, errors) {
@@ -258,7 +279,19 @@ export function validateWorkflowValue(value) {
   }
 
   if (requiredKeys(value.review, ["required", "independent"], "review", errors)) {
-    unknownKeys(value.review, new Set(["required", "independent", "agent"]), "review", errors);
+    unknownKeys(
+      value.review,
+      new Set([
+        "required",
+        "independent",
+        "agent",
+        "requiredModel",
+        "requiredModelFamily",
+        "requireDifferentModelFamily",
+      ]),
+      "review",
+      errors,
+    );
     if (value.review.required !== true) errors.push("review.required must be true");
     if (value.review.independent !== true) errors.push("review.independent must be true");
     if (value.review.agent !== undefined) {
@@ -281,6 +314,39 @@ export function validateWorkflowValue(value) {
       new Set([DEFAULT_ROLES.architect, DEFAULT_ROLES.builder, value.review.agent]).size !== 3
     ) {
       errors.push("effective roles must identify three distinct agents");
+    }
+    const hasRequiredModel = value.review.requiredModel !== undefined;
+    const hasRequiredFamily = value.review.requiredModelFamily !== undefined;
+    if (
+      hasRequiredModel &&
+      (typeof value.review.requiredModel !== "string" ||
+        !MODEL_ID_RE.test(value.review.requiredModel))
+    ) {
+      errors.push("review.requiredModel is invalid");
+    }
+    if (
+      hasRequiredFamily &&
+      (typeof value.review.requiredModelFamily !== "string" ||
+        !MODEL_FAMILY_RE.test(value.review.requiredModelFamily))
+    ) {
+      errors.push("review.requiredModelFamily is invalid");
+    }
+    if (hasRequiredModel !== hasRequiredFamily) {
+      errors.push("review.requiredModel and review.requiredModelFamily must be configured together");
+    }
+    if (
+      value.review.requireDifferentModelFamily !== undefined &&
+      typeof value.review.requireDifferentModelFamily !== "boolean"
+    ) {
+      errors.push("review.requireDifferentModelFamily must be boolean");
+    }
+    if (
+      value.review.requireDifferentModelFamily === true &&
+      (!hasRequiredModel || !hasRequiredFamily)
+    ) {
+      errors.push(
+        "review.requireDifferentModelFamily requires requiredModel and requiredModelFamily",
+      );
     }
   }
 
@@ -383,6 +449,7 @@ function loadWorkflowRoles(workspace = process.cwd()) {
       requiresAcceptance: false,
       workflowHash: null,
       roles: { ...DEFAULT_ROLES },
+      reviewPolicy: { ...DEFAULT_REVIEW_POLICY },
       errors: [],
     };
   }
@@ -430,6 +497,11 @@ function loadWorkflowRoles(workspace = process.cwd()) {
       requiresAcceptance: true,
       workflowHash,
       roles,
+      reviewPolicy: {
+        requiredModel: workflow.review.requiredModel ?? null,
+        requiredModelFamily: workflow.review.requiredModelFamily ?? null,
+        requireDifferentModelFamily: workflow.review.requireDifferentModelFamily ?? false,
+      },
       errors: [],
     };
   } catch (error) {

@@ -6,10 +6,12 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 
 import { WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
@@ -19,7 +21,16 @@ export const PLAN_FILE = "plan.json";
 export const MAX_SAME_PROGRESS_BLOCKS = 2;
 export const MAX_SESSION_BLOCKS = 6;
 export const MAX_PLAN_BYTES = 1_048_576;
+export const MAX_TOOL_TARGETS = 256;
 const MAX_GIT_POINTER_BYTES = 4_096;
+const MAX_SESSION_LOCATOR_BYTES = 4_096;
+const WINDOWS_DRIVE_CHECK_TIMEOUT_MS = 500;
+const WINDOWS_PATH_CHECK_BUDGET_MS = 1_500;
+const MAX_WINDOWS_DRIVES_PER_OPERATION = 3;
+const windowsLocalDriveCache = new Map();
+let windowsSubstDrivesCache;
+let windowsPathCheckDeadline = Number.POSITIVE_INFINITY;
+let windowsCheckedDrives = new Set();
 
 const ITEM_STATUSES = new Set(["pending", "in_progress", "banked", "parked"]);
 const PLAN_MODES = new Set(["active", "complete", "inactive"]);
@@ -28,6 +39,28 @@ const ITEM_KEYS = new Set(["id", "title", "status", "resumeWhen"]);
 const COMPLETION_KEYS = new Set(["enumeration", "evidence"]);
 const ENUMERATION_KEYS = new Set(["status", "source", "checkedAt", "remainingActionable"]);
 const EVIDENCE_KEYS = new Set(["kind", "locator", "sha256"]);
+const SESSION_LOCATOR_KEYS = new Set([
+  "schemaVersion",
+  "sessionHash",
+  "repositoryRoot",
+  "repositoryRootHash",
+  "generation",
+  "status",
+  "boundAt",
+  "updatedAt",
+]);
+const SESSION_LOCATOR_STATUSES = new Set(["provisional", "active", "released"]);
+const SESSION_MARKER_KEYS = new Set(["schemaVersion", "sessionHash", "firstBoundAt"]);
+const ATTACHMENT_KEYS = new Set([
+  "schemaVersion",
+  "sessionHash",
+  "status",
+  "routeGeneration",
+  "attachedAt",
+  "updatedAt",
+]);
+const ATTACHMENT_STATUSES = new Set(["provisional", "active"]);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const PLAN_WRITER_MATCHER =
   "Write|Edit|create|edit|apply_patch|create_file|str_replace_editor|insert|insert_edit_into_file|replace_string_in_file|multi_replace_string_in_file";
 export const PLAN_WRITER_TOOLS = new Set(
@@ -357,27 +390,336 @@ function readAttachment(cwd) {
   assertSafeStatePath(cwd, filePath);
   if (!existsSync(filePath)) return null;
   const attachment = readJson(cwd, filePath);
+  if (attachment?.schemaVersion === 1) {
+    if (
+      !/^[0-9a-f]{64}$/.test(attachment?.sessionHash ?? "") ||
+      !isDateTime(attachment?.attachedAt)
+    ) {
+      throw new Error("session attachment is invalid");
+    }
+    return { ...attachment, status: "active", routeGeneration: null };
+  }
   if (
-    attachment?.schemaVersion !== 1 ||
+    attachment?.schemaVersion !== 2 ||
+    !attachment ||
+    typeof attachment !== "object" ||
+    Array.isArray(attachment) ||
+    Object.keys(attachment).some((key) => !ATTACHMENT_KEYS.has(key)) ||
     !/^[0-9a-f]{64}$/.test(attachment?.sessionHash ?? "") ||
-    !isDateTime(attachment?.attachedAt)
+    !ATTACHMENT_STATUSES.has(attachment.status) ||
+    !(attachment.routeGeneration === null || UUID_PATTERN.test(attachment.routeGeneration ?? "")) ||
+    !isDateTime(attachment.attachedAt) ||
+    !isDateTime(attachment.updatedAt)
   ) {
     throw new Error("session attachment is invalid");
   }
   return attachment;
 }
 
-function isAttached(cwd, input) {
+function attachedRecord(cwd, input, routeGeneration = undefined) {
   const expected = sessionHash(input);
-  return expected !== null && readAttachment(cwd)?.sessionHash === expected;
+  const attachment = expected === null ? null : readAttachment(cwd);
+  if (attachment?.sessionHash !== expected) return null;
+  if (routeGeneration !== undefined && attachment.routeGeneration !== routeGeneration) return null;
+  return attachment;
+}
+
+function isAttached(cwd, input) {
+  return attachedRecord(cwd, input) !== null;
+}
+
+function pathNameEquals(left, right) {
+  return process.platform === "win32"
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
+function pathIdentity(value) {
+  const resolved = path.resolve(value);
+  if (process.platform !== "win32") return resolved;
+  return resolved
+    .split(path.sep)
+    .map((segment) => segment.replace(/[. ]+$/g, ""))
+    .join(path.sep)
+    .toLowerCase();
+}
+
+function sessionLocatorContext(input) {
+  const transcriptPath = input?.transcript_path ?? input?.transcriptPath;
+  const hash = sessionHash(input);
+  if (
+    !isFullyQualifiedRepositoryCwd(transcriptPath) ||
+    !isLocalRepositoryPath(transcriptPath) ||
+    hash === null
+  ) return null;
+  const resolvedTranscript = path.resolve(transcriptPath);
+  if (!pathNameEquals(path.basename(resolvedTranscript), `${sessionId(input)}.jsonl`)) return null;
+  const transcriptDirectory = path.dirname(resolvedTranscript);
+  const copilotDirectory = path.dirname(transcriptDirectory);
+  const storageRoot = path.dirname(copilotDirectory);
+  if (
+    !pathNameEquals(path.basename(transcriptDirectory), "transcripts") ||
+    !pathNameEquals(path.basename(copilotDirectory), "GitHub.copilot-chat")
+  ) {
+    return null;
+  }
+  try {
+    if (!lstatSync(resolvedTranscript).isFile()) return null;
+    if (!lstatSync(transcriptDirectory).isDirectory()) return null;
+    if (!lstatSync(copilotDirectory).isDirectory()) return null;
+    if (!lstatSync(storageRoot).isDirectory()) return null;
+    if (!lstatSync(path.join(storageRoot, "workspace.json")).isFile()) return null;
+  } catch {
+    return null;
+  }
+  return {
+    storageRoot,
+    directoryPath: path.join(storageRoot, "supervised-worker", "session-roots", hash),
+    filePath: path.join(storageRoot, "supervised-worker", "session-roots", hash, "route.json"),
+    markerPath: path.join(storageRoot, "supervised-worker", "session-bindings", `${hash}.json`),
+  };
+}
+
+function acquireSessionLock(input, context = sessionLocatorContext(input)) {
+  if (context === null) return null;
+  const locksDirectory = path.join(context.storageRoot, "supervised-worker", "session-locks");
+  const lockDirectory = path.join(locksDirectory, sessionHash(input));
+  const ownerPath = path.join(lockDirectory, "owner.json");
+  ensureSafeDirectory(context.storageRoot, locksDirectory);
+  const token = randomUUID();
+  assertSafeStatePath(context.storageRoot, lockDirectory);
+  try {
+    mkdirSync(lockDirectory, { mode: 0o700 });
+  } catch (error) {
+    if (error?.code === "EEXIST") throw new Error("session lifecycle lock is busy");
+    throw error;
+  }
+  try {
+    writeFileSync(
+      ownerPath,
+      `${JSON.stringify({
+        schemaVersion: 1,
+        token,
+        processId: process.pid,
+        acquiredAt: new Date().toISOString(),
+      }, null, 2)}\n`,
+      { encoding: "utf8", mode: 0o600, flag: "wx" },
+    );
+  } catch (error) {
+    rmSync(lockDirectory, { recursive: true, force: true });
+    throw error;
+  }
+  return { storageRoot: context.storageRoot, lockDirectory, ownerPath, token };
+}
+
+function releaseSessionLock(lock) {
+  if (lock === null) return;
+  try {
+    const owner = readJson(lock.storageRoot, lock.ownerPath, MAX_SESSION_LOCATOR_BYTES);
+    if (owner?.token !== lock.token || owner?.processId !== process.pid) return;
+    removeStateFile(lock.storageRoot, lock.ownerPath);
+    assertSafeStatePath(lock.storageRoot, lock.lockDirectory);
+    rmdirSync(lock.lockDirectory);
+  } catch {
+    // An abandoned lock requires operator-confirmed cleanup.
+  }
+}
+
+function readSessionMarker(context, input) {
+  assertSafeStatePath(context.storageRoot, context.markerPath);
+  if (!existsSync(context.markerPath)) return null;
+  const marker = readJson(context.storageRoot, context.markerPath, MAX_SESSION_LOCATOR_BYTES);
+  if (
+    !marker ||
+    typeof marker !== "object" ||
+    Array.isArray(marker) ||
+    Object.keys(marker).some((key) => !SESSION_MARKER_KEYS.has(key)) ||
+    marker.schemaVersion !== 1 ||
+    marker.sessionHash !== sessionHash(input) ||
+    !isDateTime(marker.firstBoundAt)
+  ) {
+    throw new Error("session repository binding marker is invalid");
+  }
+  return marker;
+}
+
+function ensureSessionMarker(context, input) {
+  const existing = readSessionMarker(context, input);
+  if (existing !== null) return existing;
+  ensureSafeDirectory(context.storageRoot, path.dirname(context.markerPath));
+  const marker = {
+    schemaVersion: 1,
+    sessionHash: sessionHash(input),
+    firstBoundAt: new Date().toISOString(),
+  };
+  try {
+    writeFileSync(context.markerPath, `${JSON.stringify(marker, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    return marker;
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    return readSessionMarker(context, input);
+  }
+}
+
+function readSessionLocator(input) {
+  const context = sessionLocatorContext(input);
+  if (context === null) return { context: null, exists: false, locator: null };
+  const marker = readSessionMarker(context, input);
+  assertSafeStatePath(context.storageRoot, context.directoryPath);
+  assertSafeStatePath(context.storageRoot, context.filePath);
+  if (existsSync(context.filePath) && marker === null) {
+    ensureSessionMarker(context, input);
+    throw new Error("session repository binding marker is missing");
+  }
+  if (!existsSync(context.filePath)) {
+    if (marker !== null || existsSync(context.directoryPath)) {
+      throw new Error("session repository locator is missing");
+    }
+    return { context, exists: false, locator: null };
+  }
+  const locator = readJson(context.storageRoot, context.filePath, MAX_SESSION_LOCATOR_BYTES);
+  if (
+    !locator ||
+    typeof locator !== "object" ||
+    Array.isArray(locator) ||
+    Object.keys(locator).some((key) => !SESSION_LOCATOR_KEYS.has(key)) ||
+    locator.schemaVersion !== 2 ||
+    locator.sessionHash !== sessionHash(input) ||
+    !isFullyQualifiedRepositoryCwd(locator.repositoryRoot) ||
+    !isLocalRepositoryPath(locator.repositoryRoot) ||
+    locator.repositoryRootHash !== sha256(pathIdentity(locator.repositoryRoot)) ||
+    !UUID_PATTERN.test(locator.generation ?? "") ||
+    !SESSION_LOCATOR_STATUSES.has(locator.status) ||
+    !isDateTime(locator.boundAt) ||
+    !isDateTime(locator.updatedAt)
+  ) {
+    throw new Error("session repository locator is invalid");
+  }
+  return { context, exists: true, locator };
+}
+
+function bindSessionLocator(input, cwd) {
+  const context = sessionLocatorContext(input);
+  if (context === null) {
+    if (!pathEquals(cwd, input?.cwd ?? cwd)) {
+      throw new Error("cross-directory hook routing requires a valid transcript anchor");
+    }
+    return { bound: false, created: false, conflict: false };
+  }
+  ensureSessionMarker(context, input);
+  const repositoryRoot = realpathSync(path.resolve(cwd));
+  const now = new Date().toISOString();
+  const record = {
+    schemaVersion: 2,
+    sessionHash: sessionHash(input),
+    repositoryRoot,
+    repositoryRootHash: sha256(pathIdentity(repositoryRoot)),
+    generation: randomUUID(),
+    status: "provisional",
+    boundAt: now,
+    updatedAt: now,
+  };
+  ensureSafeDirectory(context.storageRoot, context.directoryPath);
+  assertSafeStatePath(context.storageRoot, context.filePath);
+  try {
+    writeFileSync(context.filePath, `${JSON.stringify(record, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    return { bound: true, created: true, conflict: false, generation: record.generation };
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    const existing = readSessionLocator(input).locator;
+    if (!existing) throw new Error("session repository locator disappeared during claim");
+    if (existing.status === "released") {
+      if (attachedRecord(existing.repositoryRoot, input, existing.generation)) {
+        removeStateFile(existing.repositoryRoot, attachmentPath(existing.repositoryRoot));
+      }
+      atomicWriteJson(context.storageRoot, context.filePath, record);
+      return { bound: true, created: true, conflict: false, generation: record.generation };
+    }
+    if (pathEquals(existing.repositoryRoot, repositoryRoot)) {
+      return {
+        bound: true,
+        created: false,
+        conflict: false,
+        generation: existing.generation,
+      };
+    }
+    return { bound: false, created: false, conflict: true };
+  }
+}
+
+function updateSessionLocatorStatus(input, expectedCwd, generation, status) {
+  const result = readSessionLocator(input);
+  if (result.context === null) return;
+  if (
+    !result.exists ||
+    !pathEquals(result.locator.repositoryRoot, expectedCwd) ||
+    result.locator.generation !== generation
+  ) {
+    throw new Error("session repository locator does not match the attachment generation");
+  }
+  if (result.locator.status === status) return;
+  if (result.locator.status === "released") {
+    throw new Error("released session repository locator cannot be reactivated");
+  }
+  atomicWriteJson(result.context.storageRoot, result.context.filePath, {
+    ...result.locator,
+    status,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+function bestEffortReleaseSessionLocator(input, expectedCwd, generation) {
+  try {
+    updateSessionLocatorStatus(input, expectedCwd, generation, "released");
+  } catch {
+    // A stale locator has no authority without the matching repository attachment.
+  }
+}
+
+function attachedSessionRoot(input) {
+  const result = readSessionLocator(input);
+  if (!result.exists) return null;
+  const attachment = attachedRecord(
+    result.locator.repositoryRoot,
+    input,
+    result.locator.generation,
+  );
+  if (result.locator.status === "released") {
+    if (attachment !== null) {
+      removeStateFile(
+        result.locator.repositoryRoot,
+        attachmentPath(result.locator.repositoryRoot),
+      );
+    }
+    return null;
+  }
+  if (attachment === null) {
+    throw new Error("session repository locator has no matching attachment");
+  }
+  if (result.locator.status === "provisional" && attachment.status === "active") {
+    updateSessionLocatorStatus(
+      input,
+      result.locator.repositoryRoot,
+      result.locator.generation,
+      "active",
+    );
+  }
+  if (result.locator.status === "active" && attachment.status !== "active") {
+    throw new Error("active session repository locator has a provisional attachment");
+  }
+  return result.locator.repositoryRoot;
 }
 
 function pathEquals(left, right) {
-  const normalize = (value) => {
-    const resolved = path.resolve(value);
-    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-  };
-  return normalize(left) === normalize(right);
+  return pathIdentity(left) === pathIdentity(right);
 }
 
 function toolTargetCandidates(input) {
@@ -388,6 +730,18 @@ function toolTargetCandidates(input) {
   }
   const toolInput = input?.tool_input ?? input?.toolArgs ?? input?.toolInput;
   const candidates = [];
+  const candidateKeys = new Set();
+  const addCandidate = (candidate) => {
+    const key = process.platform === "win32"
+      ? candidate.replaceAll("/", "\\").toLowerCase()
+      : candidate;
+    if (candidateKeys.has(key)) return;
+    if (candidates.length >= MAX_TOOL_TARGETS) {
+      throw new Error(`tool input exceeds the ${MAX_TOOL_TARGETS}-target limit`);
+    }
+    candidateKeys.add(key);
+    candidates.push(candidate);
+  };
   if (toolInput && typeof toolInput === "object") {
     const pending = [toolInput];
     const seen = new WeakSet();
@@ -396,14 +750,14 @@ function toolTargetCandidates(input) {
       if (Array.isArray(value)) {
         if (seen.has(value)) continue;
         seen.add(value);
-        pending.push(...value);
+        for (const child of value) pending.push(child);
         continue;
       }
       if (!value || typeof value !== "object") continue;
       if (seen.has(value)) continue;
       seen.add(value);
       for (const [key, child] of Object.entries(value)) {
-        if (PATH_KEYS.has(key) && typeof child === "string") candidates.push(child);
+        if (PATH_KEYS.has(key) && typeof child === "string") addCandidate(child);
         else if (child && typeof child === "object") pending.push(child);
       }
     }
@@ -415,30 +769,164 @@ function toolTargetCandidates(input) {
       toolInput?.patch,
       toolInput?.raw,
     ].filter((value) => typeof value === "string");
-    const targets = patchTexts.flatMap((patchText) =>
-      patchText.split(/\r?\n/).flatMap((line) => {
+    for (const patchText of patchTexts) {
+      for (const line of patchText.split(/\r?\n/)) {
         const fileHeader = line.match(/^\*\*\* (?:Add|Update|Delete) File:\s+(.+?)\s*$/)?.[1];
-        if (fileHeader) return fileHeader.split(/\s+->\s+/);
+        if (fileHeader) {
+          for (const target of fileHeader.split(/\s+->\s+/)) addCandidate(target);
+          continue;
+        }
         const moveHeader = line.match(/^\*\*\* Move to:\s+(.+?)\s*$/)?.[1];
-        return moveHeader ? [moveHeader] : [];
-      }),
-    );
-    candidates.push(...targets);
+        if (moveHeader) addCandidate(moveHeader);
+      }
+    }
   }
   return candidates;
 }
 
-function pathWithin(candidatePath, rootPath) {
-  const normalize = (value) => {
-    const resolved = path.resolve(value);
-    if (process.platform !== "win32") return resolved;
-    return resolved
-      .split(path.sep)
-      .map((segment) => segment.replace(/[. ]+$/g, ""))
-      .join(path.sep)
-      .toLowerCase();
+function normalizedPathSegment(segment) {
+  return process.platform === "win32"
+    ? segment.replace(/[. ]+$/g, "").toLowerCase()
+    : segment;
+}
+
+function protectedMarkerIndex(segments) {
+  for (const [index, segment] of segments.entries()) {
+    const normalized = normalizedPathSegment(segment);
+    if (normalized === normalizedPathSegment(STATE_DIRECTORY) || normalized === ".git") {
+      return index;
+    }
+    if (
+      normalized === ".github" &&
+      normalizedPathSegment(segments[index + 1] ?? "") === "supervised-worker.json" &&
+      index + 2 === segments.length
+    ) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function repositoryRootFromProtectedTarget(candidate) {
+  if (!isFullyQualifiedRepositoryCwd(candidate) || isWindowsDevicePath(candidate)) return null;
+  const resolved = path.resolve(candidate);
+  const parsed = path.parse(resolved);
+  const segments = resolved
+    .slice(parsed.root.length)
+    .split(path.sep)
+    .filter(Boolean);
+  const markerIndex = protectedMarkerIndex(segments);
+  if (markerIndex < 0) return null;
+  return path.resolve(parsed.root, ...segments.slice(0, markerIndex));
+}
+
+function isProtectedTarget(candidate) {
+  const segments = candidate.split(/[\\/]+/).filter(Boolean);
+  return protectedMarkerIndex(segments) >= 0;
+}
+
+function inspectTargetCandidate(candidate, cwd = null) {
+  if (isWindowsDevicePath(candidate)) {
+    return {
+      raw: candidate,
+      qualified: false,
+      lexical: candidate,
+      canonical: candidate,
+      unsafe: true,
+      ancestorIdentities: new Set(),
+    };
+  }
+  const qualified = isFullyQualifiedRepositoryCwd(candidate);
+  if (!qualified && cwd === null) return { raw: candidate, qualified: false };
+  if (qualified && !isLocalRepositoryPath(candidate)) {
+    return {
+      raw: candidate,
+      qualified: true,
+      lexical: candidate,
+      canonical: candidate,
+      unsafe: true,
+      ancestorIdentities: new Set(),
+    };
+  }
+  const lexical = path.resolve(qualified ? candidate : path.join(cwd, candidate));
+  const canonical = canonicalizeDeepestExisting(lexical);
+  return {
+    raw: candidate,
+    qualified,
+    lexical,
+    canonical: canonical.path,
+    unsafe: canonical.unsafe ||
+      canonical.ancestorIdentities.has("multi-linked-regular-file") ||
+      canonical.ancestorIdentities.has("unresolvable-filesystem-identity"),
+    ancestorIdentities: canonical.ancestorIdentities,
   };
-  return isContained(normalize(rootPath), normalize(candidatePath));
+}
+
+function prepareToolTargets(input) {
+  return toolTargetCandidates(input).map((candidate) => inspectTargetCandidate(candidate));
+}
+
+function completeToolTargetInspection(targets, cwd) {
+  const completed = targets.map((target) =>
+    target.lexical === undefined ? inspectTargetCandidate(target.raw, cwd) : target,
+  );
+  return { targets: completed, unsafe: completed.some((target) => target.unsafe) };
+}
+
+function protectedTargetRouting(targets) {
+  const roots = [];
+  let hasUnqualifiedTarget = false;
+  for (const target of targets) {
+    const candidate = target.raw;
+    if (target.unsafe) continue;
+    if (
+      isProtectedTarget(candidate) &&
+      !target.qualified &&
+      !isWindowsDevicePath(candidate)
+    ) {
+      hasUnqualifiedTarget = true;
+      continue;
+    }
+    const root = target.canonical === undefined
+      ? null
+      : repositoryRootFromProtectedTarget(target.canonical) ??
+        repositoryRootFromProtectedTarget(target.lexical);
+    if (root !== null && !roots.some((existing) => pathEquals(existing, root))) roots.push(root);
+  }
+  return { roots, hasUnqualifiedTarget };
+}
+
+function pathsShareFilesystemIdentity(left, right) {
+  const leftRoot = canonicalizeDeepestExisting(left);
+  const rightRoot = canonicalizeDeepestExisting(right);
+  return leftRoot.exactExists &&
+    rightRoot.exactExists &&
+    leftRoot.selfIdentity !== null &&
+    leftRoot.selfIdentity === rightRoot.selfIdentity;
+}
+
+function resolveHookCwd(input, targets, fallbackCwd) {
+  const { roots: targetRoots, hasUnqualifiedTarget } = protectedTargetRouting(targets);
+  if (hasUnqualifiedTarget) {
+    throw new Error("protected edit target is not fully qualified");
+  }
+  if (targetRoots.length > 1) {
+    throw new Error("one hook invocation targets protected paths in multiple repositories");
+  }
+  if (targetRoots.length === 1) {
+    if (
+      !pathEquals(targetRoots[0], fallbackCwd) &&
+      pathsShareFilesystemIdentity(targetRoots[0], fallbackCwd)
+    ) {
+      throw new Error("protected target repository is a filesystem alias of the hook cwd");
+    }
+    return targetRoots[0];
+  }
+  return attachedSessionRoot(input) ?? fallbackCwd;
+}
+
+function pathWithin(candidatePath, rootPath) {
+  return isContained(pathIdentity(rootPath), pathIdentity(candidatePath));
 }
 
 function isWindowsDevicePath(value) {
@@ -446,6 +934,99 @@ function isWindowsDevicePath(value) {
   return normalized.startsWith("\\\\?\\") ||
     normalized.startsWith("\\\\.\\") ||
     normalized.startsWith("\\??\\");
+}
+
+function isFullyQualifiedRepositoryCwd(value) {
+  if (!nonEmptyString(value)) return false;
+  if (process.platform !== "win32") return path.isAbsolute(value);
+  if (isWindowsDevicePath(value)) return false;
+  const normalized = value.replaceAll("/", "\\");
+  return /^[A-Za-z]:\\/.test(normalized) || /^\\\\[^\\]+\\[^\\]+(?:\\|$)/.test(normalized);
+}
+
+function scrubbedChildEnvironment() {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(([key]) =>
+      !["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"].includes(key.toUpperCase()),
+    ),
+  );
+}
+
+function windowsSystemExecutable(name) {
+  const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+  if (!systemRoot || !/^[A-Za-z]:[\\/]/.test(systemRoot)) return null;
+  return path.join(systemRoot, "System32", name);
+}
+
+function resetWindowsPathChecks() {
+  windowsSubstDrivesCache = undefined;
+  windowsLocalDriveCache.clear();
+  windowsCheckedDrives = new Set();
+  windowsPathCheckDeadline = Date.now() + WINDOWS_PATH_CHECK_BUDGET_MS;
+}
+
+function windowsPathCheckTimeout() {
+  return Math.max(
+    0,
+    Math.min(WINDOWS_DRIVE_CHECK_TIMEOUT_MS, windowsPathCheckDeadline - Date.now()),
+  );
+}
+
+function windowsSubstDrives() {
+  if (windowsSubstDrivesCache !== undefined) return windowsSubstDrivesCache;
+  const executable = windowsSystemExecutable("subst.exe");
+  if (executable === null) {
+    windowsSubstDrivesCache = null;
+    return windowsSubstDrivesCache;
+  }
+  const timeout = windowsPathCheckTimeout();
+  if (timeout === 0) {
+    windowsSubstDrivesCache = null;
+    return windowsSubstDrivesCache;
+  }
+  const result = spawnSync(executable, [], {
+    encoding: "utf8",
+    env: scrubbedChildEnvironment(),
+    timeout,
+    windowsHide: true,
+  });
+  if (result.error || result.status !== 0) {
+    windowsSubstDrivesCache = null;
+    return windowsSubstDrivesCache;
+  }
+  windowsSubstDrivesCache = new Set(
+    result.stdout
+      .split(/\r?\n/)
+      .map((line) => line.match(/^([A-Za-z]):\\:/)?.[1]?.toUpperCase())
+      .filter(Boolean),
+  );
+  return windowsSubstDrivesCache;
+}
+
+function isLocalRepositoryPath(value) {
+  if (process.platform !== "win32") return true;
+  const normalized = value.replaceAll("/", "\\");
+  if (normalized.startsWith("\\\\")) return false;
+  const drive = normalized.match(/^([A-Za-z]):\\/)?.[1]?.toUpperCase();
+  if (!drive) return false;
+  const substDrives = windowsSubstDrives();
+  if (substDrives === null || substDrives.has(drive)) return false;
+  if (windowsLocalDriveCache.has(drive)) return windowsLocalDriveCache.get(drive);
+  if (windowsCheckedDrives.size >= MAX_WINDOWS_DRIVES_PER_OPERATION) return false;
+  windowsCheckedDrives.add(drive);
+  const executable = windowsSystemExecutable("net.exe");
+  if (executable === null) return false;
+  const timeout = windowsPathCheckTimeout();
+  if (timeout === 0) return false;
+  const result = spawnSync(executable, ["use", `${drive}:`], {
+    encoding: "utf8",
+    env: scrubbedChildEnvironment(),
+    timeout,
+    windowsHide: true,
+  });
+  const local = !result.error && result.status === 2;
+  windowsLocalDriveCache.set(drive, local);
+  return local;
 }
 
 function fileIdentity(stats) {
@@ -525,27 +1106,7 @@ function existingAncestorIdentities(candidatePath) {
   return identities;
 }
 
-function inspectToolTargets(input, cwd) {
-  const targets = toolTargetCandidates(input).map((candidate) => {
-    if (isWindowsDevicePath(candidate)) {
-      return { lexical: candidate, canonical: candidate, unsafe: true };
-    }
-    const lexical = path.resolve(path.isAbsolute(candidate) ? candidate : path.join(cwd, candidate));
-    const canonical = canonicalizeDeepestExisting(lexical);
-    return {
-      lexical,
-      canonical: canonical.path,
-      unsafe: canonical.unsafe ||
-        canonical.ancestorIdentities.has("multi-linked-regular-file") ||
-        canonical.ancestorIdentities.has("unresolvable-filesystem-identity"),
-      ancestorIdentities: canonical.ancestorIdentities,
-    };
-  });
-  return { targets, unsafe: targets.some((target) => target.unsafe) };
-}
-
-function targetWithin(target, rootPath) {
-  const canonicalRoot = canonicalizeDeepestExisting(rootPath);
+function targetWithin(target, rootPath, canonicalRoot) {
   return pathWithin(target.lexical, rootPath) ||
     (!target.unsafe && !canonicalRoot.unsafe && pathWithin(target.canonical, canonicalRoot.path)) ||
     (canonicalRoot.exactExists &&
@@ -591,60 +1152,158 @@ function gitMetadataRoots(cwd) {
   return roots;
 }
 
-function toolTouchesPlan(input, cwd) {
+function toolTouchesPlan(inspectedTargets, cwd) {
   const root = planPath(cwd);
   const canonicalRoot = canonicalizeDeepestExisting(root);
-  return inspectToolTargets(input, cwd).targets.some((target) =>
+  return inspectedTargets.targets.some((target) =>
     pathEquals(target.lexical, root) ||
     (!target.unsafe && !canonicalRoot.unsafe && pathEquals(target.canonical, canonicalRoot.path)),
   );
 }
 
-function toolTouchesState(input, cwd) {
-  return inspectToolTargets(input, cwd).targets.some((target) =>
-    targetWithin(target, stateDirectory(cwd)),
+function toolTouchesState(inspectedTargets, cwd) {
+  const root = stateDirectory(cwd);
+  const canonicalRoot = canonicalizeDeepestExisting(root);
+  return inspectedTargets.targets.some((target) =>
+    targetWithin(target, root, canonicalRoot),
   );
 }
 
-function toolTouchesGitMetadata(input, cwd) {
-  const targets = inspectToolTargets(input, cwd).targets;
-  return gitMetadataRoots(cwd).some((rootPath) =>
-    targets.some((target) => targetWithin(target, rootPath)),
+function toolTouchesGitMetadata(inspectedTargets, cwd) {
+  const roots = gitMetadataRoots(cwd).map((rootPath) => ({
+    rootPath,
+    canonicalRoot: canonicalizeDeepestExisting(rootPath),
+  }));
+  return roots.some(({ rootPath, canonicalRoot }) =>
+    inspectedTargets.targets.some((target) => targetWithin(target, rootPath, canonicalRoot)),
   );
 }
 
-function toolTouchesWorkflowConfig(input, cwd) {
+function toolTouchesWorkflowConfig(inspectedTargets, cwd) {
   const root = path.join(path.resolve(cwd), ...WORKFLOW_CONFIG_PATH.split("/"));
   const canonicalRoot = canonicalizeDeepestExisting(root);
-  return inspectToolTargets(input, cwd).targets.some((target) =>
+  return inspectedTargets.targets.some((target) =>
     pathEquals(target.lexical, root) ||
     (!target.unsafe && !canonicalRoot.unsafe && pathEquals(target.canonical, canonicalRoot.path)),
   );
 }
 
-function claimSession(cwd, input) {
+function promoteAttachment(cwd, input, routeGeneration) {
+  const attachment = attachedRecord(cwd, input, routeGeneration);
+  if (attachment === null) throw new Error("session attachment cannot be promoted");
+  if (attachment.status === "active") return attachment;
+  const promoted = {
+    ...attachment,
+    status: "active",
+    updatedAt: new Date().toISOString(),
+  };
+  atomicWriteJson(cwd, attachmentPath(cwd), promoted);
+  return promoted;
+}
+
+function promoteSessionClaim(cwd, input, routeGeneration) {
+  promoteAttachment(cwd, input, routeGeneration);
+  if (routeGeneration !== null) {
+    updateSessionLocatorStatus(input, cwd, routeGeneration, "active");
+  }
+}
+
+function claimSession(cwd, input, promote = false) {
   const hash = sessionHash(input);
   if (hash === null) return { claimed: false, conflict: false };
   const filePath = attachmentPath(cwd);
-  assertSafeStatePath(cwd, filePath);
-  ensureSafeDirectory(cwd, path.dirname(filePath));
+  const locatorClaim = bindSessionLocator(input, cwd);
+  if (locatorClaim.conflict) {
+    return { claimed: false, conflict: true, routingConflict: true };
+  }
+  try {
+    assertSafeStatePath(cwd, filePath);
+    ensureSafeDirectory(cwd, path.dirname(filePath));
+  } catch (error) {
+    if (locatorClaim.created) {
+      bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation);
+    }
+    throw error;
+  }
   const record = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     sessionHash: hash,
+    status: "provisional",
+    routeGeneration: locatorClaim.generation ?? null,
     attachedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   };
+  let attachmentCreated = false;
   try {
     writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, {
       encoding: "utf8",
       mode: 0o600,
       flag: "wx",
     });
+    attachmentCreated = true;
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      if (locatorClaim.created) {
+        bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation);
+      }
+      throw error;
+    }
+    const existing = readAttachment(cwd);
+    if (
+      existing?.sessionHash === hash &&
+      existing.routeGeneration === null &&
+      record.routeGeneration !== null
+    ) {
+      const migrated = {
+        schemaVersion: 2,
+        sessionHash: hash,
+        status: "active",
+        routeGeneration: record.routeGeneration,
+        attachedAt: existing.attachedAt,
+        updatedAt: new Date().toISOString(),
+      };
+      let migrationWritten = false;
+      try {
+        atomicWriteJson(cwd, filePath, migrated);
+        migrationWritten = true;
+        updateSessionLocatorStatus(input, cwd, record.routeGeneration, "active");
+      } catch (migrationError) {
+        try {
+          if (migrationWritten) {
+            atomicWriteJson(cwd, filePath, {
+              schemaVersion: 1,
+              sessionHash: hash,
+              attachedAt: existing.attachedAt,
+            });
+          }
+        } finally {
+          if (locatorClaim.created) {
+            bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation);
+          }
+        }
+        throw migrationError;
+      }
+      return { claimed: true, conflict: false };
+    }
+    if (
+      existing?.sessionHash !== hash ||
+      existing.routeGeneration !== record.routeGeneration
+    ) {
+      if (locatorClaim.created) {
+        bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation);
+      }
+      return { claimed: false, conflict: true };
+    }
+  }
+  try {
+    if (promote) promoteSessionClaim(cwd, input, record.routeGeneration);
     return { claimed: true, conflict: false };
   } catch (error) {
-    if (error?.code !== "EEXIST") throw error;
-    const existing = readAttachment(cwd);
-    if (existing?.sessionHash === hash) return { claimed: true, conflict: false };
-    return { claimed: false, conflict: true };
+    if (attachmentCreated) removeStateFile(cwd, filePath);
+    if (locatorClaim.created) {
+      bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation);
+    }
+    throw error;
   }
 }
 
@@ -654,15 +1313,18 @@ function removeStateFile(cwd, filePath) {
 }
 
 function detachSession(cwd, input) {
-  if (isAttached(cwd, input)) removeStateFile(cwd, attachmentPath(cwd));
-}
-
-function bestEffortDetach(cwd, input) {
-  try {
-    detachSession(cwd, input);
-  } catch {
-    // The visible hook response carries the failure; never follow an unsafe path.
+  const attachment = attachedRecord(cwd, input);
+  if (attachment === null) return false;
+  if (attachment.routeGeneration !== null) {
+    updateSessionLocatorStatus(
+      input,
+      cwd,
+      attachment.routeGeneration,
+      "released",
+    );
   }
+  removeStateFile(cwd, attachmentPath(cwd));
+  return true;
 }
 
 function appendLedger(cwd, input, event, detail = {}) {
@@ -709,21 +1371,42 @@ function validRuntimeState(value) {
 
 function releaseStop(cwd, input, event, detail, output) {
   try {
-    appendLedger(cwd, input, event, detail);
-  } finally {
-    try {
-      removeStateFile(cwd, runtimeStatePath(cwd, input));
-    } catch {
-      // Best effort cleanup; the attachment is still removed below.
-    }
-    bestEffortDetach(cwd, input);
+    removeStateFile(cwd, runtimeStatePath(cwd, input));
+  } catch {
+    // Runtime counters are recoverable; ownership cleanup remains authoritative.
   }
-  return output;
+  try {
+    if (!detachSession(cwd, input)) {
+      throw new Error("expected attachment disappeared during Stop cleanup");
+    }
+    appendLedger(cwd, input, event, detail);
+    return output;
+  } catch {
+    appendLedger(cwd, input, "ownership_cleanup_failed", { attemptedEvent: event });
+    const reason =
+      "Supervised Worker allowed Stop, but ownership cleanup failed. The durable claim may remain attached; do not rely on this run as queue completion or release.";
+    return allowStopOutput(input, reason);
+  }
 }
 
 function handleStop(input, cwd) {
-  if (!isAttached(cwd, input)) return {};
+  const attachment = attachedRecord(cwd, input);
+  if (attachment === null) return {};
   const planResult = loadPlan(cwd);
+  if (attachment.status === "provisional") {
+    if (!planResult.exists) {
+      const reason =
+        "Supervised Worker released a provisional claim because its plan write did not complete. Do not rely on this run as queue completion.";
+      return releaseStop(
+        cwd,
+        input,
+        "provisional_claim_released",
+        {},
+        allowStopOutput(input, reason),
+      );
+    }
+    promoteSessionClaim(cwd, input, attachment.routeGeneration);
+  }
   if (!planResult.exists) {
     return releaseStop(cwd, input, "plan_inactive", {}, {});
   }
@@ -815,7 +1498,7 @@ function handleStop(input, cwd) {
   return blockOutput(input, "Stop", reason);
 }
 
-function handleHookUnsafe(input, eventName, cwd) {
+function handleHookUnsafe(input, eventName, cwd, inspectedTargets) {
   switch (eventName) {
     case "SessionStart": {
       if (!isAttached(cwd, input)) return {};
@@ -842,7 +1525,6 @@ function handleHookUnsafe(input, eventName, cwd) {
       );
     }
     case "PreToolUse": {
-      const inspectedTargets = inspectToolTargets(input, cwd);
       if (inspectedTargets.unsafe) {
         return preToolDecision(
           input,
@@ -850,16 +1532,16 @@ function handleHookUnsafe(input, eventName, cwd) {
           "Supervised Worker denied a file edit because its target path could not be resolved safely.",
         );
       }
-      const touchesPlan = toolTouchesPlan(input, cwd);
-      const touchesState = toolTouchesState(input, cwd);
-      if (toolTouchesGitMetadata(input, cwd)) {
+      const touchesPlan = toolTouchesPlan(inspectedTargets, cwd);
+      const touchesState = toolTouchesState(inspectedTargets, cwd);
+      if (toolTouchesGitMetadata(inspectedTargets, cwd)) {
         return preToolDecision(
           input,
           "deny",
           "Supervised Worker denied a direct edit to Git metadata. Use reviewed Git commands from the owning worker instead.",
         );
       }
-      if (toolTouchesWorkflowConfig(input, cwd)) {
+      if (toolTouchesWorkflowConfig(inspectedTargets, cwd)) {
         return preToolDecision(
           input,
           "deny",
@@ -890,13 +1572,15 @@ function handleHookUnsafe(input, eventName, cwd) {
         return preToolDecision(
           input,
           "deny",
-          "Another Copilot session owns .supervised-worker/plan.json. Confirm that session is stale, then run the plugin helper's `release` command from this repository before retrying.",
+          claim.routingConflict
+            ? "This Copilot session is already bound to a different repository's durable plan. Finish or release that campaign before writing another plan."
+            : "Another Copilot session owns .supervised-worker/plan.json. Confirm that session is stale, then run the plugin helper's `release` command from this repository before retrying.",
         );
       }
       return {};
     }
     case "PostToolUse": {
-      if (toolTouchesPlan(input, cwd)) {
+      if (toolTouchesPlan(inspectedTargets, cwd)) {
         assertSafeStatePath(cwd, planPath(cwd));
         if (sessionHash(input) === null) {
           return contextOutput(
@@ -905,12 +1589,44 @@ function handleHookUnsafe(input, eventName, cwd) {
             "Supervised Worker could not attach this plan write because the hook payload had no session identifier. Do not rely on Stop governance for this run.",
           );
         }
-        const claim = claimSession(cwd, input);
+        if (!existsSync(planPath(cwd))) {
+          if (isAttached(cwd, input)) {
+            appendLedger(cwd, input, "tool_completed", {
+              toolName: input?.tool_name ?? input?.toolName ?? "unknown",
+              success: false,
+            });
+            try {
+              if (!detachSession(cwd, input)) {
+                throw new Error("expected attachment disappeared during post-tool cleanup");
+              }
+            } catch {
+              appendLedger(cwd, input, "ownership_cleanup_failed", {
+                attemptedEvent: "provisional_claim_released",
+              });
+              return contextOutput(
+                input,
+                "PostToolUse",
+                "The plan-targeting tool completed without materializing .supervised-worker/plan.json, but ownership cleanup failed. The provisional claim may remain attached; do not rely on this run as released.",
+              );
+            }
+            appendLedger(cwd, input, "provisional_claim_released", {
+              trigger: "missing_plan_after_post_tool",
+            });
+          }
+          return contextOutput(
+            input,
+            "PostToolUse",
+            "The plan-targeting tool completed without materializing .supervised-worker/plan.json. Supervised Worker released its provisional claim and did not record the write as successful.",
+          );
+        }
+        const claim = claimSession(cwd, input, true);
         if (claim.conflict) {
           return contextOutput(
             input,
             "PostToolUse",
-            "Supervised Worker did not attach this session because another session owns the durable plan. Do not continue that campaign. Ask the user to run the plugin helper's `release` command from the target repository only after confirming the prior session is stale.",
+            claim.routingConflict
+              ? "Supervised Worker did not attach this plan because the session is already bound to another repository. Do not continue either campaign until ownership is resolved."
+              : "Supervised Worker did not attach this session because another session owns the durable plan. Do not continue that campaign. Ask the user to run the plugin helper's `release` command from the target repository only after confirming the prior session is stale.",
           );
         }
       }
@@ -927,8 +1643,24 @@ function handleHookUnsafe(input, eventName, cwd) {
         toolName: input?.tool_name ?? input?.toolName ?? "unknown",
         success: false,
       });
-      if (toolTouchesPlan(input, cwd) && !existsSync(planPath(cwd))) {
-        bestEffortDetach(cwd, input);
+      if (toolTouchesPlan(inspectedTargets, cwd) && !existsSync(planPath(cwd))) {
+        try {
+          if (!detachSession(cwd, input)) {
+            throw new Error("expected attachment disappeared during failure cleanup");
+          }
+        } catch {
+          appendLedger(cwd, input, "ownership_cleanup_failed", {
+            attemptedEvent: "provisional_claim_released",
+          });
+          return contextOutput(
+            input,
+            "PostToolUseFailure",
+            "The plan write failed and ownership cleanup also failed. The provisional claim may remain attached; do not rely on this run as released.",
+          );
+        }
+        appendLedger(cwd, input, "provisional_claim_released", {
+          trigger: "post_tool_failure",
+        });
       }
       return {};
     case "PreCompact":
@@ -944,11 +1676,51 @@ function handleHookUnsafe(input, eventName, cwd) {
   }
 }
 
-export function handleHook(input, eventName, cwd = input?.cwd ?? process.cwd()) {
+export function handleHook(input, eventName, cwd = input?.cwd) {
+  if (eventName === "PreToolUse") {
+    const toolName = (input?.tool_name ?? input?.toolName ?? "")
+      .toLowerCase()
+      .split(/[./]/)
+      .at(-1);
+    if (!PLAN_WRITER_TOOLS.has(toolName)) return {};
+  }
+  if (process.platform === "win32") {
+    resetWindowsPathChecks();
+  }
+  if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd)) {
+    const reason =
+      "Supervised Worker could not verify local state because the hook payload did not provide an absolute repository cwd. Do not rely on this run as queue completion.";
+    if (eventName === "PreToolUse") {
+      return preToolDecision(
+        input,
+        "deny",
+        "Supervised Worker denied the file edit because the hook payload did not provide an absolute repository cwd.",
+      );
+    }
+    return eventName === "Stop"
+      ? allowStopOutput(input, reason)
+      : {
+          ...contextOutput(input, eventName, reason),
+          systemMessage: reason,
+        };
+  }
+  let effectiveCwd = cwd;
+  let sessionContext = null;
+  let sessionLock = null;
+  let routedAttachmentObserved = false;
   try {
-    return handleHookUnsafe(input, eventName, cwd);
+    sessionContext = sessionLocatorContext(input);
+    sessionLock = acquireSessionLock(input, sessionContext);
+    const preparedTargets = prepareToolTargets(input);
+    effectiveCwd = resolveHookCwd(input, preparedTargets, cwd);
+    const inspectedTargets = completeToolTargetInspection(preparedTargets, effectiveCwd);
+    const attachment = attachedRecord(effectiveCwd, input);
+    routedAttachmentObserved = attachment?.routeGeneration !== null && attachment !== null;
+    if (routedAttachmentObserved && (sessionContext === null || sessionLock === null)) {
+      throw new Error("routed attachment requires its workspace-scoped session lock");
+    }
+    return handleHookUnsafe(input, eventName, effectiveCwd, inspectedTargets);
   } catch {
-    if (eventName === "Stop") bestEffortDetach(cwd, input);
     if (eventName === "PreToolUse") {
       return preToolDecision(
         input,
@@ -964,10 +1736,20 @@ export function handleHook(input, eventName, cwd = input?.cwd ?? process.cwd()) 
           ...contextOutput(input, eventName, reason),
           systemMessage: reason,
         };
+  } finally {
+    releaseSessionLock(sessionLock);
   }
 }
 
 export function releaseAttachment(cwd) {
+  if (process.platform === "win32") resetWindowsPathChecks();
+  if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd)) {
+    throw new Error("release requires a local repository root");
+  }
+  const resolvedCwd = path.resolve(cwd);
+  if (!pathEquals(resolvedCwd, realpathSync(resolvedCwd))) {
+    throw new Error("release requires a canonical repository root");
+  }
   const filePath = attachmentPath(cwd);
   assertSafeStatePath(cwd, filePath);
   if (!existsSync(filePath)) return { released: false, message: "No attachment found." };

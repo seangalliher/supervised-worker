@@ -9,7 +9,8 @@
   },
   "scripts": {
     "doctor": "node src/cli.mjs doctor",
-    "test": "node --test",
+    "install:local": "node src/cli.mjs install",
+    "test": "node test/run-tests.mjs",
     "validate": "node src/cli.mjs validate"
   },
   "devDependencies": {

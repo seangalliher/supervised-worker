@@ -53,6 +53,11 @@ test("role resolution uses bundled reference agents when repository config is ab
       workflowHash: null,
       accepted: true,
       roles: { ...DEFAULT_ROLES },
+      reviewPolicy: {
+        requiredModel: null,
+        requiredModelFamily: null,
+        requireDifferentModelFamily: false,
+      },
       errors: [],
     });
   } finally {
@@ -77,6 +82,25 @@ test("role resolution returns specialized repository selectors", () => {
     assert.equal(result.requiresAcceptance, true);
     assert.equal(result.accepted, false);
     assert.match(result.workflowHash, /^[0-9a-f]{64}$/);
+    assert.deepEqual(result.roles, workflow.roles);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("role resolution accepts plugin-qualified specialized selectors", () => {
+  const cwd = workspace();
+  try {
+    const workflow = example();
+    workflow.roles = {
+      architect: "company-tools:architect",
+      builder: "company-tools:builder",
+      reviewer: "company-tools:reviewer",
+    };
+    workflow.review.agent = "company-tools:reviewer";
+    writeWorkflow(cwd, workflow);
+    const result = resolveWorkflowRoles(cwd);
+    assert.equal(result.ok, true, result.errors.join("\n"));
     assert.deepEqual(result.roles, workflow.roles);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
@@ -113,6 +137,24 @@ test("companion role selectors are distinct and cannot impersonate the Worker", 
   const workerRole = example();
   workerRole.roles.architect = "seangalliher-supervised-worker";
   assert.match(validateWorkflowValue(workerRole).join("\n"), /cannot identify/);
+
+  const qualifiedWorkerRole = example();
+  qualifiedWorkerRole.roles.architect = "supervised-worker:seangalliher-supervised-worker";
+  assert.match(validateWorkflowValue(qualifiedWorkerRole).join("\n"), /cannot identify/);
+});
+
+test("role selector validation rejects malformed plugin qualification", () => {
+  for (const selector of [
+    ":architect",
+    "company-tools:",
+    "company-tools::architect",
+    "Company:architect",
+    `${"a".repeat(65)}:architect`,
+  ]) {
+    const workflow = example();
+    workflow.roles.architect = selector;
+    assert.match(validateWorkflowValue(workflow).join("\n"), /roles\.architect is invalid/);
+  }
 });
 
 test("invalid repository workflow does not fall back to reference roles", () => {
@@ -334,5 +376,61 @@ test("reachable and dangling linked workflow parents fail closed", () => {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });
     }
+  }
+});
+
+test("role resolution returns a hash-bound reviewer model policy", () => {
+  const cwd = workspace();
+  try {
+    const workflow = example();
+    workflow.review.requiredModel = "gpt-5.6-sol";
+    workflow.review.requiredModelFamily = "openai";
+    workflow.review.requireDifferentModelFamily = true;
+    writeWorkflow(cwd, workflow);
+    const result = resolveWorkflowRoles(cwd);
+    assert.equal(result.ok, true, result.errors.join("\n"));
+    assert.deepEqual(result.reviewPolicy, {
+      requiredModel: "gpt-5.6-sol",
+      requiredModelFamily: "openai",
+      requireDifferentModelFamily: true,
+    });
+    assert.match(result.workflowHash, /^[0-9a-f]{64}$/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("reviewer model policy rejects partial or malformed values", () => {
+  for (const mutate of [
+    (workflow) => { workflow.review.requiredModel = "gpt-5.6-sol"; },
+    (workflow) => { workflow.review.requiredModelFamily = "openai"; },
+    (workflow) => {
+      workflow.review.requiredModel = "GPT 5.6 Sol";
+      workflow.review.requiredModelFamily = "openai";
+    },
+    (workflow) => {
+      workflow.review.requiredModel = 5;
+      workflow.review.requiredModelFamily = "openai";
+    },
+    (workflow) => {
+      workflow.review.requiredModel = "gpt-5.6-sol";
+      workflow.review.requiredModelFamily = 5;
+    },
+    (workflow) => { workflow.review.requireDifferentModelFamily = "yes"; },
+    (workflow) => { workflow.review.requireDifferentModelFamily = true; },
+  ]) {
+    const workflow = example();
+    mutate(workflow);
+    assert.ok(validateWorkflowValue(workflow).length > 0);
+  }
+});
+
+test("missing or malformed review returns errors instead of throwing", () => {
+  for (const review of [undefined, null, "review", []]) {
+    const workflow = example();
+    if (review === undefined) delete workflow.review;
+    else workflow.review = review;
+    assert.doesNotThrow(() => validateWorkflowValue(workflow));
+    assert.match(validateWorkflowValue(workflow).join("\n"), /review/);
   }
 });

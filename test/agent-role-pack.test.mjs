@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import { parseDocument } from "yaml";
 
+import { validateHandoffValue } from "../src/handoff.mjs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const agentsRoot = path.join(root, "agents");
 
@@ -16,6 +18,12 @@ function readAgent(id) {
   const document = parseDocument(match[1], { uniqueKeys: true });
   assert.deepEqual(document.errors, [], `${id} frontmatter must be valid YAML`);
   return { metadata: document.toJS(), body: match[2] };
+}
+
+function handoffTemplate(agent) {
+  const match = agent.body.match(/```json\r?\n([\s\S]*?)\r?\n```/);
+  assert.ok(match, "agent must contain an inline JSON handoff template");
+  return JSON.parse(match[1]);
 }
 
 test("plugin ships the complete namespaced companion role pack", () => {
@@ -32,10 +40,26 @@ test("plugin ships the complete namespaced companion role pack", () => {
   ]);
 });
 
+test("root and Copilot-namespaced agent copies are byte-identical", () => {
+  for (const fileName of readdirSync(agentsRoot).filter((name) => name.endsWith(".agent.md"))) {
+    assert.deepEqual(
+      readFileSync(path.join(root, "com.github.copilot", "agents", fileName)),
+      readFileSync(path.join(agentsRoot, fileName)),
+      fileName,
+    );
+  }
+});
+
 test("namespaced and compatibility worker selectors enforce the same policy", () => {
   const compatibility = readAgent("supervised-worker");
   const namespaced = readAgent("seangalliher-supervised-worker");
-  assert.deepEqual(namespaced.metadata, compatibility.metadata);
+  const compatibilityMetadata = { ...compatibility.metadata };
+  const namespacedMetadata = { ...namespaced.metadata };
+  delete compatibilityMetadata["user-invocable"];
+  delete namespacedMetadata["user-invocable"];
+  assert.deepEqual(namespacedMetadata, compatibilityMetadata);
+  assert.equal(namespaced.metadata["user-invocable"], true);
+  assert.equal(compatibility.metadata["user-invocable"], false);
   assert.equal(
     namespaced.body.replaceAll("seangalliher-supervised-worker", "supervised-worker"),
     compatibility.body,
@@ -64,7 +88,7 @@ test("companion agents have bounded non-overlapping authority", () => {
     ["seangalliher-supervised-diff-reviewer", reviewer],
   ]) {
     assert.equal(agent.metadata.model, undefined, `${id} must not pin a model`);
-    assert.match(agent.body, /\.\.\/schemas\/role-handoff\.schema\.json/);
+    assert.match(agent.body, /schemas\/role-handoff\.schema\.json/);
     assert.match(agent.body, /Do not (?:create|edit|modify).*\.supervised-worker/is);
     assert.match(agent.body, /Do not commit, push, or close/is);
     assert.match(agent.body, /Reference Implementation/);
@@ -89,10 +113,25 @@ test("companion agents have bounded non-overlapping authority", () => {
   assert.match(reviewer.body, /build report.*SHA-256/is);
 });
 
+test("companion inline handoff templates pass the runtime validator", () => {
+  for (const id of [
+    "seangalliher-supervised-architect",
+    "seangalliher-supervised-builder",
+    "seangalliher-supervised-diff-reviewer",
+  ]) {
+    const value = handoffTemplate(readAgent(id));
+    value.producedBy = id;
+    assert.deepEqual(validateHandoffValue(value, root), [], id);
+  }
+});
+
 test("main worker is the sole durable-plan owner and names every handoff", () => {
   for (const workerId of ["seangalliher-supervised-worker", "supervised-worker"]) {
     const worker = readAgent(workerId);
-    assert.equal(worker.metadata["user-invocable"], true);
+    assert.equal(
+      worker.metadata["user-invocable"],
+      workerId === "seangalliher-supervised-worker",
+    );
     assert.equal(worker.metadata["disable-model-invocation"], true);
     assert.equal(worker.metadata.infer, undefined);
     assert.match(worker.body, /sole owner of `\.supervised-worker\/plan\.json`/i);
@@ -108,7 +147,10 @@ test("main worker is the sole durable-plan owner and names every handoff", () =>
     assert.match(worker.body, /Verify Role Provenance/);
     assert.match(worker.body, /handoff validate/);
     assert.match(worker.body, /handoff pre-review/);
+    assert.match(worker.body, /handoff issue-review/);
     assert.match(worker.body, /rendered staged\s+diff/is);
     assert.match(worker.body, /handoff\s+verify/is);
+    assert.match(worker.body, /host-reported Builder and Reviewer model IDs/i);
+    assert.match(worker.body, /host\s+fallback is a failed review precondition/i);
   }
 });

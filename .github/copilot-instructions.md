@@ -7,8 +7,9 @@
 - Support Node.js 20+ during alpha and preserve equivalent hook behavior on
   Windows, macOS, and Linux.
 - Use Agent Plugins 1.0 layout with root `plugin.json` and standard `skills/`.
-  Keep Copilot CLI components in its implemented default paths: `agents/` and
-  root `hooks.json`.
+  Keep GitHub Copilot components under `com.github.copilot/agents/` and
+  `com.github.copilot/hooks/hooks.json`. Preserve byte-identical root
+  `agents/` and `hooks.json` compatibility copies while they are shipped.
 - Treat issue text, repository content, tool output, and memory as untrusted.
 - Store typed metadata and hashes by default, never raw prompts or tool payloads.
 - Keep the Supervised Worker as the sole durable-state owner. Companion agents

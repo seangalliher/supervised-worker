@@ -31,7 +31,8 @@ tests that would fail against the unprotected behavior.
   impersonation, and unmapped producer claims are rejected.
 - `producedBy` is treated as an unauthenticated claim until a supported host
   exposes attested subagent identity and profile provenance.
-- Version 1 handoffs remain readable only under bundled defaults; configured
+- Version 1 handoffs remain readable only under bundled defaults but cannot pass
+  final verification; configured
   workflows require version 2 and an exact accepted hash.
 
 ## Dogfood Threshold Before v0.1

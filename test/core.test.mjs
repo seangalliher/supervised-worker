@@ -8,6 +8,7 @@ import {
   readdirSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -15,7 +16,13 @@ import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import test, { afterEach } from "node:test";
 
-import { handleHook, planPath, sha256, validatePlan } from "../src/core.mjs";
+import {
+  handleHook,
+  MAX_TOOL_TARGETS,
+  planPath,
+  sha256,
+  validatePlan,
+} from "../src/core.mjs";
 
 const temporaryWorkspaces = new Set();
 
@@ -51,6 +58,34 @@ function stopInput(cwd, active = false) {
     stop_hook_active: active,
     cwd,
   };
+}
+
+function vscodeTranscriptPath(storageRoot, sessionId) {
+  const transcriptDirectory = path.join(storageRoot, "GitHub.copilot-chat", "transcripts");
+  mkdirSync(transcriptDirectory, { recursive: true });
+  writeFileSync(path.join(storageRoot, "workspace.json"), "{}\n");
+  const transcriptPath = path.join(transcriptDirectory, `${sessionId}.jsonl`);
+  writeFileSync(transcriptPath, "");
+  return transcriptPath;
+}
+
+function sessionRoutePath(storageRoot, sessionId) {
+  return path.join(
+    storageRoot,
+    "supervised-worker",
+    "session-roots",
+    sha256(sessionId),
+    "route.json",
+  );
+}
+
+function sessionMarkerPath(storageRoot, sessionId) {
+  return path.join(
+    storageRoot,
+    "supervised-worker",
+    "session-bindings",
+    `${sha256(sessionId)}.json`,
+  );
 }
 
 function attachPlan(cwd, sessionId = "11111111-1111-4111-8111-111111111111") {
@@ -137,6 +172,735 @@ test("PreToolUse claims the first plan writer before the file exists", () => {
   );
   assert.equal(stop.decision, "block");
   assert.equal(stop.hookSpecificOutput.decision, "block");
+});
+
+test("VS Code plugin cwd routes targetless lifecycle hooks to the attached repository", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "vscode-routed-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+
+  assert.deepEqual(
+    handleHook(
+      {
+        ...common,
+        hook_event_name: "PreToolUse",
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      },
+      "PreToolUse",
+    ),
+    {},
+  );
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), true);
+  assert.equal(existsSync(path.join(pluginRoot, ".supervised-worker")), false);
+
+  const locatorPath = sessionRoutePath(storageRoot, sessionId);
+  const locatorText = readFileSync(locatorPath, "utf8");
+  const locator = JSON.parse(locatorText);
+  assert.equal(locator.repositoryRoot, repositoryRoot);
+  assert.equal(locator.sessionHash, sha256(sessionId));
+  assert.equal(locator.status, "provisional");
+  assert.doesNotMatch(locatorText, new RegExp(sessionId));
+  const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
+  const provisionalAttachment = JSON.parse(readFileSync(attachmentPath, "utf8"));
+  assert.equal(provisionalAttachment.status, "provisional");
+  assert.equal(provisionalAttachment.routeGeneration, locator.generation);
+
+  writePlan(repositoryRoot);
+  handleHook(
+    {
+      ...common,
+      hook_event_name: "PostToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: planPath(repositoryRoot) },
+    },
+    "PostToolUse",
+  );
+  assert.equal(JSON.parse(readFileSync(locatorPath, "utf8")).status, "active");
+  assert.equal(JSON.parse(readFileSync(attachmentPath, "utf8")).status, "active");
+  const sessionStart = handleHook(
+    { ...common, hook_event_name: "SessionStart" },
+    "SessionStart",
+  );
+  assert.match(sessionStart.additionalContext, /"pending":1/);
+  handleHook(
+    {
+      ...common,
+      hook_event_name: "PostToolUse",
+      tool_name: "run_in_terminal",
+      tool_input: { command: "not retained" },
+    },
+    "PostToolUse",
+  );
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "runs")), true);
+  assert.equal(handleHook({ ...common, hook_event_name: "Stop" }, "Stop").decision, "block");
+  assert.equal(
+    handleHook({ ...common, hook_event_name: "Stop", stop_hook_active: true }, "Stop").decision,
+    "block",
+  );
+  assert.equal(
+    handleHook({ ...common, hook_event_name: "Stop", stop_hook_active: true }, "Stop").decision,
+    "allow",
+  );
+  const releasedRoute = JSON.parse(readFileSync(locatorPath, "utf8"));
+  assert.equal(releasedRoute.status, "released");
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), false);
+});
+
+test("Stop visibly releases a provisional routed claim without a plan", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "provisional-stop-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+  assert.deepEqual(
+    handleHook(
+      {
+        ...common,
+        hook_event_name: "PreToolUse",
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      },
+      "PreToolUse",
+    ),
+    {},
+  );
+
+  const output = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");
+  assert.equal(output.decision, "allow");
+  assert.match(output.systemMessage, /provisional claim/);
+  assert.equal(
+    JSON.parse(readFileSync(sessionRoutePath(storageRoot, sessionId), "utf8")).status,
+    "released",
+  );
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), false);
+});
+
+test("PostToolUseFailure releases a failed provisional plan claim", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "failed-plan-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+  const tool = {
+    tool_name: "Write",
+    tool_input: { file_path: planPath(repositoryRoot) },
+  };
+  assert.deepEqual(
+    handleHook({ ...common, ...tool, hook_event_name: "PreToolUse" }, "PreToolUse"),
+    {},
+  );
+  assert.deepEqual(
+    handleHook(
+      { ...common, ...tool, hook_event_name: "PostToolUseFailure" },
+      "PostToolUseFailure",
+    ),
+    {},
+  );
+  assert.equal(
+    JSON.parse(readFileSync(sessionRoutePath(storageRoot, sessionId), "utf8")).status,
+    "released",
+  );
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), false);
+});
+
+test("PostToolUse without a materialized plan releases the provisional claim", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "missing-plan-post-tool";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+  const tool = {
+    tool_name: "Write",
+    tool_input: { file_path: planPath(repositoryRoot) },
+  };
+  assert.deepEqual(
+    handleHook({ ...common, ...tool, hook_event_name: "PreToolUse" }, "PreToolUse"),
+    {},
+  );
+  const output = handleHook(
+    { ...common, ...tool, hook_event_name: "PostToolUse" },
+    "PostToolUse",
+  );
+  assert.match(output.additionalContext, /without materializing/);
+  assert.equal(
+    JSON.parse(readFileSync(sessionRoutePath(storageRoot, sessionId), "utf8")).status,
+    "released",
+  );
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), false);
+  const runs = path.join(repositoryRoot, ".supervised-worker", "runs");
+  const records = readdirSync(runs).flatMap((file) =>
+    readFileSync(path.join(runs, file), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line)),
+  );
+  const toolRecord = records.find((record) => record.event === "tool_completed");
+  assert.equal(toolRecord.success, false);
+  assert.equal(records.at(-1).event, "provisional_claim_released");
+});
+
+test("a released route reconciles its matching interrupted-release attachment", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "interrupted-release-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+  const tool = {
+    tool_name: "Write",
+    tool_input: { file_path: planPath(repositoryRoot) },
+  };
+  assert.deepEqual(
+    handleHook({ ...common, ...tool, hook_event_name: "PreToolUse" }, "PreToolUse"),
+    {},
+  );
+  writePlan(repositoryRoot);
+  handleHook({ ...common, ...tool, hook_event_name: "PostToolUse" }, "PostToolUse");
+  const routePath = sessionRoutePath(storageRoot, sessionId);
+  const route = JSON.parse(readFileSync(routePath, "utf8"));
+  writeFileSync(
+    routePath,
+    `${JSON.stringify({ ...route, status: "released", updatedAt: new Date().toISOString() }, null, 2)}\n`,
+  );
+
+  assert.deepEqual(handleHook({ ...common, hook_event_name: "SessionStart" }, "SessionStart"), {});
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), false);
+  assert.equal(JSON.parse(readFileSync(routePath, "utf8")).status, "released");
+});
+
+test("a fresh session lock denies concurrent state mutation", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "busy-lock-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const lockDirectory = path.join(
+    storageRoot,
+    "supervised-worker",
+    "session-locks",
+    sha256(sessionId),
+  );
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(
+    path.join(lockDirectory, "owner.json"),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      token: "external-owner",
+      processId: process.pid,
+      acquiredAt: new Date().toISOString(),
+    })}\n`,
+  );
+  const denied = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: sessionId,
+      transcript_path: transcriptPath,
+      cwd: pluginRoot,
+      tool_name: "Write",
+      tool_input: { file_path: planPath(repositoryRoot) },
+    },
+    "PreToolUse",
+  );
+  assert.equal(denied.permissionDecision, "deny");
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+  assert.equal(existsSync(sessionRoutePath(storageRoot, sessionId)), false);
+});
+
+test("a contended Stop cannot release active ownership without the session lock", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "contended-stop-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+  const tool = {
+    tool_name: "Write",
+    tool_input: { file_path: planPath(repositoryRoot) },
+  };
+  handleHook({ ...common, ...tool, hook_event_name: "PreToolUse" }, "PreToolUse");
+  writePlan(repositoryRoot);
+  handleHook({ ...common, ...tool, hook_event_name: "PostToolUse" }, "PostToolUse");
+  const routePath = sessionRoutePath(storageRoot, sessionId);
+  const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
+  const routeBefore = readFileSync(routePath, "utf8");
+  const attachmentBefore = readFileSync(attachmentPath, "utf8");
+  const lockDirectory = path.join(
+    storageRoot,
+    "supervised-worker",
+    "session-locks",
+    sha256(sessionId),
+  );
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(
+    path.join(lockDirectory, "owner.json"),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      token: "external-owner",
+      processId: process.pid,
+      acquiredAt: new Date().toISOString(),
+    })}\n`,
+  );
+
+  const output = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");
+  assert.equal(output.decision, "allow");
+  assert.match(output.systemMessage, /could not verify its local state/);
+  assert.equal(readFileSync(routePath, "utf8"), routeBefore);
+  assert.equal(readFileSync(attachmentPath, "utf8"), attachmentBefore);
+  assert.equal(existsSync(lockDirectory), true);
+});
+
+test("a routed attachment cannot mutate without its transcript context and lock", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "missing-context-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+  const tool = {
+    tool_name: "Write",
+    tool_input: { file_path: planPath(repositoryRoot) },
+  };
+  handleHook({ ...common, ...tool, hook_event_name: "PreToolUse" }, "PreToolUse");
+  writePlan(repositoryRoot);
+  handleHook({ ...common, ...tool, hook_event_name: "PostToolUse" }, "PostToolUse");
+  rmSync(planPath(repositoryRoot));
+  const routePath = sessionRoutePath(storageRoot, sessionId);
+  const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
+  const routeBefore = readFileSync(routePath, "utf8");
+  const attachmentBefore = readFileSync(attachmentPath, "utf8");
+
+  const stop = handleHook(
+    { hook_event_name: "Stop", session_id: sessionId, cwd: repositoryRoot },
+    "Stop",
+  );
+  assert.equal(stop.decision, "allow");
+  assert.match(stop.systemMessage, /could not verify its local state/);
+  assert.equal(readFileSync(routePath, "utf8"), routeBefore);
+  assert.equal(readFileSync(attachmentPath, "utf8"), attachmentBefore);
+
+  const failure = handleHook(
+    {
+      hook_event_name: "PostToolUseFailure",
+      session_id: sessionId,
+      cwd: repositoryRoot,
+      ...tool,
+    },
+    "PostToolUseFailure",
+  );
+  assert.match(failure.systemMessage, /could not verify its local state/);
+  assert.equal(readFileSync(routePath, "utf8"), routeBefore);
+  assert.equal(readFileSync(attachmentPath, "utf8"), attachmentBefore);
+});
+
+test("an expired session lock remains authoritative until explicit recovery", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "expired-lock-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const lockDirectory = path.join(
+    storageRoot,
+    "supervised-worker",
+    "session-locks",
+    sha256(sessionId),
+  );
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(
+    path.join(lockDirectory, "owner.json"),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      token: "expired-owner",
+      processId: process.pid,
+      acquiredAt: "2000-01-01T00:00:00Z",
+    })}\n`,
+  );
+  const expired = new Date(Date.now() - 60_000);
+  utimesSync(lockDirectory, expired, expired);
+
+  const ownerBefore = readFileSync(path.join(lockDirectory, "owner.json"), "utf8");
+  const output = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: sessionId,
+      transcript_path: transcriptPath,
+      cwd: pluginRoot,
+      tool_name: "Write",
+      tool_input: { file_path: planPath(repositoryRoot) },
+    },
+    "PreToolUse",
+  );
+  assert.equal(output.permissionDecision, "deny");
+  assert.equal(readFileSync(path.join(lockDirectory, "owner.json"), "utf8"), ownerBefore);
+  assert.equal(existsSync(sessionRoutePath(storageRoot, sessionId)), false);
+  assert.equal(
+    existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")),
+    false,
+  );
+});
+
+test("plugin cwd routing rejects subst repository roots before claiming", {
+  skip: process.platform !== "win32",
+}, () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "subst-route-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const drive = [..."ZYXWVUTSRQPONMLKJIHGFED"].find((letter) => !existsSync(`${letter}:\\`));
+  assert.ok(drive, "a free drive letter is required for the subst regression");
+  execFileSync("subst.exe", [`${drive}:`, repositoryRoot]);
+  try {
+    const denied = handleHook(
+      {
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: `${drive}:\\.supervised-worker\\plan.json` },
+      },
+      "PreToolUse",
+    );
+    assert.equal(denied.permissionDecision, "deny");
+    assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+    assert.equal(existsSync(sessionRoutePath(storageRoot, sessionId)), false);
+  } finally {
+    execFileSync("subst.exe", [`${drive}:`, "/D"]);
+  }
+});
+
+test("one VS Code session cannot bind durable plans in two repositories", () => {
+  const pluginRoot = workspace();
+  const firstRepository = workspace();
+  const secondRepository = workspace();
+  const storageRoot = workspace();
+  const sessionId = "vscode-routing-conflict";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const input = {
+    hook_event_name: "PreToolUse",
+    session_id: sessionId,
+    cwd: pluginRoot,
+    transcript_path: transcriptPath,
+    tool_name: "Write",
+  };
+
+  assert.deepEqual(
+    handleHook({ ...input, tool_input: { file_path: planPath(firstRepository) } }, "PreToolUse"),
+    {},
+  );
+  const denied = handleHook(
+    { ...input, tool_input: { file_path: planPath(secondRepository) } },
+    "PreToolUse",
+  );
+  assert.equal(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /different repository/);
+  assert.equal(existsSync(path.join(secondRepository, ".supervised-worker", "attachment.json")), false);
+});
+
+test("relative and cross-repository protected targets are denied as ambiguous", () => {
+  const cwd = workspace();
+  for (const target of [
+    path.join(".supervised-worker", "plan.json"),
+    path.join(".git", "config"),
+    path.join(".github", "supervised-worker.json"),
+  ]) {
+    const denied = handleHook(
+      {
+        hook_event_name: "PreToolUse",
+        session_id: "ambiguous-routing",
+        cwd,
+        tool_name: "Write",
+        tool_input: { file_path: target },
+      },
+      "PreToolUse",
+    );
+    assert.equal(denied.permissionDecision, "deny", target);
+  }
+
+  const other = workspace();
+  const denied = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: "cross-repository-routing",
+      cwd,
+      tool_name: "multi_replace_string_in_file",
+      tool_input: {
+        replacements: [
+          { filePath: planPath(cwd) },
+          { filePath: planPath(other) },
+        ],
+      },
+    },
+    "PreToolUse",
+  );
+  assert.equal(denied.permissionDecision, "deny");
+});
+
+test("plugin cwd routing denies canonical and Windows-normalized protected aliases", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  mkdirSync(path.join(repositoryRoot, ".git"), { recursive: true });
+  writeFileSync(path.join(repositoryRoot, ".git", "config"), "protected\n");
+  writePlan(repositoryRoot);
+  attachPlan(repositoryRoot, "owner-session");
+  mkdirSync(path.join(repositoryRoot, ".github"), { recursive: true });
+  writeFileSync(path.join(repositoryRoot, ".github", "supervised-worker.json"), "{}\n");
+  const linkType = process.platform === "win32" ? "junction" : "dir";
+  const gitAlias = path.join(repositoryRoot, "git-alias");
+  const stateAlias = path.join(repositoryRoot, "state-alias");
+  symlinkSync(path.join(repositoryRoot, ".git"), gitAlias, linkType);
+  symlinkSync(path.join(repositoryRoot, ".supervised-worker"), stateAlias, linkType);
+  const targets = [
+    path.join(gitAlias, "config"),
+    path.join(stateAlias, "plan.json"),
+    ...(process.platform === "win32"
+      ? [
+          path.join(repositoryRoot, ".git.", "config"),
+          path.join(repositoryRoot, ".supervised-worker.", "plan.json"),
+          path.join(repositoryRoot, ".github.", "supervised-worker.json"),
+        ]
+      : []),
+  ];
+
+  for (const target of targets) {
+    const denied = handleHook(
+      {
+        hook_event_name: "PreToolUse",
+        session_id: "companion-session",
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: target },
+      },
+      "PreToolUse",
+    );
+    assert.equal(denied.permissionDecision, "deny", target);
+  }
+});
+
+test("cross-directory plan claims require a regular transcript anchor", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "invalid-transcript-anchor";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const input = {
+    hook_event_name: "PreToolUse",
+    session_id: sessionId,
+    cwd: pluginRoot,
+    transcript_path: transcriptPath,
+    tool_name: "Write",
+    tool_input: { file_path: planPath(repositoryRoot) },
+  };
+
+  rmSync(transcriptPath);
+  let denied = handleHook(input, "PreToolUse");
+  assert.equal(denied.permissionDecision, "deny");
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+
+  if (process.platform === "win32") {
+    const transcriptDirectory = path.dirname(transcriptPath);
+    const realTranscriptDirectory = path.join(storageRoot, "real-transcripts");
+    rmSync(transcriptDirectory, { recursive: true });
+    mkdirSync(realTranscriptDirectory);
+    writeFileSync(path.join(realTranscriptDirectory, `${sessionId}.jsonl`), "");
+    symlinkSync(realTranscriptDirectory, transcriptDirectory, "junction");
+  } else {
+    const realTranscript = path.join(storageRoot, "real-transcript.jsonl");
+    writeFileSync(realTranscript, "");
+    symlinkSync(realTranscript, transcriptPath, "file");
+  }
+  denied = handleHook(input, "PreToolUse");
+  assert.equal(denied.permissionDecision, "deny");
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+  assert.equal(existsSync(sessionRoutePath(storageRoot, sessionId)), false);
+});
+
+test("failed target-state initialization releases its route and permits reclaim", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "state-initialization-failure";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const statePath = path.join(repositoryRoot, ".supervised-worker");
+  writeFileSync(statePath, "not a directory\n");
+  const input = {
+    hook_event_name: "PreToolUse",
+    session_id: sessionId,
+    cwd: pluginRoot,
+    transcript_path: transcriptPath,
+    tool_name: "Write",
+    tool_input: { file_path: planPath(repositoryRoot) },
+  };
+
+  const denied = handleHook(input, "PreToolUse");
+  assert.equal(denied.permissionDecision, "deny");
+  const released = JSON.parse(readFileSync(sessionRoutePath(storageRoot, sessionId), "utf8"));
+  assert.equal(released.status, "released");
+  assert.equal(readFileSync(statePath, "utf8"), "not a directory\n");
+
+  rmSync(statePath);
+  assert.deepEqual(handleHook(input, "PreToolUse"), {});
+  const reclaimed = JSON.parse(readFileSync(sessionRoutePath(storageRoot, sessionId), "utf8"));
+  assert.equal(reclaimed.status, "provisional");
+  assert.notEqual(reclaimed.generation, released.generation);
+  assert.equal(existsSync(path.join(statePath, "attachment.json")), true);
+});
+
+test("a routed plan claim migrates a matching v1 attachment", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "legacy-attachment-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  writePlan(repositoryRoot);
+  writeFileSync(
+    path.join(repositoryRoot, ".supervised-worker", "attachment.json"),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      sessionHash: sha256(sessionId),
+      attachedAt: "2026-09-01T00:00:00Z",
+    }, null, 2)}\n`,
+  );
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+  const decision = handleHook(
+    {
+      ...common,
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: planPath(repositoryRoot) },
+    },
+    "PreToolUse",
+  );
+  assert.deepEqual(decision, {});
+  const route = JSON.parse(readFileSync(sessionRoutePath(storageRoot, sessionId), "utf8"));
+  const attachment = JSON.parse(
+    readFileSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json"), "utf8"),
+  );
+  assert.equal(route.status, "active");
+  assert.equal(attachment.schemaVersion, 2);
+  assert.equal(attachment.status, "active");
+  assert.equal(attachment.routeGeneration, route.generation);
+  assert.equal(handleHook({ ...common, hook_event_name: "Stop" }, "Stop").decision, "block");
+});
+
+test("a bound VS Code session with a missing locator fails visibly", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "stale-vscode-locator";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+  assert.deepEqual(
+    handleHook(
+      {
+        ...common,
+        hook_event_name: "PreToolUse",
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      },
+      "PreToolUse",
+    ),
+    {},
+  );
+  rmSync(sessionRoutePath(storageRoot, sessionId));
+
+  const output = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");
+  assert.equal(output.decision, "allow");
+  assert.match(output.systemMessage, /could not verify its local state/);
+  assert.equal(existsSync(path.join(pluginRoot, ".supervised-worker")), false);
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), true);
+});
+
+test("a bound VS Code session with a missing route directory fails visibly", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "missing-route-directory";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+  assert.deepEqual(
+    handleHook(
+      {
+        ...common,
+        hook_event_name: "PreToolUse",
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      },
+      "PreToolUse",
+    ),
+    {},
+  );
+  assert.equal(existsSync(sessionMarkerPath(storageRoot, sessionId)), true);
+  rmSync(path.dirname(sessionRoutePath(storageRoot, sessionId)), {
+    recursive: true,
+    force: true,
+  });
+
+  const output = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");
+  assert.equal(output.decision, "allow");
+  assert.match(output.systemMessage, /could not verify its local state/);
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), true);
+});
+
+test("missing binding marker is restored before subsequent route loss", () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "missing-binding-marker";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+  const tool = {
+    tool_name: "Write",
+    tool_input: { file_path: planPath(repositoryRoot) },
+  };
+  handleHook({ ...common, ...tool, hook_event_name: "PreToolUse" }, "PreToolUse");
+  writePlan(repositoryRoot);
+  handleHook({ ...common, ...tool, hook_event_name: "PostToolUse" }, "PostToolUse");
+  const routePath = sessionRoutePath(storageRoot, sessionId);
+  const markerPath = sessionMarkerPath(storageRoot, sessionId);
+  const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
+  const attachmentBefore = readFileSync(attachmentPath, "utf8");
+  rmSync(markerPath);
+
+  const markerLoss = handleHook(
+    { ...common, hook_event_name: "Stop", cwd: repositoryRoot },
+    "Stop",
+  );
+  assert.equal(markerLoss.decision, "allow");
+  assert.match(markerLoss.systemMessage, /could not verify its local state/);
+  assert.equal(existsSync(markerPath), true);
+  assert.equal(readFileSync(attachmentPath, "utf8"), attachmentBefore);
+
+  rmSync(path.dirname(routePath), { recursive: true, force: true });
+  const routeLoss = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");
+  assert.equal(routeLoss.decision, "allow");
+  assert.match(routeLoss.systemMessage, /could not verify its local state/);
+  assert.equal(readFileSync(attachmentPath, "utf8"), attachmentBefore);
+});
+
+test("a never-bound VS Code session remains inert with a valid transcript context", () => {
+  const pluginRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "never-bound-vscode-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const output = handleHook(
+    {
+      hook_event_name: "Stop",
+      session_id: sessionId,
+      cwd: pluginRoot,
+      transcript_path: transcriptPath,
+    },
+    "Stop",
+  );
+  assert.deepEqual(output, {});
+  assert.equal(existsSync(sessionMarkerPath(storageRoot, sessionId)), false);
 });
 
 test("PreToolUse denies a plan write without a session identifier", () => {
@@ -941,9 +1705,9 @@ test("resumeWhen must match the schema type whenever present", () => {
   assert.match(errors.join("\n"), /resumeWhen must be a non-empty string/);
 });
 
-test("deep multi-replace payloads still find the plan target", () => {
+test("maximum-size multi-replace payloads still find the plan target", () => {
   const cwd = workspace();
-  const replacements = Array.from({ length: 1_100 }, (_, index) => ({
+  const replacements = Array.from({ length: MAX_TOOL_TARGETS }, (_, index) => ({
     filePath: index === 0 ? planPath(cwd) : path.join(cwd, `other-${index}.txt`),
   }));
   const sessionId = "deep-writer-session";
@@ -1018,4 +1782,44 @@ test("agent file edits cannot modify human-managed role authority", () => {
   );
   assert.equal(ownerDenied.permissionDecision, "deny");
   assert.match(ownerDenied.permissionDecisionReason, /human-managed/);
+});
+
+test("over-limit target sets are denied before protected-path inspection", () => {
+  const cwd = workspace();
+  const replacements = Array.from({ length: MAX_TOOL_TARGETS + 1 }, (_, index) => ({
+    filePath: path.join(cwd, `target-${index}.txt`),
+  }));
+  const denied = handleHook(
+    {
+      hook_event_name: "PreToolUse",
+      session_id: "over-limit-session",
+      cwd,
+      tool_name: "multi_replace_string_in_file",
+      tool_input: { replacements },
+    },
+    "PreToolUse",
+  );
+  assert.equal(denied.permissionDecision, "deny");
+  assert.equal(existsSync(path.join(cwd, ".supervised-worker")), false);
+});
+
+test("duplicate targets consume one target-budget slot", () => {
+  const cwd = workspace();
+  const repeatedTarget = path.join(cwd, "ordinary.txt");
+  const replacements = Array.from({ length: 4_000 }, () => ({
+    filePath: repeatedTarget,
+  }));
+  assert.deepEqual(
+    handleHook(
+      {
+        hook_event_name: "PreToolUse",
+        session_id: "duplicate-target-session",
+        cwd,
+        tool_name: "multi_replace_string_in_file",
+        tool_input: { replacements },
+      },
+      "PreToolUse",
+    ),
+    {},
+  );
 });

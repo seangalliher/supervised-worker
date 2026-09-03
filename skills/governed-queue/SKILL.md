@@ -10,7 +10,8 @@ or work expected to span several implementation slices.
 
 ## Durable Plan
 
-Create `.supervised-worker/plan.json` using this minimum shape:
+Create `.supervised-worker/plan.json` through a fully qualified file target using
+this minimum shape:
 
 ```json
 {
@@ -39,10 +40,13 @@ Exactly one item should normally be `in_progress`. Never turn a failed queue
 enumeration into an empty `items` array.
 
 Create or update `plan.json` through a file-editing tool. The pre-tool hook
-claims the writing session by its hashed session identifier before the write;
-the post-tool hook verifies the attachment and records completion metadata.
-Other Copilot sessions in the same repository remain inert and do not log tools
-or receive Stop decisions.
+creates a provisional, generation-bound claim for the hashed writing session;
+the successful post-tool hook promotes it and records completion metadata. A
+failed first write that leaves no materialized plan, or Stop without one,
+releases the provisional claim. Other Copilot sessions in the same repository
+remain inert and do not log tools or receive Stop decisions.
+If route or attachment cleanup fails, the hook reports that failure and the
+claim remains recoverable; do not treat that output as a release receipt.
 
 Store runtime state under `.supervised-worker/`. Keep that directory out of Git
 unless the user deliberately chooses to publish sanitized evaluation fixtures.

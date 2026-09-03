@@ -70,8 +70,28 @@
       "properties": {
         "required": { "const": true },
         "independent": { "const": true },
-        "agent": { "$ref": "#/$defs/agentSelector" }
-      }
+        "agent": { "$ref": "#/$defs/agentSelector" },
+        "requiredModel": { "$ref": "#/$defs/modelId" },
+        "requiredModelFamily": { "$ref": "#/$defs/modelFamily" },
+        "requireDifferentModelFamily": { "type": "boolean" }
+      },
+      "dependentRequired": {
+        "requiredModel": ["requiredModelFamily"],
+        "requiredModelFamily": ["requiredModel"]
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "requireDifferentModelFamily": { "const": true }
+            },
+            "required": ["requireDifferentModelFamily"]
+          },
+          "then": {
+            "required": ["requiredModel", "requiredModelFamily"]
+          }
+        }
+      ]
     },
     "filing": {
       "type": "object",
@@ -88,13 +108,40 @@
       "minLength": 1,
       "pattern": "\\S"
     },
-    "agentSelector": {
+    "modelId": {
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
-      "pattern": "^(?!.*(?:--|\\.\\.))[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$",
+      "pattern": "^[a-z0-9](?:[a-z0-9._:/-]{0,126}[a-z0-9])?$"
+    },
+    "modelFamily": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$"
+    },
+    "agentSelector": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^(?!.*(?:--|\\.\\.))[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$"
+        },
+        {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 193,
+          "pattern": "^(?!.*(?:--|\\.\\.))[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?:[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$"
+        }
+      ],
       "not": {
-        "enum": ["supervised-worker", "seangalliher-supervised-worker"]
+        "enum": [
+          "supervised-worker",
+          "seangalliher-supervised-worker",
+          "supervised-worker:supervised-worker",
+          "supervised-worker:seangalliher-supervised-worker"
+        ]
       }
     }
   }

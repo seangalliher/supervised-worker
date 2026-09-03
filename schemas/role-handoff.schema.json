@@ -14,10 +14,20 @@
       "pattern": "\\S"
     },
     "agentSelector": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 128,
-      "pattern": "^(?!.*(?:--|\\.\\.))[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$"
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^(?!.*(?:--|\\.\\.))[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$"
+        },
+        {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 193,
+          "pattern": "^(?!.*(?:--|\\.\\.))[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?:[a-z0-9](?:[a-z0-9.-]{0,126}[a-z0-9])?$"
+        }
+      ]
     },
     "sha256": {
       "type": "string",
@@ -45,6 +55,48 @@
         "kind": { "$ref": "#/$defs/nonBlank" },
         "locator": { "$ref": "#/$defs/nonBlank" },
         "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "hostModelEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "locator", "sha256"],
+      "properties": {
+        "kind": { "const": "host-model" },
+        "locator": {
+          "type": "string",
+          "pattern": "^\\.supervised-worker/runtime/model-receipts/[0-9a-f]{64}/(?:builder|reviewer)\\.json$"
+        },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "modelIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "family", "evidence"],
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9](?:[a-z0-9._:/-]{0,126}[a-z0-9])?$"
+        },
+        "family": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$"
+        },
+        "evidence": { "$ref": "#/$defs/hostModelEvidence" }
+      }
+    },
+    "modelResolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["builder", "reviewer"],
+      "properties": {
+        "builder": { "$ref": "#/$defs/modelIdentity" },
+        "reviewer": { "$ref": "#/$defs/modelIdentity" }
       }
     },
     "premise": {
@@ -404,6 +456,10 @@
             { "type": "null" }
           ]
         },
+        "reviewAttemptId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
         "createdAt": { "$ref": "#/$defs/canonicalDateTime" },
         "contractHash": { "$ref": "#/$defs/sha256" },
         "buildReportHash": { "$ref": "#/$defs/sha256" },
@@ -418,6 +474,7 @@
         "modelSeparation": {
           "enum": ["different-family", "same-family", "unknown"]
         },
+        "modelResolution": { "$ref": "#/$defs/modelResolution" },
         "verdict": { "enum": ["clean", "changes-required"] },
         "findings": {
           "type": "array",
@@ -442,7 +499,7 @@
             "properties": { "schemaVersion": { "const": 2 } },
             "required": ["schemaVersion"]
           },
-          "then": { "required": ["workflowHash"] }
+          "then": { "required": ["workflowHash", "reviewAttemptId"] }
         },
         {
           "if": {
