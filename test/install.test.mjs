@@ -19,6 +19,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { ALL_TOOL_MATCHER, sha256 } from "../src/core.mjs";
 import {
   buildInstalledHookManifest,
   defaultInstallBase,
@@ -129,6 +130,7 @@ test("installed Unix launchers use absolute trusted paths without cwd fallback",
     platform: "linux",
     environment: {},
   });
+  assert.equal(manifest.hooks.PreToolUse[0].matcher, ALL_TOOL_MATCHER);
   for (const [eventName, [entry]] of Object.entries(manifest.hooks)) {
     assert.equal(entry.timeoutSec, 5, eventName);
     assert.match(entry.bash, /^unset NODE_OPTIONS COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN;/);
@@ -136,6 +138,42 @@ test("installed Unix launchers use absolute trusted paths without cwd fallback",
     assert.match(entry.bash, /'\/home\/example\/\.local\/share\/supervised-worker\/plugins\/release\/src\/hook-launcher\.mjs'/);
     assert.ok(entry.bash.endsWith(`'${eventName}'`));
     assert.doesNotMatch(entry.bash, /PLUGIN_ROOT|\$PWD/);
+  }
+});
+
+test("isolated installed dispatch durably observes an owned non-writer", () => {
+  const installBase = temporaryDirectory("supervised-worker-observation-install-");
+  const cwd = temporaryDirectory("supervised-worker-observation-repository-");
+  try {
+    const installed = installLocalPlugin(root, { baseDirectory: installBase });
+    const manifest = JSON.parse(readFileSync(path.join(installed.installRoot, "hooks.json")));
+    assert.equal(manifest.hooks.PreToolUse[0].matcher, ALL_TOOL_MATCHER);
+    assert.deepEqual(readFileSync(path.join(installed.installRoot, "hooks.json")), readFileSync(path.join(installed.installRoot, "com.github.copilot", "hooks", "hooks.json")));
+    const state = path.join(cwd, ".supervised-worker");
+    mkdirSync(state);
+    const planFile = path.join(state, "plan.json");
+    writeFileSync(planFile, JSON.stringify({ schemaVersion: 1, mode: "active", goal: "Fixture", items: [{ id: "one", title: "One", status: "pending" }], completion: null }));
+    const invoke = (event, input) => {
+      const command = manifest.hooks[event][0][process.platform === "win32" ? "powershell" : "bash"];
+      const execution = spawnProcessTreeSync(process.platform === "win32" ? process.env.ComSpec : "bash",
+        process.platform === "win32" ? ["/d", "/s", "/c", command] : ["-lc", command],
+        { cwd, input: JSON.stringify({ cwd, session_id: "installed-observer", ...input }), timeout: 25_000 });
+      assert.equal(execution.error, undefined, execution.error?.message);
+      assert.equal(execution.status, 0, execution.stderr);
+      assert.ok(execution.elapsedMs < manifest.hooks[event][0].timeoutSec * 1_000);
+      return JSON.parse(execution.stdout);
+    };
+    assert.deepEqual(invoke("PostToolUse", { tool_name: "Write", tool_input: { file_path: planFile } }), {});
+    assert.equal(JSON.parse(readFileSync(path.join(state, "attachment.json"))).status, "active");
+    assert.deepEqual(invoke("PreToolUse", { tool_name: "Read", tool_use_id: "installed-hint", tool_input: { file_path: "PRIVATE_CONTENT" } }), {});
+    const ledger = readFileSync(path.join(state, "runs", `${sha256("installed-observer")}.jsonl`), "utf8");
+    const records = ledger.trim().split("\n").map(JSON.parse);
+    assert.equal(records.filter((record) => record.event === "tool_started").length, 1);
+    assert.equal(records.at(-1).toolName, "Read");
+    assert.doesNotMatch(ledger, /PRIVATE_CONTENT|installed-hint/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(installBase, { recursive: true, force: true });
   }
 });
 

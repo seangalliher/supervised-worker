@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
+import { canonicalPlanHash, checkpointSession, handleHook, MAX_CHECKPOINT_BYTES, sha256, validateCheckpoint } from "../src/core.mjs";
 import {
   validatePluginManifest,
   validateSkillDocument,
@@ -14,7 +17,7 @@ import {
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function fixture() {
-  const target = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-standards-"));
+  const target = realpathSync(mkdtempSync(path.join(os.tmpdir(), "supervised-worker-standards-")));
   for (const relativePath of ["agents", "com.github.copilot", "examples", "schemas", "skills"]) {
     cpSync(path.join(root, relativePath), path.join(target, relativePath), { recursive: true });
   }
@@ -32,6 +35,64 @@ function mutateJson(rootPath, relativePath, mutate) {
 
 test("published plugin, skill, schemas, examples, and safety gates conform", () => {
   assert.deepEqual(validateStandards(root), []);
+});
+
+test("checkpoint runtime and published schema accept producer artifacts and reject untyped fields", () => {
+  const cwd = realpathSync(mkdtempSync(path.join(os.tmpdir(), "supervised-worker-checkpoint-schema-")));
+  try {
+    const state = path.join(cwd, ".supervised-worker");
+    mkdirSync(state);
+    const planFile = path.join(state, "plan.json");
+    const plan = { schemaVersion: 1, mode: "active", goal: "Fixture", items: [{ id: "one", title: "One", status: "pending" }], completion: null };
+    writeFileSync(planFile, JSON.stringify(plan));
+    assert.deepEqual(handleHook({ cwd, session_id: "schema-source", tool_name: "Write", tool_input: { file_path: planFile } }, "PostToolUse"), {});
+    const checkpoint = checkpointSession(cwd, { session_id: "schema-source", planHash: canonicalPlanHash(plan), attachmentHash: sha256(readFileSync(path.join(state, "attachment.json"))) });
+    const artifact = JSON.parse(readFileSync(path.join(state, "checkpoints", `${checkpoint.checkpointHash}.json`)));
+    const ajv = new Ajv2020({ allErrors: true, strictTypes: false, strictRequired: false });
+    addFormats(ajv);
+    const schema = ajv.compile(JSON.parse(readFileSync(path.join(root, "schemas", "checkpoint.schema.json"))));
+    assert.equal(schema(artifact), true, JSON.stringify(schema.errors));
+    assert.deepEqual(validateCheckpoint(artifact), []);
+    for (const mutate of [
+      (value) => { value.raw = "PRIVATE_CONTENT"; },
+      (value) => { value.context.continuation = "PRIVATE_CONTENT"; },
+      (value) => { value.sessionHash = [value.sessionHash]; },
+      (value) => { value.claimGeneration = [value.claimGeneration]; },
+      (value) => { value.checkpointId = [value.checkpointId]; },
+      (value) => { value.createdAt = "2026-02-30T00:00:00.000Z"; },
+      (value) => { value.ledgerPosition.path = "../outside.jsonl"; },
+      (value) => { value.ledgerPosition.byteOffset = -1; },
+      (value) => { value.context.counts.pending = "1"; },
+      (value) => { value.context.itemHashes.push(value.context.itemHashes[0]); },
+      (value) => { value.context.stopState = { raw: "PRIVATE_CONTENT" }; },
+      (value) => { value.context.operations.status = "unavailable"; },
+    ]) {
+      const invalid = structuredClone(artifact);
+      mutate(invalid);
+      assert.equal(schema(invalid), false, JSON.stringify(invalid));
+      assert.ok(validateCheckpoint(invalid).length > 0);
+      assert.doesNotMatch(validateCheckpoint(invalid).join("\n"), /PRIVATE_CONTENT/);
+    }
+    const oversized = { ...artifact, padding: "x".repeat(MAX_CHECKPOINT_BYTES) };
+    assert.match(validateCheckpoint(oversized).join("\n"), /size limit/);
+    for (const value of [null, [], {}, undefined]) assert.ok(validateCheckpoint(value).length > 0);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("standards registration detects a missing or weakened checkpoint schema", () => {
+  const target = fixture();
+  try {
+    mutateJson(target, "schemas/checkpoint.schema.json", (schema) => {
+      schema.properties.context.additionalProperties = true;
+    });
+    assert.match(validateStandards(target).join("\n"), /checkpoint schema accepted unsafe state/);
+    rmSync(path.join(target, "schemas", "checkpoint.schema.json"));
+    assert.match(validateStandards(target).join("\n"), /expected exactly these published schemas/);
+  } finally {
+    rmSync(target, { recursive: true, force: true });
+  }
 });
 
 test("plugin validation rejects undeclared manifest fields", () => {

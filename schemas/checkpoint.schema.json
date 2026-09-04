@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervised-worker.dev/schemas/checkpoint.schema.json",
+  "title": "Immutable Local Session Checkpoint",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "checkpointId", "createdAt", "planHash", "sessionHash", "routeGeneration", "claimGeneration", "attachmentHash", "ledgerPosition", "context"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "session-checkpoint" },
+    "checkpointId": { "$ref": "#/definitions/uuid" },
+    "createdAt": { "type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "planHash": { "$ref": "#/definitions/hash" },
+    "sessionHash": { "$ref": "#/definitions/hash" },
+    "routeGeneration": { "$ref": "#/definitions/generation" },
+    "claimGeneration": { "$ref": "#/definitions/generation" },
+    "attachmentHash": { "$ref": "#/definitions/hash" },
+    "ledgerPosition": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "byteOffset", "recordCount", "prefixHash"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^runs/[0-9a-f]{64}\\.jsonl$" },
+        "byteOffset": { "type": "integer", "minimum": 0, "maximum": 1048576 },
+        "recordCount": { "type": "integer", "minimum": 0, "maximum": 1048576 },
+        "prefixHash": { "$ref": "#/definitions/hash" }
+      }
+    },
+    "context": {
+      "type": "object", "additionalProperties": false,
+      "required": ["counts", "itemHashes", "stopState", "operations"],
+      "properties": {
+        "counts": {
+          "type": "object", "additionalProperties": false,
+          "required": ["pending", "in_progress", "banked", "parked"],
+          "properties": {
+            "pending": { "type": "integer", "minimum": 0, "maximum": 4096 },
+            "in_progress": { "type": "integer", "minimum": 0, "maximum": 4096 },
+            "banked": { "type": "integer", "minimum": 0, "maximum": 4096 },
+            "parked": { "type": "integer", "minimum": 0, "maximum": 4096 }
+          }
+        },
+        "itemHashes": { "type": "array", "maxItems": 4096, "uniqueItems": true, "items": { "$ref": "#/definitions/hash" } },
+        "stopState": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["schemaVersion", "progressHash", "sameProgressBlocks", "totalBlocks"],
+              "properties": {
+                "schemaVersion": { "enum": [1, 2] },
+                "progressHash": { "$ref": "#/definitions/hash" },
+                "sameProgressBlocks": { "$ref": "#/definitions/counter" },
+                "totalBlocks": { "$ref": "#/definitions/counter" }
+              }
+            }
+          ]
+        },
+        "operations": {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "reason", "orphans", "uncorrelatedCompletions"],
+          "properties": {
+            "status": { "enum": ["observed", "unavailable"] },
+            "reason": { "enum": [null, "ledger-absent", "ledger-invalid", "inherited-observation-unavailable"] },
+            "orphans": { "anyOf": [{ "type": "null" }, { "type": "array", "maxItems": 256, "uniqueItems": true, "items": { "$ref": "#/definitions/orphan" } }] },
+            "uncorrelatedCompletions": { "anyOf": [{ "type": "null" }, { "$ref": "#/definitions/counter" }] }
+          },
+          "allOf": [{
+            "if": { "properties": { "status": { "const": "observed" } } },
+            "then": { "properties": { "reason": { "type": "null" }, "orphans": { "type": "array" }, "uncorrelatedCompletions": { "$ref": "#/definitions/counter" } } },
+            "else": { "properties": { "reason": { "type": "string" }, "orphans": { "type": "null" }, "uncorrelatedCompletions": { "type": "null" } } }
+          }]
+        }
+      }
+    }
+  },
+  "definitions": {
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "generation": { "anyOf": [{ "type": "null" }, { "$ref": "#/definitions/uuid" }] },
+    "counter": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "orphan": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operationId", "sessionHash", "routeGeneration", "claimGeneration", "invocationHash", "toolName", "observationStatus"],
+      "properties": {
+        "operationId": { "$ref": "#/definitions/uuid" },
+        "sessionHash": { "$ref": "#/definitions/hash" },
+        "routeGeneration": { "$ref": "#/definitions/generation" },
+        "claimGeneration": { "$ref": "#/definitions/generation" },
+        "invocationHash": { "anyOf": [{ "type": "null" }, { "$ref": "#/definitions/hash" }] },
+        "toolName": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.:/-]{0,127}$" },
+        "observationStatus": { "const": "outcome-unknown" }
+      }
+    }
+  }
+}

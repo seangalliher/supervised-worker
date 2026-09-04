@@ -165,6 +165,8 @@
       "properties": {
         "event": {
           "enum": [
+            "checkpoint_persisted",
+            "checkpoint_resumed",
             "completion_unverified_release",
             "completion_verified",
             "ownership_cleanup_failed",
@@ -172,7 +174,8 @@
             "pre_compact",
             "provisional_claim_released",
             "stop_blocked",
-            "tool_completed"
+            "tool_completed",
+            "tool_started"
           ]
         },
         "count": { "type": "integer", "minimum": 1 }

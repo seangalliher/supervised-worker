@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   existsSync,
   linkSync,
+  lstatSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -22,11 +23,17 @@ import { Worker } from "node:worker_threads";
 
 import {
   canonicalPlanHash,
+  checkpointSession,
   handleHook,
+  MAX_CHECKPOINT_BYTES,
   MAX_TOOL_TARGETS,
   planPath,
+  releaseAttachment,
+  resumeSession,
   sha256,
+  summarizePlan,
   summarizeRunLedger,
+  validateCheckpoint,
   validatePlan,
 } from "../src/core.mjs";
 
@@ -34,7 +41,7 @@ const temporaryWorkspaces = new Set();
 const coreUrl = new URL("../src/core.mjs", import.meta.url).href;
 
 function workspace() {
-  const cwd = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-test-"));
+  const cwd = realpathSync(mkdtempSync(path.join(os.tmpdir(), "supervised-worker-test-")));
   temporaryWorkspaces.add(cwd);
   return cwd;
 }
@@ -108,6 +115,40 @@ function attachPlan(cwd, sessionId = "11111111-1111-4111-8111-111111111111") {
   );
 }
 
+function checkpointFixture(routed = false, cwd = workspace()) {
+  const sessionId = `checkpoint-source-${routed}`;
+  const storageRoot = routed ? workspace() : null;
+  const source = {
+    cwd, session_id: sessionId,
+    ...(routed ? { transcript_path: vscodeTranscriptPath(storageRoot, sessionId) } : {}),
+    tool_name: "Write", tool_use_id: "setup-plan", tool_input: { file_path: planPath(cwd) },
+  };
+  assert.deepEqual(handleHook(source, "PreToolUse"), {});
+  const plan = writePlan(cwd, {
+    goal: "PRIVATE_CHECKPOINT_GOAL",
+    items: [
+      { id: "private-item-one", title: "PRIVATE_TITLE_ONE", status: "in_progress" },
+      { id: "private-item-two", title: "PRIVATE_TITLE_TWO", status: "pending" },
+    ],
+  });
+  assert.deepEqual(handleHook(source, "PostToolUse"), {});
+  const attachmentFile = path.join(cwd, ".supervised-worker", "attachment.json");
+  const attachmentBytes = readFileSync(attachmentFile);
+  const attachment = JSON.parse(attachmentBytes);
+  assert.equal(attachment.status, "active");
+  assert.equal(attachment.sessionHash, sha256(sessionId));
+  const request = {
+    session_id: sessionId,
+    ...(routed ? { transcript_path: source.transcript_path } : {}),
+    planHash: canonicalPlanHash(plan), attachmentHash: sha256(attachmentBytes),
+  };
+  const ledgerFile = path.join(cwd, ".supervised-worker", "runs", `${sha256(sessionId)}.jsonl`);
+  const records = readFileSync(ledgerFile, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(records.filter((record) => record.event === "tool_started").length, 1);
+  assert.equal(records.at(-1).operationId, records[0].operationId);
+  return { cwd, plan, source, storageRoot, request, attachment, attachmentFile, attachmentBytes, ledgerFile };
+}
+
 function writerPayloadCases() {
   return [
     ["create", (target) => ({ path: target })],
@@ -179,6 +220,192 @@ test("PreToolUse claims the first plan writer before the file exists", () => {
   );
   assert.equal(stop.decision, "block");
   assert.equal(stop.hookSpecificOutput.decision, "block");
+});
+
+test("an allowed ordinary Write durably starts before its side effect or terminal hook", () => {
+  const cwd = workspace();
+  const sessionId = "durable-start-owner";
+  writePlan(cwd);
+  attachPlan(cwd, sessionId);
+  const attachment = JSON.parse(readFileSync(path.join(cwd, ".supervised-worker", "attachment.json")));
+  assert.equal(attachment.status, "active");
+  assert.equal(attachment.sessionHash, sha256(sessionId));
+  const ledgerPath = path.join(cwd, ".supervised-worker", "runs", `${sha256(sessionId)}.jsonl`);
+  const before = readFileSync(ledgerPath, "utf8").trim().split("\n").map(JSON.parse);
+  assert.ok(before.some((record) => record.event === "tool_completed"));
+  assert.equal(before.filter((record) => record.event === "tool_started").length, 0);
+  const target = path.join(cwd, "ordinary.txt");
+  const input = { cwd, session_id: sessionId, tool_name: "Write", tool_use_id: "host-invocation", tool_input: { file_path: target, content: "private-content-sentinel" } };
+  assert.deepEqual(handleHook(input, "PreToolUse"), {});
+  assert.equal(existsSync(target), false);
+  const bytes = readFileSync(ledgerPath, "utf8");
+  const starts = bytes.trim().split("\n").map(JSON.parse).filter((record) => record.event === "tool_started");
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].claimGeneration, attachment.claimGeneration);
+  assert.equal(starts[0].invocationHash, sha256("supervised-worker-tool-invocation-v1\0host-invocation"));
+  assert.match(starts[0].operationId, /^[0-9a-f-]{36}$/);
+  assert.equal(bytes.includes("private-content-sentinel"), false);
+  assert.equal(bytes.includes("host-invocation"), false);
+  assert.equal(summarizeRunLedger(cwd).status, "available");
+});
+
+test("terminal correlation is exact, duplicate-idempotent, and conservative for absent or reused IDs", () => {
+  const cwd = workspace();
+  const sessionId = "correlation-owner";
+  writePlan(cwd);
+  attachPlan(cwd, sessionId);
+  const input = { cwd, session_id: sessionId, tool_name: "Read", toolUseId: "exact-host-id", tool_input: { path: "ignored" } };
+  const ledgerPath = path.join(cwd, ".supervised-worker", "runs", `${sha256(sessionId)}.jsonl`);
+  assert.deepEqual(handleHook(input, "PreToolUse"), {});
+  assert.deepEqual(handleHook(input, "PostToolUse"), {});
+  const firstBytes = readFileSync(ledgerPath);
+  assert.deepEqual(handleHook(input, "PostToolUse"), {});
+  assert.deepEqual(readFileSync(ledgerPath), firstBytes);
+  const first = firstBytes.toString().trim().split("\n").map(JSON.parse);
+  assert.equal(first.at(-1).operationId, first.find((record) => record.event === "tool_started").operationId);
+  assert.deepEqual(handleHook(input, "PreToolUse"), {});
+  assert.deepEqual(handleHook(input, "PostToolUseFailure"), {});
+  assert.equal(JSON.parse(readFileSync(ledgerPath, "utf8").trim().split("\n").at(-1)).operationId, null);
+  const idless = { ...input, toolUseId: undefined };
+  assert.deepEqual(handleHook(idless, "PreToolUse"), {});
+  assert.deepEqual(handleHook(idless, "PostToolUse"), {});
+  assert.equal(JSON.parse(readFileSync(ledgerPath, "utf8").trim().split("\n").at(-1)).operationId, null);
+  assert.equal(summarizeRunLedger(cwd).status, "available");
+  const unrelated = workspace();
+  assert.deepEqual(handleHook({ ...input, cwd: unrelated, session_id: "unrelated", tool_input: { path: planPath(cwd) } }, "PreToolUse"), {});
+  assert.equal(existsSync(path.join(unrelated, ".supervised-worker")), false);
+});
+
+for (const routed of [false, true]) {
+  test(`v3 claims preserve identity through promotion and renew it after release (routed=${routed})`, () => {
+    const cwd = workspace();
+    const sessionId = `claim-generation-${routed}`;
+    const storageRoot = routed ? workspace() : null;
+    const input = {
+      cwd,
+      session_id: sessionId,
+      ...(routed ? { transcript_path: vscodeTranscriptPath(storageRoot, sessionId) } : {}),
+      tool_name: "Write",
+      tool_input: { file_path: planPath(cwd) },
+    };
+    const attachmentPath = path.join(cwd, ".supervised-worker", "attachment.json");
+    assert.deepEqual(handleHook(input, "PreToolUse"), {});
+    const provisional = JSON.parse(readFileSync(attachmentPath, "utf8"));
+    assert.equal(provisional.schemaVersion, 3);
+    assert.equal(provisional.status, "provisional");
+    assert.match(provisional.claimGeneration, /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+    assert.equal(provisional.checkpointHash, null);
+    assert.equal(provisional.routeGeneration === null, !routed);
+
+    writePlan(cwd);
+    const planBytes = readFileSync(planPath(cwd));
+    assert.deepEqual(handleHook(input, "PostToolUse"), {});
+    const active = JSON.parse(readFileSync(attachmentPath, "utf8"));
+    assert.equal(active.status, "active");
+    assert.equal(active.claimGeneration, provisional.claimGeneration);
+    assert.equal(active.routeGeneration, provisional.routeGeneration);
+    assert.equal(releaseAttachment(realpathSync(cwd)).released, true);
+    assert.deepEqual(handleHook(input, "PreToolUse"), {});
+    const successor = JSON.parse(readFileSync(attachmentPath, "utf8"));
+    assert.notEqual(successor.claimGeneration, active.claimGeneration);
+    if (routed) assert.notEqual(successor.routeGeneration, active.routeGeneration);
+    assert.deepEqual(readFileSync(planPath(cwd)), planBytes);
+    assert.equal(handleHook({ ...input, stop_hook_active: false }, "Stop").decision, "block");
+    assert.equal(JSON.parse(readFileSync(planPath(cwd), "utf8")).completion, null);
+  });
+}
+
+for (const schemaVersion of [1, 2]) {
+  test(`legacy v${schemaVersion} ownership remains readable without migration on SessionStart`, () => {
+    const cwd = workspace();
+    const sessionId = `legacy-owner-${schemaVersion}`;
+    writePlan(cwd);
+    const attachmentPath = path.join(cwd, ".supervised-worker", "attachment.json");
+    const attachment = {
+      schemaVersion,
+      sessionHash: sha256(sessionId),
+      attachedAt: "2026-09-04T00:00:00Z",
+      ...(schemaVersion === 2 ? {
+        status: "active",
+        routeGeneration: null,
+        updatedAt: "2026-09-04T00:00:00Z",
+      } : {}),
+    };
+    const bytes = `${JSON.stringify(attachment)}\n`;
+    writeFileSync(attachmentPath, bytes);
+    const output = handleHook({ cwd, session_id: sessionId }, "SessionStart");
+    assert.match(output.additionalContext, /"pending":1/);
+    assert.equal(readFileSync(attachmentPath, "utf8"), bytes);
+  });
+}
+
+test("a v3 checkpoint tombstone is neither ownership nor an ordinary plan-write claim", () => {
+  const cwd = workspace();
+  const sessionId = "checkpoint-source";
+  writePlan(cwd);
+  attachPlan(cwd, sessionId);
+  const attachmentPath = path.join(cwd, ".supervised-worker", "attachment.json");
+  const active = JSON.parse(readFileSync(attachmentPath, "utf8"));
+  assert.equal(active.status, "active");
+  const tombstone = { ...active, status: "checkpointed", checkpointHash: sha256("receipt") };
+  const bytes = `${JSON.stringify(tombstone)}\n`;
+  writeFileSync(attachmentPath, bytes);
+  const planBytes = readFileSync(planPath(cwd));
+  const ledgerBefore = summarizeRunLedger(cwd);
+
+  for (const owner of [sessionId, "unrelated-fresh-session"]) {
+    const input = { cwd, session_id: owner, tool_name: "Write" };
+    assert.deepEqual(handleHook(input, "SessionStart"), {});
+    assert.deepEqual(handleHook(input, "Stop"), {});
+    const protectedEdit = handleHook({
+      ...input,
+      tool_input: { file_path: attachmentPath },
+    }, "PreToolUse");
+    assert.equal(protectedEdit.permissionDecision, "deny");
+    const planEdit = handleHook({
+      ...input,
+      tool_input: { file_path: planPath(cwd) },
+    }, "PreToolUse");
+    assert.equal(planEdit.permissionDecision, "deny");
+    assert.match(planEdit.permissionDecisionReason, /checkpointed/);
+    const post = handleHook({
+      ...input,
+      tool_input: { file_path: planPath(cwd) },
+    }, "PostToolUse");
+    assert.ok(post.additionalContext);
+  }
+  assert.equal(readFileSync(attachmentPath, "utf8"), bytes);
+  assert.deepEqual(readFileSync(planPath(cwd)), planBytes);
+  assert.deepEqual(summarizeRunLedger(cwd), ledgerBefore);
+});
+
+test("invalid v3 claim and checkpoint bindings are denied without replacing attachment bytes", () => {
+  const cwd = workspace();
+  const sessionId = "invalid-v3-owner";
+  writePlan(cwd);
+  attachPlan(cwd, sessionId);
+  const attachmentPath = path.join(cwd, ".supervised-worker", "attachment.json");
+  const active = JSON.parse(readFileSync(attachmentPath, "utf8"));
+  assert.equal(active.schemaVersion, 3);
+  const variants = [
+    { ...active, claimGeneration: null },
+    { ...active, claimGeneration: "not-a-generation" },
+    { ...active, checkpointHash: "not-a-hash" },
+    { ...active, status: "checkpointed", checkpointHash: null },
+    { ...active, unexpected: true },
+  ];
+  for (const value of variants) {
+    const bytes = `${JSON.stringify(value)}\n`;
+    writeFileSync(attachmentPath, bytes);
+    const output = handleHook({
+      cwd,
+      session_id: sessionId,
+      tool_name: "Write",
+      tool_input: { file_path: planPath(cwd) },
+    }, "PreToolUse");
+    assert.equal(output.permissionDecision, "deny");
+    assert.equal(readFileSync(attachmentPath, "utf8"), bytes);
+  }
 });
 
 test("PreToolUse accepts a host cwd alias of the canonical target repository", () => {
@@ -596,48 +823,47 @@ test("two PostToolUse contenders serialize after one brief owner", async () => {
   );
 });
 
-test("a contended Stop cannot release active ownership without the session lock", () => {
-  const pluginRoot = workspace();
-  const repositoryRoot = workspace();
-  const storageRoot = workspace();
-  const sessionId = "contended-stop-session";
-  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
-  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
-  const tool = {
-    tool_name: "Write",
-    tool_input: { file_path: planPath(repositoryRoot) },
-  };
-  handleHook({ ...common, ...tool, hook_event_name: "PreToolUse" }, "PreToolUse");
-  writePlan(repositoryRoot);
-  handleHook({ ...common, ...tool, hook_event_name: "PostToolUse" }, "PostToolUse");
-  const routePath = sessionRoutePath(storageRoot, sessionId);
-  const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
-  const routeBefore = readFileSync(routePath, "utf8");
-  const attachmentBefore = readFileSync(attachmentPath, "utf8");
-  const lockDirectory = path.join(
-    storageRoot,
-    "supervised-worker",
-    "session-locks",
-    sha256(sessionId),
-  );
-  mkdirSync(lockDirectory, { recursive: true });
-  writeFileSync(
-    path.join(lockDirectory, "owner.json"),
-    `${JSON.stringify({
-      schemaVersion: 1,
-      token: "external-owner",
-      processId: process.pid,
-      acquiredAt: new Date().toISOString(),
-    })}\n`,
-  );
+for (const lockScope of ["session", "repository"]) {
+  test(`a contended Stop cannot release active ownership without the ${lockScope} lock`, () => {
+    const pluginRoot = workspace();
+    const repositoryRoot = workspace();
+    const storageRoot = workspace();
+    const sessionId = `contended-stop-${lockScope}-session`;
+    const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+    const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+    const tool = {
+      tool_name: "Write",
+      tool_input: { file_path: planPath(repositoryRoot) },
+    };
+    handleHook({ ...common, ...tool, hook_event_name: "PreToolUse" }, "PreToolUse");
+    writePlan(repositoryRoot);
+    handleHook({ ...common, ...tool, hook_event_name: "PostToolUse" }, "PostToolUse");
+    const routePath = sessionRoutePath(storageRoot, sessionId);
+    const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
+    const routeBefore = readFileSync(routePath, "utf8");
+    const attachmentBefore = readFileSync(attachmentPath, "utf8");
+    const lockDirectory = lockScope === "session"
+      ? path.join(storageRoot, "supervised-worker", "session-locks", sha256(sessionId))
+      : path.join(repositoryRoot, ".supervised-worker", "locks", "lifecycle");
+    mkdirSync(lockDirectory, { recursive: true });
+    writeFileSync(
+      path.join(lockDirectory, "owner.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        token: "external-owner",
+        processId: process.pid,
+        acquiredAt: new Date().toISOString(),
+      })}\n`,
+    );
 
-  const output = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");
-  assert.equal(output.decision, "allow");
-  assert.match(output.systemMessage, /held the session lock beyond the bounded overlap window/);
-  assert.equal(readFileSync(routePath, "utf8"), routeBefore);
-  assert.equal(readFileSync(attachmentPath, "utf8"), attachmentBefore);
-  assert.equal(existsSync(lockDirectory), true);
-});
+    const output = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");
+    assert.equal(output.decision, "allow");
+    assert.match(output.systemMessage, new RegExp(`held the ${lockScope} lock beyond the bounded overlap window`));
+    assert.equal(readFileSync(routePath, "utf8"), routeBefore);
+    assert.equal(readFileSync(attachmentPath, "utf8"), attachmentBefore);
+    assert.equal(existsSync(lockDirectory), true);
+  });
+}
 
 test("a routed attachment cannot mutate without its transcript context and lock", () => {
   const pluginRoot = workspace();
@@ -905,7 +1131,7 @@ test("cross-directory plan claims require a regular transcript anchor", () => {
   assert.equal(existsSync(sessionRoutePath(storageRoot, sessionId)), false);
 });
 
-test("failed target-state initialization releases its route and permits reclaim", () => {
+test("failed target-state initialization publishes no claim or route and permits reclaim", () => {
   const pluginRoot = workspace();
   const repositoryRoot = workspace();
   const storageRoot = workspace();
@@ -924,16 +1150,19 @@ test("failed target-state initialization releases its route and permits reclaim"
 
   const denied = handleHook(input, "PreToolUse");
   assert.equal(denied.permissionDecision, "deny");
-  const released = JSON.parse(readFileSync(sessionRoutePath(storageRoot, sessionId), "utf8"));
-  assert.equal(released.status, "released");
+  assert.equal(existsSync(sessionRoutePath(storageRoot, sessionId)), false);
+  assert.equal(existsSync(path.join(statePath, "attachment.json")), false);
   assert.equal(readFileSync(statePath, "utf8"), "not a directory\n");
 
   rmSync(statePath);
   assert.deepEqual(handleHook(input, "PreToolUse"), {});
   const reclaimed = JSON.parse(readFileSync(sessionRoutePath(storageRoot, sessionId), "utf8"));
   assert.equal(reclaimed.status, "provisional");
-  assert.notEqual(reclaimed.generation, released.generation);
-  assert.equal(existsSync(path.join(statePath, "attachment.json")), true);
+  assert.equal(reclaimed.sessionHash, sha256(sessionId));
+  const attachment = JSON.parse(readFileSync(path.join(statePath, "attachment.json"), "utf8"));
+  assert.equal(attachment.status, "provisional");
+  assert.equal(attachment.sessionHash, reclaimed.sessionHash);
+  assert.equal(attachment.routeGeneration, reclaimed.generation);
 });
 
 test("a routed plan claim migrates a matching v1 attachment", () => {
@@ -967,9 +1196,14 @@ test("a routed plan claim migrates a matching v1 attachment", () => {
     readFileSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json"), "utf8"),
   );
   assert.equal(route.status, "active");
-  assert.equal(attachment.schemaVersion, 2);
+  assert.equal(attachment.schemaVersion, 3);
   assert.equal(attachment.status, "active");
+  assert.equal(attachment.sessionHash, sha256(sessionId));
+  assert.equal(route.sessionHash, attachment.sessionHash);
   assert.equal(attachment.routeGeneration, route.generation);
+  assert.match(attachment.claimGeneration, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.notEqual(attachment.claimGeneration, route.generation);
+  assert.equal(attachment.checkpointHash, null);
   assert.equal(handleHook({ ...common, hook_event_name: "Stop" }, "Stop").decision, "block");
 });
 
@@ -1707,6 +1941,371 @@ test("complete plan audit hashes ignore object-key insertion order", () => {
     hashes.push(emittedHash);
   }
   assert.equal(hashes[0], hashes[1]);
+});
+
+for (const routed of [false, true]) {
+  test(`checkpoint and explicit fresh resume preserve incomplete work and Stop governance (routed=${routed})`, () => {
+    const fixture = checkpointFixture(routed);
+    const { cwd, source, request, attachment, attachmentFile, storageRoot } = fixture;
+    const planBytes = readFileSync(planPath(cwd));
+    const handoffFile = path.join(cwd, ".supervised-worker", "handoffs", sha256("private-item-one"), "build-report.json");
+    mkdirSync(path.dirname(handoffFile), { recursive: true });
+    writeFileSync(handoffFile, "PRIVATE_EXISTING_HANDOFF\n");
+    assert.equal(handleHook({ ...source, stop_hook_active: false }, "Stop").decision, "block");
+    const enclosingTool = { ...source, tool_name: "Bash", tool_use_id: "checkpoint-command", tool_input: { command: "PRIVATE_COMMAND" } };
+    assert.deepEqual(handleHook(enclosingTool, "PreToolUse"), {});
+    const checkpoint = checkpointSession(cwd, request);
+    assert.equal(checkpoint.status, "checkpointed");
+    const receiptFile = path.join(cwd, ".supervised-worker", "checkpoints", `${checkpoint.checkpointHash}.json`);
+    const receiptBytes = readFileSync(receiptFile);
+    const receipt = JSON.parse(receiptBytes);
+    assert.equal(sha256(receiptBytes), checkpoint.checkpointHash);
+    assert.deepEqual(validateCheckpoint(receipt), []);
+    assert.equal(receipt.attachmentHash, request.attachmentHash);
+    assert.equal(receipt.claimGeneration, attachment.claimGeneration);
+    assert.equal(receipt.context.stopState.sameProgressBlocks, 1);
+    assert.deepEqual(receipt.context.itemHashes, fixture.plan.items.map((item) => sha256(item.id)));
+    assert.equal(receipt.context.operations.orphans.length, 1);
+    assert.equal(receipt.context.operations.orphans[0].observationStatus, "outcome-unknown");
+    assert.equal(receipt.context.operations.orphans[0].toolName, "Bash");
+    assert.doesNotMatch(receiptBytes.toString(), /PRIVATE_|private-item|checkpoint-command/);
+    assert.equal(JSON.parse(readFileSync(attachmentFile)).status, "checkpointed");
+    if (routed) assert.equal(JSON.parse(readFileSync(sessionRoutePath(storageRoot, source.session_id))).status, "released");
+    assert.deepEqual(handleHook(source, "SessionStart"), {});
+    assert.deepEqual(handleHook(source, "Stop"), {});
+    assert.deepEqual(handleHook(enclosingTool, "PostToolUse"), {});
+    const nextId = `checkpoint-successor-${routed}`;
+    const next = { cwd, session_id: nextId, ...(routed ? { transcript_path: vscodeTranscriptPath(storageRoot, nextId) } : {}) };
+    const tombstoneBytes = readFileSync(attachmentFile);
+    assert.deepEqual(handleHook(next, "SessionStart"), {});
+    assert.deepEqual(readFileSync(attachmentFile), tombstoneBytes);
+    assert.equal(handleHook({ ...next, tool_name: "Write", tool_input: { file_path: planPath(cwd) } }, "PreToolUse").permissionDecision, "deny");
+    const nextRequest = { session_id: nextId, ...(routed ? { transcript_path: next.transcript_path } : {}), planHash: request.planHash, checkpointHash: checkpoint.checkpointHash };
+    const resumed = resumeSession(cwd, nextRequest);
+    assert.equal(resumed.status, "resumed");
+    assert.deepEqual(resumed.context, checkpoint.context);
+    const successorBytes = readFileSync(attachmentFile);
+    const successor = JSON.parse(successorBytes);
+    assert.equal(successor.sessionHash, sha256(nextId));
+    assert.notEqual(successor.claimGeneration, attachment.claimGeneration);
+    assert.equal(successor.checkpointHash, checkpoint.checkpointHash);
+    if (routed) assert.equal(JSON.parse(readFileSync(sessionRoutePath(storageRoot, nextId))).status, "active");
+    assert.deepEqual(resumeSession(cwd, nextRequest), resumed);
+    assert.deepEqual(readFileSync(attachmentFile), successorBytes);
+    assert.throws(() => checkpointSession(cwd, request), /does not own/);
+    assert.throws(() => resumeSession(cwd, { ...nextRequest, session_id: "another-successor", ...(routed ? { transcript_path: vscodeTranscriptPath(storageRoot, "another-successor") } : {}) }), /another session/);
+    assert.equal(handleHook(source, "PreToolUse").permissionDecision, "deny");
+    assert.deepEqual(readFileSync(attachmentFile), successorBytes);
+    assert.deepEqual(readFileSync(planPath(cwd)), planBytes);
+    assert.equal(readFileSync(handoffFile, "utf8"), "PRIVATE_EXISTING_HANDOFF\n");
+    assert.equal(summarizePlan(cwd).complete, false);
+    assert.equal(summarizePlan(cwd).counts.pending, 1);
+    assert.equal(summarizePlan(cwd).counts.in_progress, 1);
+    assert.equal(summarizePlan(cwd).operations.orphans.length, 1);
+    const startContext = handleHook(next, "SessionStart").additionalContext;
+    assert.ok(startContext.includes(checkpoint.checkpointHash));
+    assert.match(startContext, /outcome-unknown/);
+    assert.doesNotMatch(startContext, /PRIVATE_|private-item/);
+    const events = summarizeRunLedger(cwd).eventCounts;
+    assert.equal(events.find((entry) => entry.event === "checkpoint_persisted").count, 1);
+    assert.equal(events.find((entry) => entry.event === "checkpoint_resumed").count, 1);
+    assert.equal(events.some((entry) => entry.event.startsWith("completion_")), false);
+    const stop = handleHook({ ...next, stop_hook_active: true }, "Stop");
+    assert.equal(stop.decision, "block");
+    assert.match(stop.reason, /final bounded continuation/);
+    assert.deepEqual(readFileSync(planPath(cwd)), planBytes);
+    assert.equal(JSON.parse(readFileSync(planPath(cwd))).completion, null);
+  });
+}
+
+test("host invocation reuse across claim generations never resolves a late terminal by the current owner", () => {
+  const { cwd, source, attachmentFile } = checkpointFixture();
+  const tool = { ...source, tool_name: "Read", tool_use_id: "reused-across-claims", tool_input: {} };
+  assert.deepEqual(handleHook(tool, "PreToolUse"), {});
+  const oldGeneration = JSON.parse(readFileSync(attachmentFile)).claimGeneration;
+  assert.equal(releaseAttachment(cwd).released, true);
+  attachPlan(cwd, source.session_id);
+  const newGeneration = JSON.parse(readFileSync(attachmentFile)).claimGeneration;
+  assert.notEqual(newGeneration, oldGeneration);
+  assert.deepEqual(handleHook(tool, "PreToolUse"), {});
+  assert.deepEqual(handleHook(tool, "PostToolUse"), {});
+  const observations = summarizePlan(cwd).operations;
+  assert.equal(observations.status, "observed");
+  assert.equal(observations.orphans.length, 2);
+  assert.deepEqual(new Set(observations.orphans.map((operation) => operation.claimGeneration)), new Set([oldGeneration, newGeneration]));
+});
+
+test("successive checkpoints preserve unresolved source context instead of resetting observation", () => {
+  const { cwd, source, request, attachmentFile } = checkpointFixture();
+  const tool = { ...source, tool_name: "Bash", tool_use_id: "unobserved-source", tool_input: {} };
+  assert.deepEqual(handleHook(tool, "PreToolUse"), {});
+  const first = checkpointSession(cwd, request);
+  const next = { session_id: "second-checkpoint-source", planHash: request.planHash, checkpointHash: first.checkpointHash };
+  assert.equal(resumeSession(cwd, next).status, "resumed");
+  const second = checkpointSession(cwd, { session_id: next.session_id, planHash: next.planHash, attachmentHash: sha256(readFileSync(attachmentFile)) });
+  assert.equal(second.context.operations.status, "observed");
+  assert.deepEqual(second.context.operations.orphans, first.context.operations.orphans);
+  assert.notEqual(second.checkpointHash, first.checkpointHash);
+  const resumed = resumeSession(cwd, { ...next, session_id: "third-checkpoint-session", checkpointHash: second.checkpointHash });
+  assert.deepEqual(resumed.context.operations.orphans, first.context.operations.orphans);
+  assert.equal(summarizePlan(cwd).complete, false);
+});
+
+test("PreCompact only records metadata and never creates a checkpoint or detaches ownership", () => {
+  const { cwd, source, attachmentFile, attachmentBytes } = checkpointFixture();
+  assert.deepEqual(handleHook({ ...source, trigger: "manual", transcript_size: Number.MAX_SAFE_INTEGER }, "PreCompact"), {});
+  assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
+  assert.equal(existsSync(path.join(cwd, ".supervised-worker", "checkpoints")), false);
+  assert.equal(summarizeRunLedger(cwd).eventCounts.find((entry) => entry.event === "pre_compact").count, 1);
+  assert.deepEqual(handleHook({ ...source, trigger: "PRIVATE_COMPACTION_PAYLOAD" }, "PreCompact"), {});
+  const ledger = readFileSync(path.join(cwd, ".supervised-worker", "runs", `${sha256(source.session_id)}.jsonl`), "utf8");
+  assert.doesNotMatch(ledger, /PRIVATE_COMPACTION_PAYLOAD/);
+  assert.equal(JSON.parse(ledger.trim().split("\n").at(-1)).trigger, "unknown");
+});
+
+test("source partial or corrupt ledger tails block checkpoint without detachment or false empty observations", () => {
+  const { cwd, request, ledgerFile, attachmentFile, attachmentBytes } = checkpointFixture();
+  const original = readFileSync(ledgerFile);
+  for (const tail of ['{"partial":', "not-json\n", "\n"]) {
+    writeFileSync(ledgerFile, Buffer.concat([original, Buffer.from(tail)]));
+    assert.throws(() => checkpointSession(cwd, request), /source ledger/);
+    assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
+    const observations = summarizePlan(cwd).operations;
+    assert.equal(observations.status, "unavailable");
+    assert.equal(observations.orphans, null);
+  }
+});
+
+test("duplicate-key attachments and hard-linked receipts are rejected without modifying their peers", () => {
+  const { cwd, request, attachmentFile, attachmentBytes } = checkpointFixture();
+  const duplicated = attachmentBytes.toString().replace('"schemaVersion": 3', '"schemaVersion": 3, "schemaVersion": 3');
+  assert.notEqual(duplicated, attachmentBytes.toString());
+  writeFileSync(attachmentFile, duplicated);
+  assert.throws(() => checkpointSession(cwd, { ...request, attachmentHash: sha256(duplicated) }));
+  assert.equal(readFileSync(attachmentFile, "utf8"), duplicated);
+  writeFileSync(attachmentFile, attachmentBytes);
+  const checkpoint = checkpointSession(cwd, request);
+  const receipt = path.join(cwd, ".supervised-worker", "checkpoints", `${checkpoint.checkpointHash}.json`);
+  const bytes = readFileSync(receipt);
+  const peer = path.join(workspace(), "receipt-peer.json");
+  linkSync(receipt, peer);
+  assert.equal(lstatSync(receipt).nlink, 2);
+  assert.throws(() => resumeSession(cwd, { session_id: "linked-receipt-successor", planHash: request.planHash, checkpointHash: checkpoint.checkpointHash }), /receipt/);
+  assert.deepEqual(readFileSync(receipt), bytes);
+  assert.deepEqual(readFileSync(peer), bytes);
+});
+
+test("orphan reference bounds fail explicitly without truncating or detaching the active owner", () => {
+  const { cwd, request, ledgerFile, attachmentFile, attachmentBytes } = checkpointFixture();
+  const baseline = readFileSync(ledgerFile, "utf8").trim().split("\n").map(JSON.parse);
+  const start = baseline.find((record) => record.event === "tool_started");
+  assert.ok(start);
+  const orphans = Array.from({ length: 257 }, (_, index) => ({
+    ...start, toolName: "Bash", invocationHash: null,
+    operationId: `${(index + 1).toString(16).padStart(8, "0")}-0000-4000-8000-000000000000`,
+  }));
+  writeFileSync(ledgerFile, `${[...baseline, ...orphans].map((record) => JSON.stringify(record)).join("\n")}\n`);
+  assert.equal(summarizeRunLedger(cwd).status, "available");
+  assert.throws(() => checkpointSession(cwd, request), /orphan limit exceeded/);
+  assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
+  assert.equal(summarizePlan(cwd).operations.orphans, null);
+});
+
+test("unavailable ownerless observation stays unavailable with a corrupt prior session ledger", () => {
+  const { cwd, request, ledgerFile, attachmentFile } = checkpointFixture();
+  const corrupt = Buffer.concat([readFileSync(ledgerFile), Buffer.from("{PRIVATE_PARTIAL")]);
+  writeFileSync(ledgerFile, corrupt);
+  rmSync(attachmentFile);
+  const resumed = resumeSession(cwd, { session_id: "corrupt-ledger-recovery", planHash: request.planHash, checkpointHash: null });
+  assert.equal(resumed.context.operations.status, "unavailable");
+  assert.equal(resumed.context.operations.reason, "ledger-invalid");
+  assert.equal(resumed.context.operations.orphans, null);
+  assert.deepEqual(readFileSync(ledgerFile), corrupt);
+  assert.doesNotMatch(JSON.stringify(resumed), /PRIVATE_PARTIAL/);
+});
+
+test("checkpoint request failures leave the active attachment and queue bytes unchanged", () => {
+  const { cwd, request, attachmentFile, attachmentBytes } = checkpointFixture();
+  const planBytes = readFileSync(planPath(cwd));
+  for (const invalid of [
+    null, [], {}, { ...request, unexpected: "PRIVATE_REQUEST" }, { ...request, cwd: "PRIVATE_OVERRIDE" },
+    { ...request, session_id: "wrong-owner" }, { ...request, session_id: "PRIVATE_REQUEST".repeat(900) },
+    { ...request, planHash: "0".repeat(64) }, { ...request, attachmentHash: "0".repeat(64) },
+    { ...request, attachmentHash: [request.attachmentHash] }, { ...request, planHash: null },
+    { ...request, transcript_path: "PRIVATE_TRANSCRIPT" },
+  ]) {
+    assert.throws(() => checkpointSession(cwd, invalid), (error) => !error.message.includes("PRIVATE_"));
+    assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
+    assert.deepEqual(readFileSync(planPath(cwd)), planBytes);
+  }
+});
+
+for (const schemaVersion of [1, 2]) {
+  test(`legacy v${schemaVersion} checkpoint binds original bytes and restores legacy Stop migration`, () => {
+    const { cwd, source, plan, attachmentFile } = checkpointFixture();
+    const legacy = { schemaVersion, sessionHash: sha256(source.session_id), attachedAt: "2026-09-01T00:00:00Z",
+      ...(schemaVersion === 2 ? { status: "active", routeGeneration: null, updatedAt: "2026-09-01T00:00:00Z" } : {}) };
+    const bytes = Buffer.from(`${JSON.stringify(legacy)}\n`);
+    writeFileSync(attachmentFile, bytes);
+    const runtime = path.join(cwd, ".supervised-worker", "runtime", `${legacy.sessionHash}.json`);
+    mkdirSync(path.dirname(runtime), { recursive: true });
+    const stopState = { schemaVersion: 1, progressHash: sha256(JSON.stringify(plan)), sameProgressBlocks: 1, totalBlocks: 7 };
+    writeFileSync(runtime, JSON.stringify(stopState));
+    const checkpoint = checkpointSession(cwd, { session_id: source.session_id, planHash: canonicalPlanHash(plan), attachmentHash: sha256(bytes) });
+    const receipt = JSON.parse(readFileSync(path.join(cwd, ".supervised-worker", "checkpoints", `${checkpoint.checkpointHash}.json`)));
+    assert.equal(receipt.attachmentHash, sha256(bytes));
+    assert.equal(receipt.claimGeneration, null);
+    assert.equal(receipt.routeGeneration, null);
+    assert.deepEqual(receipt.context.stopState, stopState);
+    const next = { session_id: `legacy-resume-${schemaVersion}`, planHash: canonicalPlanHash(plan), checkpointHash: checkpoint.checkpointHash };
+    assert.equal(resumeSession(cwd, next).status, "resumed");
+    const output = handleHook({ cwd, session_id: next.session_id, stop_hook_active: true }, "Stop");
+    assert.equal(output.decision, "block");
+    const restored = JSON.parse(readFileSync(path.join(cwd, ".supervised-worker", "runtime", `${sha256(next.session_id)}.json`)));
+    assert.equal(restored.schemaVersion, 2);
+    assert.equal(restored.sameProgressBlocks, 2);
+    assert.equal(restored.totalBlocks, 8);
+  });
+}
+
+test("invalid Stop state blocks checkpoint without rewriting runtime counters", () => {
+  const { cwd, source, request, attachmentFile, attachmentBytes } = checkpointFixture();
+  const runtime = path.join(cwd, ".supervised-worker", "runtime", `${sha256(source.session_id)}.json`);
+  mkdirSync(path.dirname(runtime), { recursive: true });
+  for (const bytes of ["{PRIVATE_STATE", '{"schemaVersion":2,"sameProgressBlocks":"1"}', JSON.stringify({ schemaVersion: 2, progressHash: request.planHash, sameProgressBlocks: 1, totalBlocks: 1, raw: "PRIVATE_STATE" })]) {
+    writeFileSync(runtime, bytes);
+    assert.throws(() => checkpointSession(cwd, request), /Stop state/);
+    assert.equal(readFileSync(runtime, "utf8"), bytes);
+    assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
+  }
+});
+
+for (const mode of ["absent", "inactive", "complete"]) {
+  test(`checkpoint rejects a ${mode} plan without altering ownership`, () => {
+    const { cwd, request, attachmentFile, attachmentBytes } = checkpointFixture();
+    if (mode === "absent") rmSync(planPath(cwd));
+    else {
+      const plan = writePlan(cwd, mode === "inactive" ? { mode } : {
+        mode, items: [{ id: "done", title: "Done", status: "banked" }],
+        completion: { enumeration: { status: "complete", source: "fixture", checkedAt: "2026-09-01T00:00:00Z", remainingActionable: 0 }, evidence: [{ kind: "fixture", locator: "local:fixture" }] },
+      });
+      assert.deepEqual(validatePlan(plan), []);
+      request.planHash = canonicalPlanHash(plan);
+    }
+    assert.throws(() => checkpointSession(cwd, request), /active/);
+    assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
+  });
+}
+
+test("receipt and ledger tampering cannot authorize resumption", () => {
+  const { cwd, request, ledgerFile, attachmentFile } = checkpointFixture();
+  const checkpoint = checkpointSession(cwd, request);
+  const receiptFile = path.join(cwd, ".supervised-worker", "checkpoints", `${checkpoint.checkpointHash}.json`);
+  const receiptBytes = readFileSync(receiptFile);
+  const ledgerBytes = readFileSync(ledgerFile);
+  const tombstone = readFileSync(attachmentFile);
+  const resume = { session_id: "checked-resume", planHash: request.planHash, checkpointHash: checkpoint.checkpointHash };
+  for (const bytes of [Buffer.from("{PRIVATE_RECEIPT"), Buffer.alloc(MAX_CHECKPOINT_BYTES + 1, 0x61)]) {
+    writeFileSync(receiptFile, bytes);
+    assert.throws(() => resumeSession(cwd, resume), /receipt/);
+    assert.deepEqual(readFileSync(attachmentFile), tombstone);
+  }
+  writeFileSync(receiptFile, receiptBytes);
+  for (const bytes of [
+    Buffer.from(ledgerBytes.toString().replace('"success":true', '"success":false')),
+    Buffer.concat([ledgerBytes, Buffer.from('{"partial":')]),
+    Buffer.from(ledgerBytes.toString().replace('"event":"checkpoint_persisted"', '"event":"unknown_event"')),
+  ]) {
+    assert.notDeepEqual(bytes, ledgerBytes);
+    writeFileSync(ledgerFile, bytes);
+    assert.throws(() => resumeSession(cwd, resume), /ledger/);
+    assert.deepEqual(readFileSync(attachmentFile), tombstone);
+  }
+  writeFileSync(ledgerFile, ledgerBytes);
+  for (const bad of [
+    { ...resume, checkpointHash: "0".repeat(64) }, { ...resume, checkpointHash: null },
+    { ...resume, planHash: "0".repeat(64) }, { ...resume, session_id: request.session_id },
+    { ...resume, raw: "PRIVATE_REQUEST" },
+  ]) assert.throws(() => resumeSession(cwd, bad), (error) => !error.message.includes("PRIVATE_"));
+  assert.deepEqual(readFileSync(attachmentFile), tombstone);
+  assert.equal(resumeSession(cwd, resume).status, "resumed");
+});
+
+test("checkpoint rejects linked state and noncanonical roots without touching their targets", () => {
+  const { cwd, request, attachmentFile, attachmentBytes } = checkpointFixture();
+  const outside = workspace();
+  const alias = path.join(outside, "alias");
+  symlinkSync(cwd, alias, process.platform === "win32" ? "junction" : "dir");
+  assert.throws(() => checkpointSession(alias, request), /canonical/);
+  const checkpoints = path.join(cwd, ".supervised-worker", "checkpoints");
+  const externalReceipts = workspace();
+  symlinkSync(externalReceipts, checkpoints, process.platform === "win32" ? "junction" : "dir");
+  assert.throws(() => checkpointSession(cwd, request), /local lifecycle/);
+  assert.deepEqual(readdirSync(externalReceipts), []);
+  assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
+});
+
+test("ownerless recovery preserves unknown operations and never repeats a side effect", () => {
+  const { cwd, source, request, attachmentFile } = checkpointFixture();
+  assert.equal(handleHook({ ...source, stop_hook_active: false }, "Stop").decision, "block");
+  const input = { ...source, tool_name: "Bash", tool_use_id: undefined, tool_input: { command: "PRIVATE_COMMAND" } };
+  assert.deepEqual(handleHook(input, "PreToolUse"), {});
+  const before = summarizePlan(cwd).operations;
+  assert.equal(before.status, "observed");
+  assert.equal(before.orphans.length, 1);
+  const sideEffect = path.join(cwd, "side-effect.txt");
+  writeFileSync(sideEffect, "performed-once\n");
+  rmSync(attachmentFile);
+  const next = { session_id: "ownerless-successor", planHash: request.planHash, checkpointHash: null };
+  const resumed = resumeSession(cwd, next);
+  assert.equal(resumed.status, "resumed");
+  assert.equal(resumed.context.operations.orphans[0].observationStatus, "outcome-unknown");
+  assert.equal(readFileSync(sideEffect, "utf8"), "performed-once\n");
+  assert.equal(handleHook({ cwd, session_id: next.session_id, stop_hook_active: true }, "Stop").decision, "block");
+  assert.throws(() => resumeSession(cwd, { ...next, session_id: "stealing-owner" }), /no attachment/);
+});
+
+test("missing ledger observation is unavailable rather than a verified empty orphan list", () => {
+  const cwd = workspace();
+  const plan = writePlan(cwd);
+  const recovered = resumeSession(cwd, { session_id: "unobserved-recovery", planHash: canonicalPlanHash(plan), checkpointHash: null });
+  assert.equal(recovered.context.operations.status, "unavailable");
+  assert.equal(recovered.context.operations.orphans, null);
+  assert.equal(recovered.context.operations.uncorrelatedCompletions, null);
+  assert.equal(summarizePlan(cwd).operations.status, "unavailable");
+  assert.equal(summarizePlan(cwd).operations.orphans, null);
+  assert.match(handleHook({ cwd, session_id: "unobserved-recovery" }, "SessionStart").additionalContext, /"status":"unavailable"/);
+});
+
+test("checkpoint and resume preserve staged, unstaged, untracked work and index identity", () => {
+  const cwd = workspace();
+  const git = (...args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  git("init", "--quiet");
+  writeFileSync(path.join(cwd, ".gitignore"), ".supervised-worker/\n");
+  writeFileSync(path.join(cwd, "tracked.txt"), "staged\n");
+  git("add", ".gitignore", "tracked.txt");
+  writeFileSync(path.join(cwd, "tracked.txt"), "unstaged\n");
+  writeFileSync(path.join(cwd, "untracked.txt"), "untracked\n");
+  const index = path.join(cwd, ".git", "index");
+  const before = {
+    bytes: readFileSync(index), identity: lstatSync(index, { bigint: true }),
+    status: git("--no-optional-locks", "status", "--porcelain=v1", "-z"),
+  };
+  assert.match(before.status, /AM tracked\.txt/);
+  assert.match(before.status, /\?\? untracked\.txt/);
+  const { request } = checkpointFixture(false, cwd);
+  assert.throws(() => checkpointSession(cwd, { ...request, attachmentHash: "0".repeat(64) }));
+  const checkpoint = checkpointSession(cwd, request);
+  const next = { session_id: "dirty-git-successor", planHash: request.planHash, checkpointHash: checkpoint.checkpointHash };
+  assert.equal(resumeSession(cwd, next).status, "resumed");
+  assert.throws(() => checkpointSession(cwd, request));
+  assert.deepEqual(readFileSync(index), before.bytes);
+  const afterIdentity = lstatSync(index, { bigint: true });
+  assert.equal(afterIdentity.dev, before.identity.dev);
+  assert.equal(afterIdentity.ino, before.identity.ino);
+  assert.equal(git("--no-optional-locks", "status", "--porcelain=v1", "-z"), before.status);
+  assert.equal(readFileSync(path.join(cwd, "tracked.txt"), "utf8"), "unstaged\n");
+  assert.equal(readFileSync(path.join(cwd, "untracked.txt"), "utf8"), "untracked\n");
 });
 
 test("run ledger summary consumes appendLedger records without exposing detail", () => {

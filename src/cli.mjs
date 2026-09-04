@@ -11,9 +11,11 @@ import {
   serializeLocalCampaignReceipt,
 } from "./campaign.mjs";
 import {
+  checkpointSession,
   handleHook,
-  PLAN_WRITER_MATCHER,
+  MAX_CHECKPOINT_REQUEST_BYTES,
   releaseAttachment,
+  resumeSession,
   summarizePlan,
   validatePlan,
 } from "./core.mjs";
@@ -25,25 +27,26 @@ import {
 } from "./handoff.mjs";
 import { validateHookManifest } from "./hook-manifest.mjs";
 import { installLocalPlugin } from "./install.mjs";
-import { acceptWorkflowRoles, resolveWorkflowRoles } from "./workflow.mjs";
+import { acceptWorkflowRoles, parseWorkflowJson, resolveWorkflowRoles } from "./workflow.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const MAX_STDIN_BYTES = 1_048_576;
 
-function readStdin() {
+function readStdin(maximumBytes = MAX_STDIN_BYTES) {
   return new Promise((resolve, reject) => {
-    let data = "";
+    const chunks = [];
     let bytes = 0;
     let exceeded = false;
-    process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk) => {
-      bytes += Buffer.byteLength(chunk, "utf8");
-      if (bytes > MAX_STDIN_BYTES) exceeded = true;
-      else data += chunk;
+      bytes += chunk.length;
+      if (bytes > maximumBytes) {
+        exceeded = true;
+        chunks.length = 0;
+      } else chunks.push(chunk);
     });
     process.stdin.on("end", () => {
       if (exceeded) reject(new Error("hook input exceeds the size limit"));
-      else resolve(data);
+      else resolve(Buffer.concat(chunks));
     });
     process.stdin.on("error", reject);
   });
@@ -117,6 +120,7 @@ async function validateRepository() {
     "examples/handoff.review-report.json",
     "examples/local-campaign-receipt.json",
     "policy/constitution.json",
+    "schemas/checkpoint.schema.json",
     "schemas/episode.schema.json",
     "schemas/local-campaign-receipt.schema.json",
     "schemas/model-receipt.schema.json",
@@ -175,7 +179,7 @@ async function validateRepository() {
     const hooks = JSON.parse(
       readFileSync(path.join(root, "hooks.json"), "utf8"),
     );
-    errors.push(...validateHookManifest(hooks, PLAN_WRITER_MATCHER));
+    errors.push(...validateHookManifest(hooks));
   } catch (error) {
     errors.push(`hooks.json is invalid: ${error.message}`);
   }
@@ -328,7 +332,7 @@ async function main() {
   const [command = "help", argument, ...argumentsAfter] = process.argv.slice(2);
   const hasNoArguments = argument === undefined && argumentsAfter.length === 0;
   const usage =
-    "Usage: node src/cli.mjs <validate|doctor|install|status|release|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
+    "Usage: node src/cli.mjs <validate|doctor|install|status|checkpoint|resume|release|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
   if (command === "help" && hasNoArguments) {
     process.stdout.write(usage);
     return;
@@ -350,7 +354,7 @@ async function main() {
     }
     let input;
     try {
-      input = JSON.parse(text || "{}");
+      input = text.length === 0 ? {} : parseWorkflowJson(text);
     } catch {
       process.stdout.write(
         `${JSON.stringify(hookInputFailure(
@@ -374,6 +378,25 @@ async function main() {
       return;
     }
     process.stdout.write(`${JSON.stringify(handleHook(input, argument, input.cwd))}\n`);
+    return;
+  }
+  if (["checkpoint", "resume"].includes(command) && hasNoArguments) {
+    let request;
+    try {
+      request = parseWorkflowJson(await readStdin(MAX_CHECKPOINT_REQUEST_BYTES));
+    } catch {
+      process.stdout.write(`${JSON.stringify({ status: "unconfirmed", error: `${command} requires bounded, duplicate-key-free JSON stdin.` })}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      const result = command === "checkpoint" ? checkpointSession(process.cwd(), request) : resumeSession(process.cwd(), request);
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      if (result.status !== (command === "checkpoint" ? "checkpointed" : "resumed")) process.exitCode = 1;
+    } catch (error) {
+      process.stdout.write(`${JSON.stringify({ status: "unconfirmed", error: error.message })}\n`);
+      process.exitCode = 1;
+    }
     return;
   }
   if (command === "campaign") {
@@ -488,11 +511,19 @@ async function main() {
   }
   if ((command === "validate" || command === "doctor") && hasNoArguments) {
     const errors = await validateRepository();
+    let plan;
+    try {
+      plan = summarizePlan(process.cwd());
+    } catch {
+      const error = "Local state could not be verified.";
+      plan = { active: false, valid: false, error };
+      errors.push(error);
+    }
     const report = {
       ok: errors.length === 0,
       node: process.version,
       pluginRoot: root,
-      plan: summarizePlan(process.cwd()),
+      plan,
       errors,
     };
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);

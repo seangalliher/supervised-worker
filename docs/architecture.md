@@ -116,12 +116,14 @@ separate from the agent so other Copilot agents can adopt the same queue contrac
 The plugin uses PascalCase event names so Copilot CLI emits the VS Code-compatible
 snake_case payload. Current events are:
 
-- `SessionStart`: inject bounded counts from an active durable plan.
+- `SessionStart`: inject bounded counts and checkpoint/orphan references only
+        for an already owned durable plan; fresh sessions remain inert.
 - `PreToolUse`: create a generation-bound provisional claim for the first plan
-        writer and deny later sessions.
+        writer, deny conflicting writers, and durably observe every owned invocation.
 - `PostToolUse` and, on supporting hosts, `PostToolUseFailure`: append
         metadata-only events and reconcile provisional plan claims.
-- `PreCompact`: record that a context transition is beginning.
+- `PreCompact`: record metadata about a context transition without checkpointing
+        or rotating sessions.
 - `Stop`: check plan structure and bounded completion conditions.
 
 Checkout hooks resolve code only through a host-provided `PLUGIN_ROOT` and fail
@@ -143,10 +145,13 @@ Control responses carry Copilot CLI's top-level fields and VS Code's nested
 ordinary path arguments and `apply_patch` headers before plan ownership is
 decided.
 
-VS Code 1.136 does not retain the manifest's `PreToolUse.matcher`, so it invokes
-the command for non-writer tools too. The runtime checks the tool name before
-locality checks, session-context parsing, or lock acquisition and returns `{}`
-without creating state. Hosts that honor the matcher avoid that process launch.
+All packaged and generated `PreToolUse` entries use the shared `.*` matcher.
+`PLAN_WRITER_MATCHER` and `PLAN_WRITER_TOOLS` govern file-write permissions only.
+Non-writer arguments never select a repository or acquire a plan claim. A
+read-only ownership check leaves unrelated non-writers inert before creating
+locks or state. Owned non-writers use the same durable start path as writers.
+VS Code versions that omit matcher filtering therefore have the same semantics
+as hosts that honor the all-tool matcher.
 
 Edit targets are checked lexically and by filesystem identity. The hook denies
 device-namespace paths, unresolved link aliases, aliases whose existing
@@ -193,8 +198,9 @@ recorded original source hash. Completion audit records and campaign export
 likewise share one canonical plan hash implementation.
 
 Plan observations reveal only a domain-separated hash of each item ID and its
-status. Ledger observation is closed to the exact eight `appendLedger` event
-variants, rejects unsafe or unstable files, and is bounded by file count, file
+status. Ledger observation is closed to eleven event variants: the original
+eight plus `tool_started`, `checkpoint_persisted`, and `checkpoint_resumed`.
+The parser rejects unsafe or unstable files and is bounded by file count, file
 bytes, aggregate bytes, and record bytes. Only event names, counts, UTC bounds,
 and a length-framed ledger hash leave the parser; record details and session
 hashes do not. An existing empty `runs` directory is observed as an empty
@@ -230,7 +236,9 @@ The state directory belongs to the repository being worked on, not the plugin:
 |-- workflow-acceptance.json # exact accepted repository role-map hash
 |-- handoffs/       # typed summaries below sha256(itemId), never raw provider ids
 |-- runs/*.jsonl    # append-only metadata events by hashed session id
-|-- attachment.json # session hash, claim generation, and provisional/active status
+|-- checkpoints/*.json # immutable receipts named by exact file-byte SHA-256
+|-- locks/lifecycle/ # shared repository lifecycle exclusion
+|-- attachment.json # v3 claim/route identity; provisional, active, or checkpointed
 `-- runtime/*.json  # bounded Stop counters
 ```
 
@@ -271,16 +279,24 @@ The record contains the session hash, repository root and hash, random claim
 generation, lifecycle status, and timestamps; it contains no transcript
 content. Targetless events accept an active or provisional route only while the
 repository's `attachment.json` carries the same session hash and generation.
-Route and attachment transitions are serialized by a workspace-scoped session
-lock. Potentially blocking drive-locality checks for the hook cwd, qualified
+Route and attachment transitions and ledger mutations are serialized by the
+workspace-scoped session lock when available, followed by repository lifecycle
+locks in canonical-root order. A repository lock is also required for sessions
+without transcript routing. No path acquires a session lock while holding a
+repository lock. Old-root reconciliation when rebinding and explicit release
+use the same repository exclusion. Explicit release captures its attachment
+before waiting and revalidates that exact byte hash and filesystem identity
+under the lock, so a delayed release cannot remove a successor.
+Potentially blocking drive-locality checks for the hook cwd, qualified
 targets, transcript anchor, and a read-only locator-root hint complete before
 locking; authoritative route and attachment bytes are reread under the lock,
 where an uncached drive fails closed without spawning another check. A contender
 uses a 250 ms monotonic retry deadline for a concurrently completing hook,
 without deleting, renaming, or replacing its owner. A delayed scheduler wake
 may return later but cannot retry acquisition after the deadline. A lock that
-remains authoritative then fails visibly and requires operator-confirmed cleanup, while a new session uses
-a different hashed lock path. Each claim writes one UUID-named owner file and
+remains authoritative then fails visibly and requires operator-confirmed
+cleanup. A new session has a different hashed session lock but cannot bypass
+the repository's shared lifecycle lock. Each lock writes one UUID-named owner file and
 holds that file open so copied contents cannot impersonate its filesystem
 identity. The owner must remain the sole entry in the same stable, nonzero
 device/inode directory identity. Release atomically renames the canonical lock
@@ -301,6 +317,119 @@ the hook restores the marker and fails visibly. Normal Stop release removes the
 attachment and retains a released route tombstone for later reconciliation. If
 writing the tombstone or removing the attachment fails, the hook reports that
 cleanup failed and does not claim the ownership was released.
+
+### Checkpoint State Machine
+
+`checkpointSession(cwd, request)`, `resumeSession(cwd, request)`, and
+`validateCheckpoint(value)` live in the existing core. The CLI accepts strict,
+duplicate-key-free UTF-8 JSON stdin up to 8 KiB. Checkpoint requests contain
+exactly `session_id`, optional `transcript_path`, `planHash`, and
+`attachmentHash`; resume replaces the latter with `checkpointHash` (digest or
+explicit `null`). Authority is the canonical local process cwd and validated
+existing routing, never a repository override inside the request. `status`
+exposes the canonical plan hash and exact current attachment hash read-only.
+Confirmed responses contain `status` (`checkpointed` or `resumed`),
+`checkpointHash`, `planHash`, `attachmentHash`, and typed `context`.
+Unconfirmed CLI responses contain `status: "unconfirmed"` and a concrete,
+input-redacted error, with exit code `1`.
+
+The source plan must be valid, active, unchanged canonically, and have
+`completion: null`. Under uninterrupted lifecycle exclusion the helper:
+
+1. reads and flushes the validated source ledger's complete-record prefix;
+2. captures exact attachment identity and existing valid Stop counters;
+3. persists, flushes, and verifies an immutable checkpoint receipt;
+4. durably appends `checkpoint_persisted` binding receipt, plan, and source;
+5. revalidates ownership and atomically publishes the checkpointed tombstone;
+6. marks the matching source route released before reporting success.
+
+Attachment version 3 carries an independent UUID `claimGeneration` for every
+new claim and nullable `checkpointHash`. Only `active` and `provisional` are
+ownership. `checkpointed` is a logical detachment with a receipt reference;
+ordinary plan writes cannot consume it. Legacy v1/v2 ownership remains readable
+and is bound to its exact original bytes, session, and available route identity.
+It is not migrated before persistence succeeds; legacy receipt generations may
+be null. A tombstone alone, or a receipt/persistence event without the matching
+tombstone, does not authorize a new session.
+
+The [checkpoint schema](../schemas/checkpoint.schema.json) closes every object.
+Receipts are limited to 256 KiB, 4,096 item hashes, and 256 orphan references;
+limits fail explicitly instead of truncating. Top-level fields are version,
+kind, UUID checkpoint ID, canonical UTC creation time, plan/session/attachment
+hashes, route and claim generations, `ledgerPosition`, and `context`.
+`ledgerPosition` names only `runs/<source-session-hash>.jsonl`, its byte offset,
+record count, and exact prefix SHA-256 before the persistence event. Context
+contains typed status counts, `sha256(itemId)` handoff references, a valid Stop
+snapshot or null, and bounded operation observations. Runtime validation also
+checks relational constraints such as count totals, source filename, prefix
+hash/count, and the persistence event at that exact watermark.
+
+Explicit resume requires a fresh session different from the source. It validates
+the receipt, tombstone, unchanged active plan, and source ledger binding,
+restores the Stop snapshot before publishing active ownership with fresh claim
+and route generations, promotes routing, and durably appends
+`checkpoint_resumed`. The successor retains `checkpointHash`. Once published,
+only that exact successor can idempotently finish an interrupted resume; a
+competing session cannot roll it back or remove it. Retries never reset counters
+already used by the successor. Before publication, failures retain the
+resumable tombstone; an incomplete, generation-unconfirmed host route requires
+manual inspection or a different fresh session, not opportunistic deletion.
+
+`checkpointHash: null` is an explicit ownerless active-plan recovery only. It
+rejects any current attachment, including tombstones, observes durable ledger
+context without replay, and preserves unambiguous valid Stop counters. It does
+not consume or alter review/model evidence under other runtime namespaces.
+Ambiguous counters require inspection rather than choosing the newest by time.
+An owner published during this recovery is not automatically removed if its
+confirmation fails. A known-stale owner must be handled with the separately
+authorized, snapshot-bound `release` operation. Neither SessionStart nor
+PreCompact initiates this process.
+
+Receipt, flush, or pre-detachment event failure leaves the original attachment
+and route authoritative. After tombstone publication, a route-cleanup failure
+is unconfirmed, not an active source or a completed release; the same source
+request can retry cleanup. Temporary files are checked and flushed before
+atomic publication and bounded read-back. Required ledger appends publish the
+validated old prefix plus one new record atomically, so a failed terminal
+temporary write cannot look like observed completion. Process-crash states
+are detectable and recoverable, but directory-entry/power-loss guarantees are
+not asserted across platforms. Locks require operator-confirmed stale-owner
+recovery; age, wall-clock time, compaction, and model choice grant no authority.
+
+### Operation Observations
+
+Every allowed owned or newly claimed PreToolUse must durably record
+`tool_started` before permission is returned. Failure denies the invocation
+visibly. Records include a UUID `operationId`, bounded tool name, source session,
+route/claim identity, and optional invocation hash. `tool_use_id` and `toolUseId`
+are hints, not required host guarantees; only their domain-separated SHA-256 is
+stored. Conflicting aliases are treated as absent. No arguments, prompts,
+transcripts, outputs, or free-form continuation text enter these records.
+
+A terminal `tool_completed` may name an operation only for exactly one matching
+invocation hash within the same source claim. Repeated terminal observations
+for that match are idempotent. Missing IDs, reused IDs, ambiguous matches,
+legacy completion-only records, and failed persistence cannot resolve starts
+by tool name, order, argument similarity, or counts. Reused IDs leave every
+affected start unknown, including one with an earlier terminal record.
+Success/failure metadata without an operation binding remains uncorrelated.
+
+`context.operations` distinguishes observed prefixes from unavailable history;
+orphans have `observationStatus: "outcome-unknown"`. Unavailable observations
+carry null dependent values and a typed reason, which `checkpoint_resumed`
+also preserves for later status and subsequent checkpoints. Legacy uncorrelated
+completion counts are explicit. Operators must inspect real side effects;
+recovery never executes recorded operations. The enclosing checkpoint tool can
+remain an orphan because the source session is already detached when its
+terminal hook arrives. Source references survive successor checkpoints.
+
+None of these transitions edits the plan, changes item status or actionable
+counts, creates `resumeWhen`, alters handoffs, or mutates Git/index/worktree
+contents. Valid Stop v1/v2 snapshots retain the existing migration and bounded
+continuation behavior. Checkpoint events never replace `completion_verified`
+or `completion_unverified_release`, and cannot make a campaign receipt's
+`localCompletionShape` true. Campaign export accepts the new closed vocabulary
+but still emits aggregates only, with every provider fact unavailable.
 
 The main worker derives each item handoff directory from `sha256(itemId)`. This
 keeps untrusted provider identifiers out of filesystem paths. Handoffs may carry

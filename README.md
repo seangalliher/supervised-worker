@@ -57,7 +57,8 @@ Provider-Verified Completion**.
   Stop fails open visibly. A changed canonical valid-plan state resets that
   bound; invalid plans share one stable state until repaired.
 - A runtime-dependency-free Node helper with repository validation, plan status,
-  and deterministic local campaign receipt export and reconciliation.
+  explicit checkpoint/resume, and deterministic local campaign receipt export
+  and reconciliation.
 - Constitutional policy and schemas for future evidence-gated learning. The
   alpha does not yet capture outcome episodes or activate learned procedures.
 
@@ -67,7 +68,7 @@ Supervised Worker is a governance layer, not a coding runtime. It does not ship
 an LLM client, execute an autonomous model loop, poll trackers in a daemon,
 manage a worktree fleet, or replace GitHub Copilot.
 
-The alpha helper records only lifecycle and tool-result metadata. It does not
+The alpha helper records only lifecycle and tool-observation metadata. It does not
 store prompts, command arguments, source code, or tool output.
 
 ## Role-Separated Execution
@@ -232,7 +233,10 @@ For a queue or multi-step task, the agent creates:
 ```text
 .supervised-worker/
 |-- plan.json
+|-- attachment.json
+|-- checkpoints/<receipt-byte-sha256>.json
 |-- handoffs/<sha256(itemId)>/
+|-- locks/lifecycle/
 |-- runs/
 `-- runtime/
 ```
@@ -253,7 +257,9 @@ Protected edit targets must be fully qualified. When VS Code reports the plugin
 root as the hook cwd, the first absolute plan edit writes a metadata-only
 session locator beneath that window's `workspaceStorage` directory. Later
 targetless hooks use the locator only when its session hash and random claim
-generation match the repository's own attachment. The claim starts provisional,
+route generation match the repository's own attachment. Version 3 attachments
+also carry a separate UUID claim generation, including repository-local sessions
+without transcript routing. The claim starts provisional,
 is promoted after a successful plan write, and leaves a released routing
 tombstone when detached. No transcript content is read or retained.
 Because VS Code Copilot Chat 0.64 drops `PostToolUseFailure`, the supported
@@ -261,9 +267,12 @@ Because VS Code Copilot Chat 0.64 drops `PostToolUseFailure`, the supported
 `plan.json`; a missing plan is recorded as failure and releases the provisional
 claim. If ownership-state cleanup fails, the hook says so and leaves the claim
 recoverable instead of reporting release.
-VS Code 1.136 also drops the packaged `PreToolUse` matcher. Non-writer
-invocations therefore return immediately in the helper before locality checks,
-workspace routing, or lock creation.
+The packaged and installed `PreToolUse` matcher is now `.*`. Every owned tool
+invocation, including non-writers, must persist a start before proceeding.
+File-write permissions still use only the existing writer vocabulary. A
+non-writer follows existing ownership only, never repository paths in its
+arguments; an unrelated non-writer creates no state or locks. Hosts that drop
+the matcher therefore have the same observation behavior.
 Hook path inspection accepts at most 256 unique targets per invocation and
 deduplicates repeats before touching the filesystem.
 Windows evaluation is limited to local drive-letter storage; UNC,
@@ -271,10 +280,13 @@ network-mapped, and `subst` repository roots fail closed before filesystem
 inspection. Locality checks share a 1.5-second budget and allow at most three
 distinct drive letters per operation.
 
-Session locks are never reclaimed automatically. If a hook process terminates
-while holding one, the same session fails visibly until an operator confirms
-the owner is stale and removes that hashed workspace-storage lock; unrelated
-new sessions use different lock paths.
+Session and repository lifecycle locks are never reclaimed automatically. If a
+process terminates while holding one, inspect the UUID owner record and confirm
+that its process and lifecycle operation have ended before manually removing
+that exact stale lock. Time, transcript size, compaction, and model selection
+are not reclamation authority. New sessions have different session locks but
+share `.supervised-worker/locks/lifecycle`; they cannot bypass a stale repository
+lock. Inspect any token-specific retired lock directory separately.
 
 See [the active example](examples/plan.active.json), [the complete
 example](examples/plan.complete.json), and [the plan schema](schemas/plan.schema.json).
@@ -288,6 +300,8 @@ npm run validate
 npm test
 npm run doctor
 node src/cli.mjs status
+node src/cli.mjs checkpoint < checkpoint-request.json
+node src/cli.mjs resume < resume-request.json
 node src/cli.mjs workflow roles
 node src/cli.mjs workflow accept <workflowHash>
 node src/cli.mjs campaign export
@@ -298,6 +312,93 @@ node src/cli.mjs campaign validate <receipt.json>
 
 `doctor` validates the package and reports durable plan state for the current
 directory. The lifecycle host invokes `hook EVENT` automatically.
+
+### Explicit Checkpoint And Resume
+
+Invoke these operations from the target repository's canonical local cwd,
+using the trusted helper's absolute path when it is installed elsewhere. The
+Worker, not a companion role, requests them explicitly. `SessionStart`, Stop,
+PreCompact, elapsed time, and context size never initiate checkpointing,
+resumption, or automatic session creation.
+
+`status` is read-only. It returns `planHash` (canonical plan content),
+`attachmentHash` (exact attachment or tombstone bytes), bounded attachment
+identity, and `operations` with explicit orphan-observation status. Use the
+current hashes and actual host session ID; these request examples show shapes
+with illustrative hashes, not reusable authorization:
+
+```json
+{
+  "session_id": "source-session",
+  "planHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "attachmentHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}
+```
+
+Send that JSON on stdin to `checkpoint`. For transcript-routed ownership, also
+supply the matching host `transcript_path`. It is an anchor, not transcript
+content; the helper never reads the transcript. No request-supplied `cwd` or
+repository override is accepted. Requests are strict UTF-8 JSON, reject
+duplicate and unknown keys, and are limited to 8 KiB. Invalid, stale, or
+unconfirmed operations exit `1` without echoing input.
+
+A successful response has `status: "checkpointed"`, `checkpointHash`,
+`planHash`, `attachmentHash`, and typed `context`. It is returned only after
+the receipt and persistence event are verified, a matching **checkpointed
+tombstone** replaces the active attachment, and source route cleanup is
+confirmed. The old session is logically detached, although `attachment.json`
+still exists. An ordinary plan write cannot consume this tombstone.
+
+Start a fresh host session, then explicitly send this shape to `resume`:
+
+```json
+{
+  "session_id": "fresh-session",
+  "planHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "checkpointHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}
+```
+
+Use the returned receipt hash and the fresh session's transcript anchor when
+available. A successful response has `status: "resumed"` and the same response
+fields with the successor attachment hash. A receipt or ledger event alone is
+insufficient: resume requires its matching tombstone or that exact session's
+already-published successor, an unchanged canonical active plan, and intact
+ledger bindings. Retrying the same published successor is idempotent and does
+not reset its Stop counters; another session conflicts. After a pre-publication
+failure, the tombstone remains resumable. If an interrupted route is incomplete,
+use another fresh session or inspect it manually, never delete a replacement
+owner to make the request succeed.
+
+For an ownerless active-plan crash recovery only, `checkpointHash: null` reads
+the current durable context. It is rejected while any attachment or tombstone
+exists; it never releases an owner automatically. If this recovery publishes
+ownership but cannot confirm its final event, inspect that owner and its ledger
+before further recovery. A known-stale owner requires the explicit `release`
+procedure below, not an inferred timeout.
+
+Checkpoint receipts follow the [checkpoint schema](schemas/checkpoint.schema.json)
+and contain counts, handoff item hashes, valid Stop counters, source identities,
+and bounded operation references. They do not copy goals, titles, prompts,
+transcripts, tool arguments/results, or continuation instructions. The queue,
+handoffs, staged/unstaged/untracked work, and Git index are not rewritten.
+Checkpointing never parks an item, changes `completion: null`, or substitutes
+for completion evidence. Stop still enforces the existing incomplete-plan bound.
+
+`tool_started` records a UUID operation and optional domain-separated hash of
+the host's `tool_use_id` or `toolUseId`. A terminal observation resolves a start
+only when that ID and claim identity identify exactly one invocation. Missing,
+reused, or ambiguous IDs, legacy completion-only records, and failed terminal
+persistence are not proof of completion. Inspect every `outcome-unknown`
+reference against the actual side effect before continuing; recovery never
+replays recorded operations. The checkpoint command's enclosing tool can itself
+remain unknown because its old-session terminal hook occurs after detachment.
+Unavailable observations stay unavailable, never a verified empty orphan list.
+
+Writes use file flushes, atomic publication, and bounded read-back. Interrupted
+processes can leave unreferenced receipts, incomplete routes, a resumable
+tombstone, or an identifiable successor. These are process-crash recovery
+semantics, not a claim of portable power-loss durability or provider verification.
 
 `campaign export` writes only to stdout and defaults to deterministic,
 two-space JSON; `--format json` is the explicit equivalent and `--format

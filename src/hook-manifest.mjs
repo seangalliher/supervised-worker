@@ -1,3 +1,5 @@
+import { ALL_TOOL_MATCHER } from "./core.mjs";
+
 export const EXPECTED_HOOK_EVENTS = [
   "SessionStart",
   "PreToolUse",
@@ -18,7 +20,7 @@ function expectedPowerShellCommand(eventName) {
   return `$pluginRoot=$env:PLUGIN_ROOT; if ([string]::IsNullOrWhiteSpace($pluginRoot)) { Write-Error 'Supervised Worker requires PLUGIN_ROOT; run node src/cli.mjs install for VS Code.'; exit 1 }; $env:NODE_OPTIONS=$null; $env:COPILOT_GITHUB_TOKEN=$null; $env:GH_TOKEN=$null; $env:GITHUB_TOKEN=$null; node (Join-Path $pluginRoot 'src/hook-launcher.mjs') ${eventName}`;
 }
 
-export function validateHookManifest(hooks, planWriterMatcher) {
+export function validateHookManifest(hooks) {
   const errors = [];
   if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) {
     return ["hooks.json must contain an object"];
@@ -60,8 +62,8 @@ export function validateHookManifest(hooks, planWriterMatcher) {
       errors.push(`${event} timeoutSec must be exactly 5 seconds`);
     }
     if (event === "PreToolUse") {
-      if (entry.matcher !== planWriterMatcher) {
-        errors.push("PreToolUse matcher differs from the case-sensitive writer vocabulary");
+      if (entry.matcher !== ALL_TOOL_MATCHER) {
+        errors.push("PreToolUse matcher must observe all tools");
       }
     } else if (Object.hasOwn(entry, "matcher")) {
       errors.push(`${event} must not define a matcher`);

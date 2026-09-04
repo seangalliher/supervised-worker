@@ -6,6 +6,7 @@ import addFormats from "ajv-formats";
 import { parseDocument } from "yaml";
 
 import { validateLocalCampaignReceipt } from "./campaign.mjs";
+import { sha256, validateCheckpoint } from "./core.mjs";
 import { validateHandoffValue } from "./handoff.mjs";
 import { validateWorkflowValue } from "./workflow.mjs";
 
@@ -31,6 +32,7 @@ const SKILL_KEYS = new Set([
   "allowed-tools",
 ]);
 const SCHEMA_FILES = [
+  "checkpoint.schema.json",
   "episode.schema.json",
   "local-campaign-receipt.schema.json",
   "model-receipt.schema.json",
@@ -366,6 +368,37 @@ function validateLocalCampaignGates(validate, root, errors) {
   }
 }
 
+function validateCheckpointGates(validate, errors) {
+  const baseline = {
+    schemaVersion: 1, kind: "session-checkpoint", checkpointId: "11111111-1111-4111-8111-111111111111",
+    createdAt: "2026-09-01T00:00:00.000Z", planHash: "a".repeat(64), sessionHash: "b".repeat(64),
+    routeGeneration: null, claimGeneration: null, attachmentHash: "c".repeat(64),
+    ledgerPosition: { path: `runs/${"b".repeat(64)}.jsonl`, byteOffset: 0, recordCount: 0, prefixHash: sha256("") },
+    context: {
+      counts: { pending: 0, in_progress: 0, banked: 0, parked: 0 }, itemHashes: [], stopState: null,
+      operations: { status: "unavailable", reason: "ledger-absent", orphans: null, uncorrelatedCompletions: null },
+    },
+  };
+  if (!validate(baseline) || validateCheckpoint(baseline).length > 0) {
+    errors.push("checkpoint valid baseline was rejected by schema or runtime");
+    return;
+  }
+  for (const [name, mutate] of [
+    ["unknown context", (value) => { value.context.instructions = "not permitted"; }],
+    ["wrapped digest", (value) => { value.planHash = [value.planHash]; }],
+    ["wrapped UUID", (value) => { value.checkpointId = [value.checkpointId]; }],
+    ["unsafe path", (value) => { value.ledgerPosition.path = "../outside.jsonl"; }],
+    ["negative offset", (value) => { value.ledgerPosition.byteOffset = -1; }],
+    ["unknown presented as empty", (value) => { value.context.operations.orphans = []; }],
+    ["untyped Stop state", (value) => { value.context.stopState = {}; }],
+  ]) {
+    const value = structuredClone(baseline);
+    mutate(value);
+    if (validate(value)) errors.push(`checkpoint schema accepted unsafe state: ${name}`);
+    if (validateCheckpoint(value).length === 0) errors.push(`checkpoint runtime accepted unsafe state: ${name}`);
+  }
+}
+
 export function validatePublishedSchemas(root) {
   const errors = [];
   const discovered = readdirSync(path.join(root, "schemas"))
@@ -440,6 +473,10 @@ export function validatePublishedSchemas(root) {
   const campaignValidate = campaignSchemaId ? ajv.getSchema(campaignSchemaId) : null;
   if (campaignValidate) validateLocalCampaignGates(campaignValidate, root, errors);
   else errors.push("local campaign receipt safety gates could not be exercised");
+  const checkpointSchemaId = schemas.get("checkpoint.schema.json");
+  const checkpointValidate = checkpointSchemaId ? ajv.getSchema(checkpointSchemaId) : null;
+  if (checkpointValidate) validateCheckpointGates(checkpointValidate, errors);
+  else errors.push("checkpoint schema safety gates could not be exercised");
   return errors;
 }
 

@@ -14,6 +14,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 
+import { ALL_TOOL_MATCHER } from "./core.mjs";
 import { EXPECTED_HOOK_EVENTS } from "./hook-manifest.mjs";
 import { parseWorkflowJson } from "./workflow.mjs";
 
@@ -30,8 +31,6 @@ const INSTALL_ENTRIES = [
   "skills",
   "src",
 ];
-const PLAN_WRITER_MATCHER =
-  "Write|Edit|create|edit|apply_patch|create_file|str_replace_editor|insert|insert_edit_into_file|replace_string_in_file|multi_replace_string_in_file";
 const INSTALL_FORMAT_VERSION = 5;
 const INSTALL_RECORD_KEYS = new Set([
   "schemaVersion",
@@ -122,7 +121,7 @@ export function buildInstalledHookManifest({
     const command = installedCommand(eventName, installRoot, nodePath, platform, environment);
     hooks[eventName] = [{
       type: "command",
-      ...(eventName === "PreToolUse" ? { matcher: PLAN_WRITER_MATCHER } : {}),
+      ...(eventName === "PreToolUse" ? { matcher: ALL_TOOL_MATCHER } : {}),
       bash: platform === "win32"
         ? `printf '%s\\n' 'Supervised Worker Windows installation requires the PowerShell launcher.' >&2; exit 1`
         : command,

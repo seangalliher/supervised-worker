@@ -23,6 +23,8 @@ import { parseWorkflowJson } from "./workflow.mjs";
 const MAX_RECEIPT_BYTES = 1_048_576;
 const ITEM_STATUSES = ["pending", "in_progress", "banked", "parked"];
 const LEDGER_EVENTS = [
+  "checkpoint_persisted",
+  "checkpoint_resumed",
   "completion_unverified_release",
   "completion_verified",
   "ownership_cleanup_failed",
@@ -31,6 +33,7 @@ const LEDGER_EVENTS = [
   "provisional_claim_released",
   "stop_blocked",
   "tool_completed",
+  "tool_started",
 ];
 const PROVIDER_FACTS = Object.freeze({
   repository: "provider-repository-verification-unavailable",

@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -23,7 +24,7 @@ const cli = path.join(root, "src", "cli.mjs");
 const hookLauncher = path.join(root, "src", "hook-launcher.mjs");
 
 function workspace() {
-  return mkdtempSync(path.join(os.tmpdir(), "supervised-worker-cli-"));
+  return realpathSync(mkdtempSync(path.join(os.tmpdir(), "supervised-worker-cli-")));
 }
 
 function run(args, options = {}) {
@@ -49,6 +50,105 @@ function writeCampaignState(cwd) {
     }, null, 2)}\n`,
   );
   return state;
+}
+
+for (const command of ["doctor", "validate"]) {
+  test(`${command} reports corrupt attachment state without an unhandled rejection`, () => {
+    const cwd = workspace();
+    try {
+      const state = writeCampaignState(cwd);
+      const healthy = run([command], { cwd });
+      assert.equal(healthy.status, 0, healthy.stderr || healthy.stdout);
+      assert.equal(JSON.parse(healthy.stdout).plan.valid, true);
+      const attachmentPath = path.join(state, "attachment.json");
+      const corruptBytes = '{"schemaVersion":3,"private":"PRIVATE_ATTACHMENT"}\n';
+      writeFileSync(attachmentPath, corruptBytes);
+      const result = run([command], { cwd });
+      assert.equal(result.status, 1);
+      assert.equal(result.stderr, "");
+      const report = JSON.parse(result.stdout);
+      assert.equal(report.ok, false);
+      assert.equal(report.plan.valid, false);
+      assert.ok(report.errors.includes("Local state could not be verified."));
+      assert.doesNotMatch(result.stdout, /PRIVATE_ATTACHMENT/);
+      assert.equal(readFileSync(attachmentPath, "utf8"), corruptBytes);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("CLI status, checkpoint, fresh resume, and Stop cross real process boundaries", () => {
+  const cwd = workspace();
+  try {
+    const state = writeCampaignState(cwd);
+    const planFile = path.join(state, "plan.json");
+    const input = { cwd, session_id: "cli-checkpoint-source", tool_name: "Write", tool_use_id: "cli-setup", tool_input: { file_path: planFile } };
+    for (const event of ["PreToolUse", "PostToolUse"]) {
+      const result = run(["hook", event], { cwd, input: JSON.stringify(input) });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), {});
+    }
+    const before = readFileSync(planFile);
+    const status = run(["status"], { cwd });
+    assert.equal(status.status, 0, status.stderr);
+    const summary = JSON.parse(status.stdout);
+    assert.equal(summary.attachment.status, "active");
+    assert.match(summary.planHash, /^[0-9a-f]{64}$/);
+    assert.match(summary.attachmentHash, /^[0-9a-f]{64}$/);
+    const request = { session_id: input.session_id, planHash: summary.planHash, attachmentHash: summary.attachmentHash };
+    const checkpoint = run(["checkpoint"], { cwd, input: JSON.stringify(request) });
+    assert.equal(checkpoint.status, 0, checkpoint.stderr || checkpoint.stdout);
+    const saved = JSON.parse(checkpoint.stdout);
+    assert.equal(saved.status, "checkpointed");
+    assert.doesNotMatch(checkpoint.stdout, /SECRET CLI|secret-cli-id/);
+    const fresh = { cwd, session_id: "cli-checkpoint-successor" };
+    assert.deepEqual(JSON.parse(run(["hook", "SessionStart"], { cwd, input: JSON.stringify(fresh) }).stdout), {});
+    const resumed = run(["resume"], { cwd, input: JSON.stringify({ session_id: fresh.session_id, planHash: summary.planHash, checkpointHash: saved.checkpointHash }) });
+    assert.equal(resumed.status, 0, resumed.stderr || resumed.stdout);
+    assert.equal(JSON.parse(resumed.stdout).status, "resumed");
+    assert.deepEqual(JSON.parse(resumed.stdout).context, saved.context);
+    const stop = run(["hook", "Stop"], { cwd, input: JSON.stringify(fresh) });
+    assert.equal(stop.status, 0, stop.stderr);
+    assert.equal(JSON.parse(stop.stdout).decision, "block");
+    assert.deepEqual(readFileSync(planFile), before);
+    assert.equal(JSON.parse(run(["status"], { cwd }).stdout).complete, false);
+    const stale = run(["checkpoint"], { cwd, input: JSON.stringify(request) });
+    assert.equal(stale.status, 1);
+    assert.equal(JSON.parse(stale.stdout).status, "unconfirmed");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+for (const command of ["checkpoint", "resume"]) {
+  test(`${command} rejects malformed, duplicate, oversized, and unknown request data privately`, () => {
+    const cwd = workspace();
+    try {
+      const state = writeCampaignState(cwd);
+      const planBytes = readFileSync(path.join(state, "plan.json"));
+      for (const input of [
+        "", "{PRIVATE_INPUT", "null", "[]", "{}",
+        '{"session_id":"PRIVATE_INPUT","session_id":"other"}',
+        JSON.stringify({ session_id: "PRIVATE_INPUT", planHash: "a".repeat(64), attachmentHash: "b".repeat(64), cwd: "PRIVATE_OVERRIDE" }),
+        JSON.stringify({ session_id: "PRIVATE_INPUT", planHash: "a".repeat(64), checkpointHash: null, command: "PRIVATE_EXECUTION" }),
+        `PRIVATE_INPUT${"x".repeat(8_192)}`, Buffer.from([0xff, 0x7b, 0x7d]),
+      ]) {
+        const result = run([command], { cwd, input });
+        assert.equal(result.status, 1, result.stderr || result.stdout);
+        assert.equal(result.stderr, "");
+        assert.equal(JSON.parse(result.stdout).status, "unconfirmed");
+        assert.doesNotMatch(result.stdout, /PRIVATE_/);
+        assert.deepEqual(readFileSync(path.join(state, "plan.json")), planBytes);
+        assert.equal(existsSync(path.join(state, "attachment.json")), false);
+      }
+      const arity = run([command, "extra"], { cwd, input: "PRIVATE_INPUT" });
+      assert.equal(arity.status, 1);
+      assert.match(arity.stdout, /^Usage:/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 }
 
 test("malformed hook JSON fails open without echoing its content", () => {

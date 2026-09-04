@@ -12,7 +12,7 @@
     "PreToolUse": [
       {
         "type": "command",
-        "matcher": "Write|Edit|create|edit|apply_patch|create_file|str_replace_editor|insert|insert_edit_into_file|replace_string_in_file|multi_replace_string_in_file",
+        "matcher": ".*",
         "bash": "plugin_root=\"${PLUGIN_ROOT:-}\"; if [ -z \"$plugin_root\" ]; then printf '%s\\n' 'Supervised Worker requires PLUGIN_ROOT; run node src/cli.mjs install for VS Code.' >&2; exit 1; fi; unset NODE_OPTIONS COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN; node \"$plugin_root/src/hook-launcher.mjs\" PreToolUse",
         "powershell": "$pluginRoot=$env:PLUGIN_ROOT; if ([string]::IsNullOrWhiteSpace($pluginRoot)) { Write-Error 'Supervised Worker requires PLUGIN_ROOT; run node src/cli.mjs install for VS Code.'; exit 1 }; $env:NODE_OPTIONS=$null; $env:COPILOT_GITHUB_TOKEN=$null; $env:GH_TOKEN=$null; $env:GITHUB_TOKEN=$null; node (Join-Path $pluginRoot 'src/hook-launcher.mjs') PreToolUse",
         "timeoutSec": 5

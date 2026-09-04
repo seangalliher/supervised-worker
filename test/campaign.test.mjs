@@ -23,6 +23,7 @@ import {
   serializeLocalCampaignReceipt,
   validateLocalCampaignReceipt,
 } from "../src/campaign.mjs";
+import { canonicalPlanHash, checkpointSession, handleHook, resumeSession, sha256, summarizePlan, summarizeRunLedger } from "../src/core.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -143,6 +144,88 @@ test("local campaign receipt deterministically summarizes a valid plan and empty
       renderLocalCampaignReceiptMarkdown(first),
       /First observed at: `null`/,
     );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint producers cross ledger, campaign export, validation, and reconciliation without leaking details", () => {
+  const cwd = temporaryWorkspace();
+  try {
+    const plan = writeCampaignPlan(cwd);
+    const state = path.join(cwd, ".supervised-worker");
+    const source = { cwd, session_id: "PRIVATE_SESSION", tool_name: "Write", tool_input: { file_path: path.join(state, "plan.json") } };
+    assert.deepEqual(handleHook(source, "PostToolUse"), {});
+    const attachmentHash = sha256(readFileSync(path.join(state, "attachment.json")));
+    const tool = { ...source, tool_name: "Read", tool_use_id: "PRIVATE_INVOCATION", tool_input: { prompt: "PRIVATE_ARGUMENT" }, tool_result: "PRIVATE_OUTPUT" };
+    assert.deepEqual(handleHook(tool, "PreToolUse"), {});
+    assert.deepEqual(handleHook(tool, "PostToolUse"), {});
+    assert.deepEqual(handleHook({ ...tool, tool_name: "Bash", tool_use_id: "PRIVATE_CHECKPOINT_INVOCATION" }, "PreToolUse"), {});
+    const checkpoint = checkpointSession(cwd, { session_id: source.session_id, planHash: canonicalPlanHash(plan), attachmentHash });
+    assert.equal(resumeSession(cwd, { session_id: "PRIVATE_SUCCESSOR", planHash: canonicalPlanHash(plan), checkpointHash: checkpoint.checkpointHash }).status, "resumed");
+    const receipt = createLocalCampaignReceipt(cwd, root);
+    assert.deepEqual(receipt.runLedger, summarizeRunLedger(cwd));
+    assert.deepEqual(validateLocalCampaignReceipt(receipt), []);
+    assert.equal(receipt.localDataStatus, "available");
+    assert.equal(receipt.plan.localCompletionShape, false);
+    assert.equal(summarizePlan(cwd).complete, false);
+    assert.equal(receipt.runLedger.recordCount, 6);
+    assert.deepEqual(receipt.runLedger.eventCounts.map(({ event }) => event), ["checkpoint_persisted", "checkpoint_resumed", "tool_completed", "tool_started"]);
+    for (const fact of Object.values(receipt.providerFacts)) {
+      assert.equal(fact.status, "unavailable");
+      assert.equal(fact.value, null);
+    }
+    for (const text of [serializeLocalCampaignReceipt(receipt), renderLocalCampaignReceiptMarkdown(receipt)]) {
+      assert.doesNotMatch(text, /PRIVATE_|SECRET|secret-item-id|operationId|invocationHash|claimGeneration/);
+      assert.equal(text.includes(checkpoint.checkpointHash), false);
+    }
+    const exported = path.join(cwd, "campaign-receipt.json");
+    writeFileSync(exported, serializeLocalCampaignReceipt(receipt));
+    const verified = inspectLocalCampaignReceiptFile(cwd, exported, root);
+    assert.equal(verified.ok, true);
+    assert.equal(verified.matchesCurrentWorkspace, true);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("new ledger variants enforce strict correlation and checkpoint binding field types", () => {
+  const cwd = temporaryWorkspace();
+  try {
+    const plan = writeCampaignPlan(cwd);
+    const state = path.join(cwd, ".supervised-worker");
+    const source = { cwd, session_id: "strict-source", tool_name: "Write", tool_use_id: "strict-hint", tool_input: { file_path: path.join(state, "plan.json") } };
+    assert.deepEqual(handleHook(source, "PreToolUse"), {});
+    assert.deepEqual(handleHook(source, "PostToolUse"), {});
+    const checkpoint = checkpointSession(cwd, { session_id: source.session_id, planHash: canonicalPlanHash(plan), attachmentHash: sha256(readFileSync(path.join(state, "attachment.json"))) });
+    assert.equal(resumeSession(cwd, { session_id: "strict-successor", planHash: canonicalPlanHash(plan), checkpointHash: checkpoint.checkpointHash }).status, "resumed");
+    const paths = ["strict-source", "strict-successor"].map((session) => path.join(state, "runs", `${sha256(session)}.jsonl`));
+    const bytes = paths.map((file) => readFileSync(file, "utf8"));
+    const records = bytes.flatMap((text) => text.trim().split("\n").map(JSON.parse));
+    for (const event of ["tool_started", "tool_completed", "checkpoint_persisted", "checkpoint_resumed"]) {
+      const original = records.find((record) => record.event === event);
+      assert.ok(original, `${event} producer must have fired`);
+      const file = path.join(state, "runs", `${original.session}.jsonl`);
+      const originalText = readFileSync(file, "utf8");
+      for (const key of ["claimGeneration", "routeGeneration", "invocationHash", "operationId", "observationId", "checkpointHash", "attachmentHash", "sourceSessionHash"].filter((key) => Object.hasOwn(original, key))) {
+        const invalid = { ...original, [key]: [original[key]] };
+        const text = originalText.replace(JSON.stringify(original), JSON.stringify(invalid));
+        assert.notEqual(text, originalText);
+        writeFileSync(file, text);
+        const exported = createLocalCampaignReceipt(cwd, root);
+        assert.equal(exported.runLedger.status, "unavailable", `${event}.${key}`);
+        assert.equal(exported.runLedger.eventCounts, null);
+        assert.equal(exported.plan.localCompletionShape, false);
+        writeFileSync(file, originalText);
+      }
+      const extra = originalText.replace(JSON.stringify(original), JSON.stringify({ ...original, private: "PRIVATE_EVENT_PAYLOAD" }));
+      writeFileSync(file, extra);
+      const exported = createLocalCampaignReceipt(cwd, root);
+      assert.equal(exported.runLedger.status, "unavailable");
+      assert.doesNotMatch(serializeLocalCampaignReceipt(exported), /PRIVATE_EVENT_PAYLOAD/);
+      writeFileSync(file, originalText);
+    }
+    assert.equal(summarizeRunLedger(cwd).status, "available");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

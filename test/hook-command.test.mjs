@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -14,7 +15,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { PLAN_WRITER_MATCHER, PLAN_WRITER_TOOLS, sha256 } from "../src/core.mjs";
+import { ALL_TOOL_MATCHER, PLAN_WRITER_MATCHER, PLAN_WRITER_TOOLS, sha256 } from "../src/core.mjs";
+import { validateHookManifest } from "../src/hook-manifest.mjs";
 import { spawnProcessTreeSync } from "./process-tree.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -33,7 +35,7 @@ const EXPECTED_HOOK_EVENTS = [
   "Stop",
 ];
 
-test("packaged PreTool matcher covers the runtime writer vocabulary", () => {
+test("packaged PreTool matcher observes all tools while permissions retain the writer vocabulary", () => {
   const expected = [
     "Write",
     "Edit",
@@ -47,8 +49,15 @@ test("packaged PreTool matcher covers the runtime writer vocabulary", () => {
     "replace_string_in_file",
     "multi_replace_string_in_file",
   ];
-  assert.equal(hooks.PreToolUse[0].matcher, PLAN_WRITER_MATCHER);
-  assert.deepEqual(hooks.PreToolUse[0].matcher.split("|"), expected);
+  assert.equal(hooks.PreToolUse[0].matcher, ALL_TOOL_MATCHER);
+  assert.deepEqual(PLAN_WRITER_MATCHER.split("|"), expected);
+  for (const toolName of [...expected, "Read", "Bash", "functions.read_file", "mcp.example.query"]) {
+    assert.match(toolName, new RegExp(`^(?:${hooks.PreToolUse[0].matcher})$`));
+  }
+  assert.deepEqual(validateHookManifest({ version: 1, hooks }), []);
+  const oldMatcher = structuredClone({ version: 1, hooks });
+  oldMatcher.hooks.PreToolUse[0].matcher = PLAN_WRITER_MATCHER;
+  assert.match(validateHookManifest(oldMatcher).join("\n"), /observe all tools/);
   assert.deepEqual(
     new Set(expected.map((name) => name.toLowerCase())),
     new Set([...PLAN_WRITER_TOOLS]),
@@ -61,7 +70,7 @@ test("packaged PreTool matcher covers the runtime writer vocabulary", () => {
 });
 
 function workspace() {
-  return mkdtempSync(path.join(os.tmpdir(), "supervised-worker-hook-"));
+  return realpathSync(mkdtempSync(path.join(os.tmpdir(), "supervised-worker-hook-")));
 }
 
 function payload(cwd, eventName, active = false) {
@@ -311,6 +320,31 @@ function exerciseInvalidStopLifecycle(invoke) {
     rmSync(cwd, { recursive: true, force: true });
     assert.equal(existsSync(cwd), false);
   }
+}
+
+for (const [shellName, invoke] of [["Bash", invokeBash], ["PowerShell", invokePowerShell]]) {
+  test(`packaged ${shellName} records an owned non-writer start and exact terminal observation`, {
+    skip: shellName === "PowerShell" && process.platform !== "win32",
+  }, () => {
+    const cwd = workspace();
+    try {
+      attach(invoke, cwd, writeActivePlan(cwd));
+      const input = { ...payload(cwd, "PreToolUse"), tool_name: "read_file", tool_use_id: "packaged-host-id", tool_input: { filePath: "PRIVATE_ARGUMENT" } };
+      const ledger = path.join(cwd, ".supervised-worker", "runs", `${sha256(input.session_id)}.jsonl`);
+      assert.equal(JSON.parse(readFileSync(path.join(cwd, ".supervised-worker", "attachment.json"))).status, "active");
+      assert.deepEqual(invoke("PreToolUse", input, cwd), {});
+      const records = readFileSync(ledger, "utf8").trim().split("\n").map(JSON.parse);
+      const starts = records.filter((record) => record.event === "tool_started");
+      assert.equal(starts.length, 1);
+      assert.equal(starts[0].toolName, "read_file");
+      assert.deepEqual(invoke("PostToolUse", { ...input, hook_event_name: "PostToolUse", tool_result: "PRIVATE_RESULT" }, cwd), {});
+      const bytes = readFileSync(ledger, "utf8");
+      assert.equal(JSON.parse(bytes.trim().split("\n").at(-1)).operationId, starts[0].operationId);
+      assert.doesNotMatch(bytes, /PRIVATE_|packaged-host-id/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 }
 
 test("packaged PowerShell SessionStart is inert without a plan", {
