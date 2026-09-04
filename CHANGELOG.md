@@ -2,6 +2,10 @@
 
 ## 0.1.2-alpha.1 - Unreleased
 
+- Changed `npm test` to run every test file and report an aggregated list of
+	failing files instead of stopping at the first one. A single early failure
+	previously hid every later test file and skipped `npm run validate`, which
+	made a partially executed run look like a passing one.
 - Added deterministic, stdout-only `local-campaign-receipt` JSON and Markdown
 	export plus safe current-workspace validation. The artifact exposes sanitized
 	plan and bounded ledger observations, fixes all provider facts to unavailable,
