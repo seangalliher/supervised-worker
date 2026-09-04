@@ -225,6 +225,58 @@ function exerciseStopLifecycle(invoke) {
   }
 }
 
+function exerciseProgressingStopLifecycle(invoke) {
+  const cwd = workspace();
+  try {
+    const planFile = writeActivePlan(cwd);
+    attach(invoke, cwd, planFile);
+    for (let index = 0; index < 8; index += 1) {
+      if (index > 0) {
+        const plan = JSON.parse(readFileSync(planFile, "utf8"));
+        plan.items = [{ id: `issue-${index}`, title: `Issue ${index}`, status: "pending" }];
+        writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
+      }
+      const output = invoke("Stop", payload(cwd, "Stop", index > 0), cwd);
+      assert.equal(output.decision, "block", `progress epoch ${index}`);
+      assert.equal(
+        existsSync(path.join(cwd, ".supervised-worker", "attachment.json")),
+        true,
+        `progress epoch ${index}`,
+      );
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    assert.equal(existsSync(cwd), false);
+  }
+}
+
+function exerciseInvalidStopLifecycle(invoke) {
+  const cwd = workspace();
+  try {
+    const planFile = writeActivePlan(cwd);
+    const plan = JSON.parse(readFileSync(planFile, "utf8"));
+    plan.unexpectedNonce = 1;
+    writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
+    attach(invoke, cwd, planFile);
+
+    const first = invoke("Stop", payload(cwd, "Stop"), cwd);
+    assert.equal(first.decision, "block");
+    plan.unexpectedNonce = 2;
+    writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
+    const second = invoke("Stop", payload(cwd, "Stop", true), cwd);
+    assert.equal(second.decision, "block");
+    assert.match(second.reason, /final bounded continuation/);
+    plan.unexpectedNonce = 3;
+    writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
+    const third = invoke("Stop", payload(cwd, "Stop", true), cwd);
+    assert.equal(third.decision, "allow");
+    assert.match(third.systemMessage, /bounded retry limit/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    assert.equal(existsSync(cwd), false);
+  }
+}
+
 test("packaged PowerShell SessionStart is inert without a plan", {
   skip: process.platform !== "win32",
 }, () => {
@@ -316,6 +368,70 @@ test("packaged PowerShell hook runs the attached Stop lifecycle", {
   skip: process.platform !== "win32",
 }, () => {
   exerciseStopLifecycle(invokePowerShell);
+});
+
+test("packaged PowerShell Stop remains attached while the plan progresses", {
+  skip: process.platform !== "win32",
+}, () => {
+  exerciseProgressingStopLifecycle(invokePowerShell);
+});
+
+test("packaged PowerShell Stop bounds changing invalid plans", {
+  skip: process.platform !== "win32",
+}, () => {
+  exerciseInvalidStopLifecycle(invokePowerShell);
+});
+
+test("packaged PowerShell Stop resets an ambiguous legacy hash mismatch", {
+  skip: process.platform !== "win32",
+}, () => {
+  const cwd = workspace();
+  try {
+    const planFile = writeActivePlan(cwd);
+    const canonicalOrderPlan = {
+      completion: null,
+      goal: "Exercise the packaged hook.",
+      items: [{ id: "one", status: "in_progress", title: "One" }],
+      mode: "active",
+      schemaVersion: 1,
+    };
+    const legacyHash = sha256(JSON.stringify(canonicalOrderPlan));
+    const reorderedPlan = {
+      schemaVersion: 1,
+      mode: "active",
+      goal: "Exercise the packaged hook.",
+      items: [{ title: "One", status: "in_progress", id: "one" }],
+      completion: null,
+    };
+    assert.notEqual(sha256(JSON.stringify(reorderedPlan)), legacyHash);
+    writeFileSync(planFile, `${JSON.stringify(reorderedPlan, null, 2)}\n`);
+    attach(invokePowerShell, cwd, planFile);
+    const runtime = path.join(
+      cwd,
+      ".supervised-worker",
+      "runtime",
+      `${sha256("22222222-2222-4222-8222-222222222222")}.json`,
+    );
+    mkdirSync(path.dirname(runtime), { recursive: true });
+    writeFileSync(runtime, JSON.stringify({
+      schemaVersion: 1,
+      progressHash: legacyHash,
+      sameProgressBlocks: 2,
+      totalBlocks: 2,
+    }));
+
+    const output = invokePowerShell("Stop", payload(cwd, "Stop", true), cwd);
+    assert.equal(output.decision, "block");
+    assert.doesNotMatch(output.reason, /final bounded continuation/);
+    const migrated = JSON.parse(readFileSync(runtime, "utf8"));
+    assert.equal(migrated.schemaVersion, 2);
+    assert.equal(migrated.sameProgressBlocks, 1);
+    assert.equal(migrated.totalBlocks, 3);
+    assert.equal(migrated.progressHash, legacyHash);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    assert.equal(existsSync(cwd), false);
+  }
 });
 
 test("packaged Bash SessionStart is inert without a plan", {

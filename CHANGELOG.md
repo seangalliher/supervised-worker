@@ -31,6 +31,11 @@
 - Added state-free runtime filtering because VS Code 1.136 drops the packaged
   `PreToolUse` matcher, and made every release path report cleanup-write failure
   without claiming ownership was released.
+- Replaced the six-Stop session ceiling with a canonical valid-plan state bound:
+	a changed valid state resets the counter, invalid plans cannot churn it, and
+	the Stop after two unchanged blocks still fails open visibly.
+- Versioned the Stop-state hash algorithm, migrated matching legacy hashes
+	without resetting counters, and made completion audit hashes canonical.
 - Switched bundled CLI role defaults to `plugin-name:agent-id` selectors, allowed
 	qualified specialized roles, and retained raw v1/v2 producer compatibility.
 - Added hash-bound reviewer model requirements and host-evidenced model receipts;

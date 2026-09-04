@@ -37,7 +37,10 @@ Supervised Worker makes those transitions explicit and inspectable.
 - A `governed-queue` skill with a durable plan and banking contract.
 - A typed, hash-bound contract for architecture, build, and review handoffs.
 - Cross-platform lifecycle hooks for recovery, metadata-only run ledgers,
-  compaction markers, plan ownership, and bounded Stop enforcement.
+  compaction markers, plan ownership, and progress-sensitive Stop enforcement.
+  After two blocked Stops at the same canonical valid-plan state, the following
+  Stop fails open visibly. A changed canonical valid-plan state resets that
+  bound; invalid plans share one stable state until repaired.
 - A runtime-dependency-free Node helper with repository validation and plan status.
 - Constitutional policy and schemas for future evidence-gated learning. The
   alpha does not yet capture outcome episodes or activate learned procedures.
@@ -331,9 +334,10 @@ plan it:
 3. then releases rather than looping forever, detaches ownership, and only
   afterward records `completion_unverified_release`.
 
-Progress changes reset the stagnant-block count, subject to a total per-session
-cap. A mechanically complete plan must contain a complete authenticated
-enumeration with zero actionable entries and at least one evidence reference.
+Canonical valid-plan state changes reset the stagnant-block count; there is no
+total per-session ceiling, and the hook does not judge whether a valid state
+change is productive. A mechanically complete plan must contain a complete
+authenticated enumeration with zero actionable entries and at least one evidence reference.
 If the final ledger write fails, release still occurs because an unavailable
 ledger must not turn a bounded reliability control into an infinite loop. The
 preceding blocked continuation is the portable visible warning.

@@ -181,6 +181,17 @@ commands. Node is an alpha prerequisite. Release builds will replace this
 dependency with signed platform executables without changing schemas or hook
 behavior.
 
+The Stop bound measures consecutive attempts against the same canonical,
+schema-valid plan state, not total session length. After two blocked Stops at
+that state, the following Stop releases visibly so a stuck agent cannot loop
+forever. Object-key insertion order is normalized, and all invalid plans share
+one stable marker until repaired. A changed canonical valid-plan state resets
+the consecutive counter; the monotonic total remains ledger metadata. Runtime
+state version 2 identifies this hash algorithm. Version 1 raw hashes are
+translated when they match the current plan representation, preserving existing
+consecutive counters across an upgrade. Completion audit hashes use the same
+canonical representation.
+
 ## State And Trust
 
 The state directory belongs to the repository being worked on, not the plugin:

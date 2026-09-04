@@ -19,7 +19,6 @@ import { WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
 export const STATE_DIRECTORY = ".supervised-worker";
 export const PLAN_FILE = "plan.json";
 export const MAX_SAME_PROGRESS_BLOCKS = 2;
-export const MAX_SESSION_BLOCKS = 6;
 export const MAX_PLAN_BYTES = 1_048_576;
 export const MAX_TOOL_TARGETS = 256;
 const MAX_GIT_POINTER_BYTES = 4_096;
@@ -70,6 +69,19 @@ const PATH_KEYS = new Set(["filePath", "file_path", "path"]);
 
 export function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 export function stateDirectory(cwd) {
@@ -1360,7 +1372,7 @@ function stopReason(planResult) {
 function validRuntimeState(value) {
   return Boolean(
     value &&
-      value.schemaVersion === 1 &&
+      [1, 2].includes(value.schemaVersion) &&
       /^[0-9a-f]{64}$/.test(value.progressHash ?? "") &&
       Number.isInteger(value.sameProgressBlocks) &&
       value.sameProgressBlocks >= 0 &&
@@ -1418,26 +1430,37 @@ function handleStop(input, cwd) {
       cwd,
       input,
       "completion_verified",
-      { planHash: sha256(JSON.stringify(planResult.plan)) },
+      { planHash: sha256(canonicalJson(planResult.plan)) },
       {},
     );
   }
 
   const filePath = runtimeStatePath(cwd, input);
-  const progressHash = sha256(JSON.stringify(planResult.plan ?? planResult.errors));
+  const progressHash = planResult.errors.length === 0
+    ? sha256(canonicalJson(planResult.plan))
+    : sha256("invalid-plan");
+  const legacyProgressHash = sha256(JSON.stringify(planResult.plan ?? planResult.errors));
   let state = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     progressHash,
     sameProgressBlocks: 0,
     totalBlocks: 0,
   };
   assertSafeStatePath(cwd, filePath);
+  const stateExists = existsSync(filePath);
   let stateWasInvalid = false;
-  if (existsSync(filePath)) {
+  if (stateExists) {
     try {
       const candidate = readJson(cwd, filePath);
-      if (validRuntimeState(candidate)) state = candidate;
-      else stateWasInvalid = true;
+      if (validRuntimeState(candidate)) {
+        state = candidate;
+        if (state.schemaVersion === 1) {
+          const legacyHashMismatch = state.progressHash !== legacyProgressHash;
+          state.schemaVersion = 2;
+          state.progressHash = progressHash;
+          if (legacyHashMismatch) state.sameProgressBlocks = 0;
+        }
+      } else stateWasInvalid = true;
     } catch {
       stateWasInvalid = true;
     }
@@ -1457,7 +1480,7 @@ function handleStop(input, cwd) {
   if (stateWasInvalid) {
     removeStateFile(cwd, filePath);
     state = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       progressHash,
       sameProgressBlocks: 0,
       totalBlocks: 0,
@@ -1468,9 +1491,8 @@ function handleStop(input, cwd) {
     state.sameProgressBlocks = 0;
   }
   if (
-    (recursiveStop && state.totalBlocks === 0) ||
-    state.sameProgressBlocks >= MAX_SAME_PROGRESS_BLOCKS ||
-    state.totalBlocks >= MAX_SESSION_BLOCKS
+    (recursiveStop && !stateExists) ||
+    state.sameProgressBlocks >= MAX_SAME_PROGRESS_BLOCKS
   ) {
     const reason =
       "Supervised Worker released the Stop gate after its bounded retry limit. The durable plan remains incomplete; do not rely on this run as queue completion.";
@@ -1491,8 +1513,7 @@ function handleStop(input, cwd) {
     totalBlocks: state.totalBlocks,
   });
   const reason =
-    state.sameProgressBlocks >= MAX_SAME_PROGRESS_BLOCKS ||
-    state.totalBlocks >= MAX_SESSION_BLOCKS
+    state.sameProgressBlocks >= MAX_SAME_PROGRESS_BLOCKS
       ? `${stopReason(planResult)} This is the final bounded continuation before an unchanged Stop is released. If no measurable progress is possible, the final response must state that queue completion remains unverified.`
       : stopReason(planResult);
   return blockOutput(input, "Stop", reason);

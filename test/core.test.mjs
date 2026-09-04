@@ -1245,6 +1245,285 @@ test("Stop hook blocks attached incomplete work twice then releases visibly", ()
   assert.equal(records.at(-1).reason, "bounded_stop_limit");
 });
 
+test("Stop hook remains attached across more than six progressing continuations", () => {
+  const cwd = workspace();
+  writePlan(cwd);
+  attachPlan(cwd);
+
+  for (let index = 0; index < 8; index += 1) {
+    if (index > 0) {
+      writePlan(cwd, {
+        items: [{ id: `issue-${index}`, title: `Issue ${index}`, status: "pending" }],
+      });
+    }
+    const output = handleHook(stopInput(cwd, index > 0), "Stop");
+    assert.equal(output.decision, "block", `progress epoch ${index}`);
+    assert.equal(
+      existsSync(path.join(cwd, ".supervised-worker", "attachment.json")),
+      true,
+      `progress epoch ${index}`,
+    );
+  }
+
+  const runtime = JSON.parse(
+    readFileSync(
+      path.join(
+        cwd,
+        ".supervised-worker",
+        "runtime",
+        `${sha256("11111111-1111-4111-8111-111111111111")}.json`,
+      ),
+      "utf8",
+    ),
+  );
+  assert.equal(runtime.schemaVersion, 2);
+  assert.equal(runtime.totalBlocks, 8);
+  assert.equal(runtime.sameProgressBlocks, 1);
+
+  const finalBlock = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(finalBlock.decision, "block");
+  assert.match(finalBlock.reason, /final bounded continuation/);
+  const released = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(released.decision, "allow");
+  assert.match(released.systemMessage, /bounded retry limit/);
+});
+
+test("Stop hook ignores valid plan object-key insertion order", () => {
+  const cwd = workspace();
+  writePlan(cwd);
+  attachPlan(cwd);
+
+  const first = handleHook(stopInput(cwd), "Stop");
+  assert.equal(first.decision, "block");
+  writeFileSync(
+    planPath(cwd),
+    `${JSON.stringify({
+      completion: null,
+      items: [{ status: "pending", title: "First issue", id: "issue-1" }],
+      goal: "Complete the selected queue.",
+      mode: "active",
+      schemaVersion: 1,
+    }, null, 2)}\n`,
+  );
+  const second = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(second.decision, "block");
+  assert.match(second.reason, /final bounded continuation/);
+  writePlan(cwd);
+  const third = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(third.decision, "allow");
+  assert.match(third.systemMessage, /bounded retry limit/);
+});
+
+test("Stop hook does not treat changing invalid plan bytes as progress", () => {
+  const cwd = workspace();
+  writePlan(cwd, { unexpectedNonce: 1 });
+  attachPlan(cwd);
+
+  const first = handleHook(stopInput(cwd), "Stop");
+  assert.equal(first.decision, "block");
+  writePlan(cwd, { unexpectedNonce: 2 });
+  const second = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(second.decision, "block");
+  assert.match(second.reason, /final bounded continuation/);
+  writePlan(cwd, { unexpectedNonce: 3 });
+  const third = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(third.decision, "allow");
+  assert.match(third.systemMessage, /bounded retry limit/);
+});
+
+test("Stop hook preserves valid legacy counters while migrating the hash", () => {
+  const cwd = workspace();
+  const plan = writePlan(cwd);
+  attachPlan(cwd);
+  const runtime = path.join(
+    cwd,
+    ".supervised-worker",
+    "runtime",
+    `${sha256("11111111-1111-4111-8111-111111111111")}.json`,
+  );
+  mkdirSync(path.dirname(runtime), { recursive: true });
+  writeFileSync(runtime, JSON.stringify({
+    schemaVersion: 1,
+    progressHash: sha256(JSON.stringify(plan)),
+    sameProgressBlocks: 1,
+    totalBlocks: 1,
+  }));
+
+  const migratedBlock = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(migratedBlock.decision, "block");
+  assert.match(migratedBlock.reason, /final bounded continuation/);
+  const migrated = JSON.parse(readFileSync(runtime, "utf8"));
+  assert.equal(migrated.schemaVersion, 2);
+  assert.notEqual(migrated.progressHash, sha256(JSON.stringify(plan)));
+  assert.equal(migrated.sameProgressBlocks, 2);
+  assert.equal(migrated.totalBlocks, 2);
+  const released = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(released.decision, "allow");
+  assert.match(released.systemMessage, /bounded retry limit/);
+});
+
+test("Stop hook preserves invalid legacy counters while migrating the hash", () => {
+  const cwd = workspace();
+  const plan = writePlan(cwd, { unexpectedNonce: 1 });
+  attachPlan(cwd);
+  const runtime = path.join(
+    cwd,
+    ".supervised-worker",
+    "runtime",
+    `${sha256("11111111-1111-4111-8111-111111111111")}.json`,
+  );
+  mkdirSync(path.dirname(runtime), { recursive: true });
+  writeFileSync(runtime, JSON.stringify({
+    schemaVersion: 1,
+    progressHash: sha256(JSON.stringify(plan)),
+    sameProgressBlocks: 1,
+    totalBlocks: 1,
+  }));
+
+  const migratedBlock = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(migratedBlock.decision, "block");
+  assert.match(migratedBlock.reason, /final bounded continuation/);
+  const migrated = JSON.parse(readFileSync(runtime, "utf8"));
+  assert.equal(migrated.schemaVersion, 2);
+  assert.equal(migrated.progressHash, sha256("invalid-plan"));
+  assert.equal(migrated.sameProgressBlocks, 2);
+  assert.equal(migrated.totalBlocks, 2);
+  const released = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(released.decision, "allow");
+  assert.match(released.systemMessage, /bounded retry limit/);
+});
+
+test("legacy hash mismatch resets counters even when it equals the canonical hash", () => {
+  const cwd = workspace();
+  const canonicalOrderPlan = {
+    completion: null,
+    goal: "Complete the selected queue.",
+    items: [{ id: "issue-1", status: "pending", title: "First issue" }],
+    mode: "active",
+    schemaVersion: 1,
+  };
+  mkdirSync(path.dirname(planPath(cwd)), { recursive: true });
+  writeFileSync(planPath(cwd), `${JSON.stringify(canonicalOrderPlan, null, 2)}\n`);
+  attachPlan(cwd);
+  const legacyHash = sha256(JSON.stringify(canonicalOrderPlan));
+
+  const reorderedPlan = {
+    schemaVersion: 1,
+    mode: "active",
+    goal: "Complete the selected queue.",
+    items: [{ title: "First issue", status: "pending", id: "issue-1" }],
+    completion: null,
+  };
+  assert.notEqual(sha256(JSON.stringify(reorderedPlan)), legacyHash);
+  writeFileSync(planPath(cwd), `${JSON.stringify(reorderedPlan, null, 2)}\n`);
+  const runtime = path.join(
+    cwd,
+    ".supervised-worker",
+    "runtime",
+    `${sha256("11111111-1111-4111-8111-111111111111")}.json`,
+  );
+  mkdirSync(path.dirname(runtime), { recursive: true });
+  writeFileSync(runtime, JSON.stringify({
+    schemaVersion: 1,
+    progressHash: legacyHash,
+    sameProgressBlocks: 2,
+    totalBlocks: 2,
+  }));
+
+  const output = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(output.decision, "block");
+  assert.doesNotMatch(output.reason, /final bounded continuation/);
+  const migrated = JSON.parse(readFileSync(runtime, "utf8"));
+  assert.equal(migrated.schemaVersion, 2);
+  assert.equal(migrated.sameProgressBlocks, 1);
+  assert.equal(migrated.totalBlocks, 3);
+  assert.equal(migrated.progressHash, legacyHash);
+});
+
+test("Stop hook treats valid item-array reordering as a changed state", () => {
+  const cwd = workspace();
+  writePlan(cwd, {
+    items: [
+      { id: "issue-1", title: "First issue", status: "pending" },
+      { id: "issue-2", title: "Second issue", status: "pending" },
+    ],
+  });
+  attachPlan(cwd);
+  assert.equal(handleHook(stopInput(cwd), "Stop").decision, "block");
+  const runtime = path.join(
+    cwd,
+    ".supervised-worker",
+    "runtime",
+    `${sha256("11111111-1111-4111-8111-111111111111")}.json`,
+  );
+  const firstHash = JSON.parse(readFileSync(runtime, "utf8")).progressHash;
+
+  writePlan(cwd, {
+    items: [
+      { id: "issue-2", title: "Second issue", status: "pending" },
+      { id: "issue-1", title: "First issue", status: "pending" },
+    ],
+  });
+  const output = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(output.decision, "block");
+  assert.doesNotMatch(output.reason, /final bounded continuation/);
+  const migrated = JSON.parse(readFileSync(runtime, "utf8"));
+  assert.notEqual(migrated.progressHash, firstHash);
+  assert.equal(migrated.sameProgressBlocks, 1);
+});
+
+test("complete plan audit hashes ignore object-key insertion order", () => {
+  const hashes = [];
+  for (const reverseKeys of [false, true]) {
+    const cwd = workspace();
+    const completion = {
+      enumeration: {
+        status: "complete",
+        source: "Authenticated provider",
+        checkedAt: "2026-09-01T00:00:00Z",
+        remainingActionable: 0,
+      },
+      evidence: [{ kind: "test", locator: "receipt.json" }],
+    };
+    const plan = reverseKeys
+      ? {
+          completion: {
+            evidence: [{ locator: "receipt.json", kind: "test" }],
+            enumeration: {
+              remainingActionable: 0,
+              checkedAt: "2026-09-01T00:00:00Z",
+              source: "Authenticated provider",
+              status: "complete",
+            },
+          },
+          items: [{ status: "banked", title: "First issue", id: "issue-1" }],
+          goal: "Complete the selected queue.",
+          mode: "complete",
+          schemaVersion: 1,
+        }
+      : {
+          schemaVersion: 1,
+          mode: "complete",
+          goal: "Complete the selected queue.",
+          items: [{ id: "issue-1", title: "First issue", status: "banked" }],
+          completion,
+        };
+    mkdirSync(path.dirname(planPath(cwd)), { recursive: true });
+    writeFileSync(planPath(cwd), `${JSON.stringify(plan, null, 2)}\n`);
+    attachPlan(cwd);
+    assert.deepEqual(handleHook(stopInput(cwd), "Stop"), {});
+    const records = readdirSync(path.join(cwd, ".supervised-worker", "runs"))
+      .flatMap((file) =>
+        readFileSync(path.join(cwd, ".supervised-worker", "runs", file), "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line)),
+      );
+    hashes.push(records.find((record) => record.event === "completion_verified").planHash);
+  }
+  assert.equal(hashes[0], hashes[1]);
+});
+
 test("Stop releases after its final warning when the ledger is unavailable", () => {
   const cwd = workspace();
   writePlan(cwd);
@@ -1474,6 +1753,38 @@ test("malformed runtime counters release a recursive Stop visibly", () => {
   const output = handleHook(stopInput(cwd, true), "Stop");
   assert.match(output.systemMessage, /runtime state was invalid/);
   assert.deepEqual(handleHook(stopInput(cwd), "Stop"), {});
+});
+
+test("first recursive Stop without runtime counters releases visibly", () => {
+  const cwd = workspace();
+  writePlan(cwd);
+  attachPlan(cwd);
+
+  const output = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(output.decision, "allow");
+  assert.match(output.systemMessage, /bounded retry limit/);
+  assert.equal(existsSync(path.join(cwd, ".supervised-worker", "attachment.json")), false);
+});
+
+test("persisted zero totalBlocks does not authorize recursive Stop release", () => {
+  const cwd = workspace();
+  writePlan(cwd);
+  attachPlan(cwd);
+  assert.equal(handleHook(stopInput(cwd), "Stop").decision, "block");
+  const runtime = path.join(
+    cwd,
+    ".supervised-worker",
+    "runtime",
+    `${sha256("11111111-1111-4111-8111-111111111111")}.json`,
+  );
+  const state = JSON.parse(readFileSync(runtime, "utf8"));
+  state.totalBlocks = 0;
+  writeFileSync(runtime, `${JSON.stringify(state, null, 2)}\n`);
+
+  const output = handleHook(stopInput(cwd, true), "Stop");
+  assert.equal(output.decision, "block");
+  assert.match(output.reason, /final bounded continuation/);
+  assert.equal(existsSync(path.join(cwd, ".supervised-worker", "attachment.json")), true);
 });
 
 test("ledger failure cannot prevent bounded Stop release", () => {
