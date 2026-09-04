@@ -22,6 +22,15 @@
 - Added generation-bound provisional claims, workspace-scoped session locks,
 	successful-write promotion, interrupted-release reconciliation, and released
 	route tombstones for detectable cross-file recovery.
+- Added a 250 ms monotonic retry deadline for overlapping same-session lifecycle hooks so
+	parallel tool completions do not emit false PostToolUse warnings; persistent
+	locks remain authoritative and are never reclaimed automatically.
+- Bound lock cleanup to UUID-named owner files and stable directory identity;
+	concurrent parent creation is validated, and ambiguous replacement state is
+	left authoritative instead of being recursively removed.
+- Moved potentially blocking Windows drive-locality checks before session lock
+	acquisition and required stable nonzero device/inode identity, preventing a
+	healthy hook from holding the lock beyond the overlap window.
 - Disabled automatic stale-lock takeover, restored missing binding markers
 	before visible failure, and restricted explicit release to canonical local
 	repository roots.

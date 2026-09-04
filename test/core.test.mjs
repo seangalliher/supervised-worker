@@ -14,7 +14,10 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
+import { once } from "node:events";
+import { performance } from "node:perf_hooks";
 import test, { afterEach } from "node:test";
+import { Worker } from "node:worker_threads";
 
 import {
   handleHook,
@@ -25,6 +28,7 @@ import {
 } from "../src/core.mjs";
 
 const temporaryWorkspaces = new Set();
+const coreUrl = new URL("../src/core.mjs", import.meta.url).href;
 
 function workspace() {
   const cwd = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-test-"));
@@ -413,6 +417,165 @@ test("a fresh session lock denies concurrent state mutation", () => {
   assert.equal(existsSync(sessionRoutePath(storageRoot, sessionId)), false);
 });
 
+test("PostToolUse waits for a brief same-session lock overlap", async () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "brief-lock-overlap-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+  const planTool = {
+    tool_name: "Write",
+    tool_input: { file_path: planPath(repositoryRoot) },
+  };
+  handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse");
+  writePlan(repositoryRoot);
+  handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse");
+
+  const lockDirectory = path.join(
+    storageRoot,
+    "supervised-worker",
+    "session-locks",
+    sha256(sessionId),
+  );
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(
+    path.join(lockDirectory, "owner.json"),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      token: "brief-owner",
+      processId: process.pid,
+      acquiredAt: new Date().toISOString(),
+    })}\n`,
+  );
+  const releaser = new Worker(
+    `
+      const { rmSync } = require("node:fs");
+      const { parentPort, workerData } = require("node:worker_threads");
+      parentPort.postMessage("ready");
+      parentPort.once("message", () => {
+        setTimeout(() => {
+          rmSync(workerData, { recursive: true, force: true });
+          parentPort.postMessage("released");
+        }, 75);
+      });
+    `,
+    { eval: true, workerData: lockDirectory },
+  );
+  await once(releaser, "message");
+  releaser.postMessage("release");
+
+  const started = performance.now();
+  const output = handleHook(
+    {
+      ...common,
+      hook_event_name: "PostToolUse",
+      tool_name: "read_file",
+      tool_input: { filePath: path.join(repositoryRoot, "README.md") },
+    },
+    "PostToolUse",
+  );
+  const elapsed = performance.now() - started;
+  assert.deepEqual(output, {});
+  assert.ok(elapsed >= 40, `transient contention premise did not fire: ${elapsed}ms`);
+  assert.ok(elapsed < 500, `transient contention exceeded its bound: ${elapsed}ms`);
+  await once(releaser, "exit");
+  assert.equal(existsSync(lockDirectory), false);
+
+  const records = readFileSync(
+    path.join(repositoryRoot, ".supervised-worker", "runs", `${sha256(sessionId)}.jsonl`),
+    "utf8",
+  )
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(records.at(-1).event, "tool_completed");
+  assert.equal(records.at(-1).toolName, "read_file");
+  assert.equal(records.at(-1).success, true);
+});
+
+test("two PostToolUse contenders serialize after one brief owner", async () => {
+  const pluginRoot = workspace();
+  const repositoryRoot = workspace();
+  const storageRoot = workspace();
+  const sessionId = "three-contender-session";
+  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+  const planTool = {
+    tool_name: "Write",
+    tool_input: { file_path: planPath(repositoryRoot) },
+  };
+  handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse");
+  writePlan(repositoryRoot);
+  handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse");
+
+  const lockDirectory = path.join(
+    storageRoot,
+    "supervised-worker",
+    "session-locks",
+    sha256(sessionId),
+  );
+  mkdirSync(lockDirectory, { recursive: true });
+  writeFileSync(path.join(lockDirectory, "brief-owner.json"), "{}\n");
+  const input = {
+    ...common,
+    hook_event_name: "PostToolUse",
+    tool_name: "read_file",
+    tool_input: { filePath: path.join(repositoryRoot, "README.md") },
+  };
+  const workerSource = `
+    const { parentPort, workerData } = require("node:worker_threads");
+    parentPort.postMessage({ type: "ready" });
+    parentPort.once("message", async () => {
+      const { performance } = await import("node:perf_hooks");
+      const { handleHook } = await import(workerData.coreUrl);
+      const started = performance.now();
+      const output = handleHook(workerData.input, "PostToolUse");
+      parentPort.postMessage({ type: "result", output, elapsed: performance.now() - started });
+      parentPort.close();
+    });
+  `;
+  const contenders = [0, 1].map(() =>
+    new Worker(workerSource, { eval: true, workerData: { coreUrl, input } }),
+  );
+  const exitPromises = contenders.map((worker) => once(worker, "exit"));
+  try {
+    await Promise.all(contenders.map(async (worker) => {
+      const [message] = await once(worker, "message");
+      assert.equal(message.type, "ready");
+    }));
+    const resultPromises = contenders.map(async (worker) => {
+      const messagePromise = once(worker, "message");
+      worker.postMessage("go");
+      const [message] = await messagePromise;
+      return message;
+    });
+    setTimeout(() => rmSync(lockDirectory, { recursive: true, force: true }), 75);
+    const results = await Promise.all(resultPromises);
+    for (const result of results) {
+      assert.equal(result.type, "result");
+      assert.deepEqual(result.output, {});
+      assert.ok(result.elapsed >= 40, `contender did not observe the brief owner: ${result.elapsed}ms`);
+      assert.ok(result.elapsed < 500, `contender exceeded the overlap bound: ${result.elapsed}ms`);
+    }
+    await Promise.all(exitPromises);
+  } finally {
+    await Promise.all(contenders.map((worker) => worker.terminate()));
+  }
+  assert.equal(existsSync(lockDirectory), false);
+  const records = readFileSync(
+    path.join(repositoryRoot, ".supervised-worker", "runs", `${sha256(sessionId)}.jsonl`),
+    "utf8",
+  )
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(
+    records.filter((record) => record.event === "tool_completed" && record.toolName === "read_file").length,
+    2,
+  );
+});
+
 test("a contended Stop cannot release active ownership without the session lock", () => {
   const pluginRoot = workspace();
   const repositoryRoot = workspace();
@@ -450,7 +613,7 @@ test("a contended Stop cannot release active ownership without the session lock"
 
   const output = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");
   assert.equal(output.decision, "allow");
-  assert.match(output.systemMessage, /could not verify its local state/);
+  assert.match(output.systemMessage, /held the session lock beyond the bounded overlap window/);
   assert.equal(readFileSync(routePath, "utf8"), routeBefore);
   assert.equal(readFileSync(attachmentPath, "utf8"), attachmentBefore);
   assert.equal(existsSync(lockDirectory), true);

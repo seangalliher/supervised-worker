@@ -244,9 +244,20 @@ generation, lifecycle status, and timestamps; it contains no transcript
 content. Targetless events accept an active or provisional route only while the
 repository's `attachment.json` carries the same session hash and generation.
 Route and attachment transitions are serialized by a workspace-scoped session
-lock. An existing lock is never replaced automatically; an abandoned lock fails
-visibly and requires operator-confirmed cleanup, while a new session uses a
-different hashed lock path. Individual writes are atomic, while the shared
+lock. Potentially blocking drive-locality checks for the hook cwd, qualified
+targets, transcript anchor, and a read-only locator-root hint complete before
+locking; authoritative route and attachment bytes are reread under the lock,
+where an uncached drive fails closed without spawning another check. A contender
+uses a 250 ms monotonic retry deadline for a concurrently completing hook,
+without deleting, renaming, or replacing its owner. A delayed scheduler wake
+may return later but cannot retry acquisition after the deadline. A lock that
+remains authoritative then fails visibly and requires operator-confirmed cleanup, while a new session uses
+a different hashed lock path. Each claim writes one UUID-named owner file and
+must remain the sole entry in the same stable, nonzero device/inode directory
+identity. Release
+removes only that token and only removes an empty directory; ambiguous or
+replacement state remains authoritative. A filesystem with no stable nonzero
+directory identity fails closed. Individual writes are atomic, while the shared
 generation and provisional state make a crash between files detectable and
 recoverable. A persistent hashed binding marker distinguishes a deleted route
 directory from a never-bound session; if an existing route loses its marker,

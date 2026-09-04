@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 const testModuleUrl = import.meta.url;
@@ -39,6 +42,13 @@ function filesystemPrelude(sessionId) {
     const originalRenameSync = fs.renameSync;
     const originalAppendFileSync = fs.appendFileSync;
     const originalRmSync = fs.rmSync;
+    const originalMkdirSync = fs.mkdirSync;
+    const originalExistsSync = fs.existsSync;
+    const originalLstatSync = fs.lstatSync;
+    const originalReadFileSync = fs.readFileSync;
+    const originalReaddirSync = fs.readdirSync;
+    const originalWriteFileSync = fs.writeFileSync;
+    const originalRmdirSync = fs.rmdirSync;
   `;
 }
 
@@ -48,6 +58,13 @@ function filesystemCleanup() {
       fs.renameSync = originalRenameSync;
       fs.appendFileSync = originalAppendFileSync;
       fs.rmSync = originalRmSync;
+      fs.mkdirSync = originalMkdirSync;
+      fs.existsSync = originalExistsSync;
+      fs.lstatSync = originalLstatSync;
+      fs.readFileSync = originalReadFileSync;
+      fs.readdirSync = originalReaddirSync;
+      fs.writeFileSync = originalWriteFileSync;
+      fs.rmdirSync = originalRmdirSync;
       syncBuiltinESMExports();
       fs.rmSync(base, { recursive: true, force: true });
     }
@@ -113,6 +130,933 @@ test("stale locks are never automatically renamed or replaced", () => {
       assert.equal(fs.existsSync(routePath), false);
     ${filesystemCleanup()}
   `);
+});
+
+test("session lock overlap bound does not depend on wall-clock progress", () => {
+  runIsolated(`
+    ${filesystemPrelude("frozen-wall-clock-lock")}
+    const originalDateNow = Date.now;
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      fs.mkdirSync(lockDirectory, { recursive: true });
+      fs.writeFileSync(
+        path.join(lockDirectory, "owner.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          token: "frozen-clock-owner",
+          processId: process.pid,
+          acquiredAt: "2026-09-04T00:00:00Z",
+        }) + "\\n",
+      );
+      Date.now = () => 0;
+      const started = performance.now();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      }, "PreToolUse");
+      const elapsed = performance.now() - started;
+      assert.equal(output.permissionDecision, "deny");
+      assert.ok(elapsed >= 200, "lock wait returned before its overlap window");
+      assert.ok(elapsed < 1_000, "lock wait depended on frozen wall time: " + elapsed);
+      assert.equal(fs.existsSync(lockDirectory), true);
+    ${filesystemCleanup()}
+    Date.now = originalDateNow;
+  `, 2_000);
+});
+
+test("concurrent cold-start parent creation is validated and reused", () => {
+  runIsolated(`
+    ${filesystemPrelude("cold-start-parent-race")}
+    try {
+      const { handleHook, planPath } = await import(${JSON.stringify(coreUrl)});
+      const locksDirectory = path.join(storageRoot, "supervised-worker", "session-locks");
+      let injected = false;
+      fs.existsSync = (filePath) => {
+        if (!injected && path.resolve(String(filePath)) === path.resolve(locksDirectory)) {
+          return false;
+        }
+        return originalExistsSync(filePath);
+      };
+      fs.mkdirSync = (directoryPath, ...args) => {
+        if (!injected && path.resolve(String(directoryPath)) === path.resolve(locksDirectory)) {
+          injected = true;
+          originalMkdirSync(directoryPath, ...args);
+          const error = new Error("concurrent parent creation");
+          error.code = "EEXIST";
+          throw error;
+        }
+        return originalMkdirSync(directoryPath, ...args);
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      }, "PreToolUse");
+      assert.deepEqual(output, {});
+      assert.equal(injected, true);
+      assert.equal(originalExistsSync(locksDirectory), true);
+      assert.equal(originalExistsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), true);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("acquisition rejects an empty replacement lock directory", () => {
+  runIsolated(`
+    ${filesystemPrelude("empty-replacement-aba")}
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      let injected = false;
+      fs.readdirSync = (directoryPath, ...args) => {
+        if (!injected && path.resolve(String(directoryPath)) === path.resolve(lockDirectory)) {
+          injected = true;
+          originalRmSync(lockDirectory, { recursive: true, force: true });
+          originalMkdirSync(lockDirectory, { recursive: true });
+        }
+        return originalReaddirSync(directoryPath, ...args);
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      }, "PreToolUse");
+      assert.equal(output.permissionDecision, "deny");
+      assert.equal(injected, true);
+      assert.deepEqual(originalReaddirSync(lockDirectory), []);
+      assert.equal(originalExistsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("acquisition rejects multiple owner entries", () => {
+  runIsolated(`
+    ${filesystemPrelude("multiple-owner-entries")}
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      let injected = false;
+      fs.writeFileSync = (filePath, ...args) => {
+        const result = originalWriteFileSync(filePath, ...args);
+        if (!injected && path.dirname(String(filePath)) === lockDirectory) {
+          injected = true;
+          originalWriteFileSync(path.join(lockDirectory, "zz-foreign-owner.json"), "{}\\n");
+        }
+        return result;
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      }, "PreToolUse");
+      assert.equal(output.permissionDecision, "deny");
+      assert.equal(injected, true);
+      const entries = originalReaddirSync(lockDirectory);
+      assert.equal(entries.length, 2);
+      assert.equal(entries.at(-1), "zz-foreign-owner.json");
+      assert.equal(originalExistsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("acquisition rejects a replacement directory containing the copied owner token", () => {
+  runIsolated(`
+    ${filesystemPrelude("copied-token-aba")}
+    let replaced = false;
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      fs.readdirSync = (directoryPath, ...args) => {
+        const entries = originalReaddirSync(directoryPath, ...args);
+        if (!replaced && path.resolve(String(directoryPath)) === path.resolve(lockDirectory)) {
+          replaced = true;
+          const tokenPath = path.join(lockDirectory, entries[0]);
+          const tokenBytes = originalReadFileSync(tokenPath);
+          originalRmSync(lockDirectory, { recursive: true, force: true });
+          originalMkdirSync(lockDirectory, { recursive: true });
+          originalWriteFileSync(tokenPath, tokenBytes);
+        }
+        return entries;
+      };
+      fs.lstatSync = (filePath, ...args) => {
+        const stats = originalLstatSync(filePath, ...args);
+        if (replaced && path.resolve(String(filePath)) === path.resolve(lockDirectory)) {
+          return new Proxy(stats, {
+            get(target, property) {
+              if (property === "ino") return target.ino + 1n;
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        }
+        return stats;
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      }, "PreToolUse");
+      assert.equal(output.permissionDecision, "deny");
+      assert.equal(replaced, true);
+      assert.equal(originalReaddirSync(lockDirectory).length, 1);
+      assert.equal(originalExistsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("acquisition fails closed when lock directory identity has zero inode", () => {
+  runIsolated(`
+    ${filesystemPrelude("zero-inode-acquire")}
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      fs.lstatSync = (filePath, ...args) => {
+        const stats = originalLstatSync(filePath, ...args);
+        if (path.resolve(String(filePath)) === path.resolve(lockDirectory)) {
+          return new Proxy(stats, {
+            get(target, property) {
+              if (property === "ino") return 0n;
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        }
+        return stats;
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      }, "PreToolUse");
+      assert.equal(output.permissionDecision, "deny");
+      assert.deepEqual(originalReaddirSync(lockDirectory), []);
+      assert.equal(originalExistsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("acquisition fails closed when lock directory identity has zero device", () => {
+  runIsolated(`
+    ${filesystemPrelude("zero-device-acquire")}
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      fs.lstatSync = (filePath, ...args) => {
+        const stats = originalLstatSync(filePath, ...args);
+        if (path.resolve(String(filePath)) === path.resolve(lockDirectory)) {
+          return new Proxy(stats, {
+            get(target, property) {
+              if (property === "dev") return 0n;
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        }
+        return stats;
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      }, "PreToolUse");
+      assert.equal(output.permissionDecision, "deny");
+      assert.deepEqual(originalReaddirSync(lockDirectory), []);
+      assert.equal(originalExistsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("partial owner write remains authoritative", () => {
+  runIsolated(`
+    ${filesystemPrelude("partial-owner-write")}
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      let injected = false;
+      fs.writeFileSync = (filePath, ...args) => {
+        if (!injected && path.dirname(String(filePath)) === lockDirectory) {
+          injected = true;
+          originalWriteFileSync(filePath, "{");
+          const error = new Error("partial owner write");
+          error.code = "EIO";
+          throw error;
+        }
+        return originalWriteFileSync(filePath, ...args);
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      }, "PreToolUse");
+      assert.equal(output.permissionDecision, "deny");
+      assert.equal(injected, true);
+      const entries = originalReaddirSync(lockDirectory);
+      assert.equal(entries.length, 1);
+      assert.equal(originalReadFileSync(path.join(lockDirectory, entries[0]), "utf8"), "{");
+      assert.equal(originalExistsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("owner creation failure cannot delete a replacement session lock", () => {
+  runIsolated(`
+    ${filesystemPrelude("owner-create-aba")}
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      const replacementPath = path.join(lockDirectory, "replacement-owner.json");
+      const replacementBytes = JSON.stringify({
+        schemaVersion: 1,
+        token: "replacement-owner",
+        processId: 42,
+        acquiredAt: "2026-09-04T00:00:00Z",
+      }) + "\\n";
+      let injected = false;
+      fs.writeFileSync = (filePath, ...args) => {
+        if (!injected && path.dirname(String(filePath)) === lockDirectory) {
+          injected = true;
+          originalRmSync(lockDirectory, { recursive: true, force: true });
+          originalMkdirSync(lockDirectory, { recursive: true });
+          originalWriteFileSync(replacementPath, replacementBytes);
+          const error = new Error("injected owner creation failure");
+          error.code = "EACCES";
+          throw error;
+        }
+        return originalWriteFileSync(filePath, ...args);
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      }, "PreToolUse");
+      assert.equal(output.permissionDecision, "deny");
+      assert.equal(injected, true);
+      assert.equal(originalReadFileSync(replacementPath, "utf8"), replacementBytes);
+      assert.deepEqual(fs.readdirSync(lockDirectory), ["replacement-owner.json"]);
+      assert.equal(fs.existsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("release cannot delete an empty replacement session lock after owner read", () => {
+  runIsolated(`
+    ${filesystemPrelude("release-read-aba")}
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const common = {
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+      };
+      const planTool = {
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      };
+      handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse");
+      fs.writeFileSync(planPath(repositoryRoot), JSON.stringify({
+        schemaVersion: 1,
+        mode: "active",
+        goal: "Exercise release ABA protection.",
+        items: [{ id: "one", title: "One", status: "pending" }],
+        completion: null,
+      }) + "\\n");
+      handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse");
+      const routePath = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-roots",
+        sha256(sessionId),
+        "route.json",
+      );
+      const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
+      const routeBefore = fs.readFileSync(routePath, "utf8");
+      const attachmentBefore = fs.readFileSync(attachmentPath, "utf8");
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      let injected = false;
+      fs.readFileSync = (filePath, ...args) => {
+        const bytes = originalReadFileSync(filePath, ...args);
+        if (!injected && path.dirname(String(filePath)) === lockDirectory) {
+          injected = true;
+          originalRmSync(lockDirectory, { recursive: true, force: true });
+          originalMkdirSync(lockDirectory, { recursive: true });
+        }
+        return bytes;
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        ...common,
+        hook_event_name: "PostToolUse",
+        tool_name: "read_file",
+        tool_input: { filePath: path.join(repositoryRoot, "README.md") },
+      }, "PostToolUse");
+      assert.deepEqual(output, {});
+      assert.equal(injected, true);
+      assert.deepEqual(fs.readdirSync(lockDirectory), []);
+      assert.equal(originalReadFileSync(routePath, "utf8"), routeBefore);
+      assert.equal(originalReadFileSync(attachmentPath, "utf8"), attachmentBefore);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("release cannot delete an empty replacement after removing its token", () => {
+  runIsolated(`
+    ${filesystemPrelude("release-remove-aba")}
+    let injected = false;
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const common = {
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+      };
+      const planTool = {
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      };
+      handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse");
+      fs.writeFileSync(planPath(repositoryRoot), JSON.stringify({
+        schemaVersion: 1,
+        mode: "active",
+        goal: "Exercise post-removal ABA protection.",
+        items: [{ id: "one", title: "One", status: "pending" }],
+        completion: null,
+      }) + "\\n");
+      handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse");
+      const routePath = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-roots",
+        sha256(sessionId),
+        "route.json",
+      );
+      const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
+      const routeBefore = fs.readFileSync(routePath, "utf8");
+      const attachmentBefore = fs.readFileSync(attachmentPath, "utf8");
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      fs.rmSync = (filePath, ...args) => {
+        const result = originalRmSync(filePath, ...args);
+        if (!injected && path.dirname(String(filePath)) === lockDirectory) {
+          injected = true;
+          originalRmdirSync(lockDirectory);
+          originalMkdirSync(lockDirectory, { recursive: true });
+        }
+        return result;
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        ...common,
+        hook_event_name: "PostToolUse",
+        tool_name: "read_file",
+        tool_input: { filePath: path.join(repositoryRoot, "README.md") },
+      }, "PostToolUse");
+      assert.deepEqual(output, {});
+      assert.equal(injected, true);
+      assert.deepEqual(originalReaddirSync(lockDirectory), []);
+      assert.equal(originalReadFileSync(routePath, "utf8"), routeBefore);
+      assert.equal(originalReadFileSync(attachmentPath, "utf8"), attachmentBefore);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("release leaves its owner token when directory identity becomes zero", () => {
+  runIsolated(`
+    ${filesystemPrelude("zero-inode-release")}
+    let zeroIdentity = false;
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const common = {
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+      };
+      const planTool = {
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      };
+      handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse");
+      fs.writeFileSync(planPath(repositoryRoot), JSON.stringify({
+        schemaVersion: 1,
+        mode: "active",
+        goal: "Exercise zero-inode release protection.",
+        items: [{ id: "one", title: "One", status: "pending" }],
+        completion: null,
+      }) + "\\n");
+      handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse");
+      const routePath = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-roots",
+        sha256(sessionId),
+        "route.json",
+      );
+      const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
+      const routeBefore = fs.readFileSync(routePath, "utf8");
+      const attachmentBefore = fs.readFileSync(attachmentPath, "utf8");
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      fs.readFileSync = (filePath, ...args) => {
+        const bytes = originalReadFileSync(filePath, ...args);
+        if (path.dirname(String(filePath)) === lockDirectory) zeroIdentity = true;
+        return bytes;
+      };
+      fs.lstatSync = (filePath, ...args) => {
+        const stats = originalLstatSync(filePath, ...args);
+        if (zeroIdentity && path.resolve(String(filePath)) === path.resolve(lockDirectory)) {
+          return new Proxy(stats, {
+            get(target, property) {
+              if (property === "ino") return 0n;
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        }
+        return stats;
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        ...common,
+        hook_event_name: "PostToolUse",
+        tool_name: "read_file",
+        tool_input: { filePath: path.join(repositoryRoot, "README.md") },
+      }, "PostToolUse");
+      assert.deepEqual(output, {});
+      assert.equal(zeroIdentity, true);
+      assert.equal(originalReaddirSync(lockDirectory).length, 1);
+      assert.equal(originalReadFileSync(routePath, "utf8"), routeBefore);
+      assert.equal(originalReadFileSync(attachmentPath, "utf8"), attachmentBefore);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("release leaves its owner token when directory device becomes zero", () => {
+  runIsolated(`
+    ${filesystemPrelude("zero-device-release")}
+    let zeroIdentity = false;
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const common = {
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+      };
+      const planTool = {
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      };
+      handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse");
+      fs.writeFileSync(planPath(repositoryRoot), JSON.stringify({
+        schemaVersion: 1,
+        mode: "active",
+        goal: "Exercise zero-device release protection.",
+        items: [{ id: "one", title: "One", status: "pending" }],
+        completion: null,
+      }) + "\\n");
+      handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse");
+      const routePath = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-roots",
+        sha256(sessionId),
+        "route.json",
+      );
+      const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
+      const routeBefore = fs.readFileSync(routePath, "utf8");
+      const attachmentBefore = fs.readFileSync(attachmentPath, "utf8");
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      fs.readFileSync = (filePath, ...args) => {
+        const bytes = originalReadFileSync(filePath, ...args);
+        if (path.dirname(String(filePath)) === lockDirectory) zeroIdentity = true;
+        return bytes;
+      };
+      fs.lstatSync = (filePath, ...args) => {
+        const stats = originalLstatSync(filePath, ...args);
+        if (zeroIdentity && path.resolve(String(filePath)) === path.resolve(lockDirectory)) {
+          return new Proxy(stats, {
+            get(target, property) {
+              if (property === "dev") return 0n;
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        }
+        return stats;
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        ...common,
+        hook_event_name: "PostToolUse",
+        tool_name: "read_file",
+        tool_input: { filePath: path.join(repositoryRoot, "README.md") },
+      }, "PostToolUse");
+      assert.deepEqual(output, {});
+      assert.equal(zeroIdentity, true);
+      assert.equal(originalReaddirSync(lockDirectory).length, 1);
+      assert.equal(originalReadFileSync(routePath, "utf8"), routeBefore);
+      assert.equal(originalReadFileSync(attachmentPath, "utf8"), attachmentBefore);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("delayed lock poll cannot acquire after the overlap deadline", () => {
+  runIsolated(`
+    ${filesystemPrelude("delayed-lock-poll")}
+    const originalAtomicsWait = Atomics.wait;
+    try {
+      const { performance } = await import("node:perf_hooks");
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      fs.mkdirSync(lockDirectory, { recursive: true });
+      fs.writeFileSync(path.join(lockDirectory, "owner.json"), "{}\\n");
+      let delayed = false;
+      Atomics.wait = () => {
+        if (!delayed) {
+          delayed = true;
+          originalRmSync(lockDirectory, { recursive: true, force: true });
+          const until = performance.now() + 300;
+          while (performance.now() < until) {}
+        }
+        return "timed-out";
+      };
+      const started = performance.now();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      }, "PreToolUse");
+      const elapsed = performance.now() - started;
+      assert.equal(output.permissionDecision, "deny");
+      assert.equal(delayed, true);
+      assert.ok(elapsed >= 300, "delayed poll premise did not fire");
+      assert.ok(elapsed < 1_000, "delayed poll exceeded its outer bound: " + elapsed);
+      assert.equal(fs.existsSync(lockDirectory), false);
+      assert.equal(fs.existsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+    } finally {
+      Atomics.wait = originalAtomicsWait;
+      fs.renameSync = originalRenameSync;
+      fs.appendFileSync = originalAppendFileSync;
+      fs.rmSync = originalRmSync;
+      fs.mkdirSync = originalMkdirSync;
+      fs.existsSync = originalExistsSync;
+      fs.lstatSync = originalLstatSync;
+      fs.readFileSync = originalReadFileSync;
+      fs.readdirSync = originalReaddirSync;
+      fs.writeFileSync = originalWriteFileSync;
+      fs.rmdirSync = originalRmdirSync;
+      syncBuiltinESMExports();
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  `, 2_000);
+});
+
+test("slow routed-drive locality check completes before session locking", {
+  skip: process.platform !== "win32",
+}, (context) => {
+  const tempDrive = path.parse(os.tmpdir()).root.toLowerCase();
+  const checkoutDrive = path.parse(fileURLToPath(coreUrl)).root.toLowerCase();
+  if (tempDrive === checkoutDrive) {
+    context.skip("routed-drive ordering requires writable temp and checkout roots on different drives");
+    return;
+  }
+  runIsolated(`
+    import { createRequire, syncBuiltinESMExports } from "node:module";
+    import { fileURLToPath } from "node:url";
+    import os from "node:os";
+    import path from "node:path";
+    const require = createRequire(${JSON.stringify(testModuleUrl)});
+    const fs = require("node:fs");
+    const childProcess = require("node:child_process");
+    const originalSpawnSync = childProcess.spawnSync;
+    const pluginRoot = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-worker-locality-plugin-"));
+    const storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-worker-locality-storage-"));
+    const sourceDriveRoot = path.parse(fileURLToPath(${JSON.stringify(coreUrl)})).root;
+    const repositoryRoot = fs.mkdtempSync(path.join(sourceDriveRoot, "supervised-worker-locality-repo-"));
+    try {
+      assert.notEqual(
+        path.parse(pluginRoot).root.toLowerCase(),
+        path.parse(repositoryRoot).root.toLowerCase(),
+        "locality-order premise requires two drives",
+      );
+      const sessionId = "slow-routed-locality";
+      const transcriptDirectory = path.join(storageRoot, "GitHub.copilot-chat", "transcripts");
+      fs.mkdirSync(transcriptDirectory, { recursive: true });
+      fs.writeFileSync(path.join(storageRoot, "workspace.json"), "{}\\n");
+      const transcriptPath = path.join(transcriptDirectory, sessionId + ".jsonl");
+      fs.writeFileSync(transcriptPath, "");
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const common = { session_id: sessionId, transcript_path: transcriptPath, cwd: pluginRoot };
+      const planTool = { tool_name: "Write", tool_input: { file_path: planPath(repositoryRoot) } };
+      assert.deepEqual(
+        handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse"),
+        {},
+      );
+      fs.writeFileSync(planPath(repositoryRoot), JSON.stringify({
+        schemaVersion: 1,
+        mode: "active",
+        goal: "Exercise routed locality ordering.",
+        items: [{ id: "one", title: "One", status: "pending" }],
+        completion: null,
+      }) + "\\n");
+      assert.deepEqual(
+        handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse"),
+        {},
+      );
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      const routedDrive = path.parse(repositoryRoot).root.slice(0, 1).toUpperCase();
+      let slowCheckObserved = false;
+      childProcess.spawnSync = (executable, args, options) => {
+        if (
+          path.basename(String(executable)).toLowerCase() === "net.exe" &&
+          args?.[0] === "use" &&
+          args?.[1]?.toUpperCase() === routedDrive + ":"
+        ) {
+          slowCheckObserved = true;
+          assert.equal(fs.existsSync(lockDirectory), false, "slow locality check ran under lock");
+          const until = performance.now() + 440;
+          while (performance.now() < until) {}
+          return { status: 2, stdout: "", stderr: "" };
+        }
+        return originalSpawnSync(executable, args, options);
+      };
+      syncBuiltinESMExports();
+      const started = performance.now();
+      const output = handleHook({
+        ...common,
+        hook_event_name: "PostToolUse",
+        tool_name: "read_file",
+        tool_input: { filePath: path.join(repositoryRoot, "README.md") },
+      }, "PostToolUse");
+      const elapsed = performance.now() - started;
+      assert.deepEqual(output, {});
+      assert.equal(slowCheckObserved, true);
+      assert.ok(elapsed >= 400, "slow locality premise did not fire: " + elapsed);
+      assert.ok(elapsed < 1_500, "routed locality preflight exceeded its bound: " + elapsed);
+      assert.equal(fs.existsSync(lockDirectory), false);
+      const records = fs.readFileSync(
+        path.join(repositoryRoot, ".supervised-worker", "runs", sha256(sessionId) + ".jsonl"),
+        "utf8",
+      ).trim().split("\\n").map((line) => JSON.parse(line));
+      assert.equal(records.at(-1).toolName, "read_file");
+      assert.equal(records.at(-1).success, true);
+    } finally {
+      childProcess.spawnSync = originalSpawnSync;
+      syncBuiltinESMExports();
+      fs.rmSync(pluginRoot, { recursive: true, force: true });
+      fs.rmSync(storageRoot, { recursive: true, force: true });
+      fs.rmSync(repositoryRoot, { recursive: true, force: true });
+    }
+  `, 5_000);
+});
+
+test("locked route reread cannot spawn an uncached drive check", {
+  skip: process.platform !== "win32",
+}, () => {
+  runIsolated(`
+    import { createRequire, syncBuiltinESMExports } from "node:module";
+    import os from "node:os";
+    import path from "node:path";
+    const require = createRequire(${JSON.stringify(testModuleUrl)});
+    const fs = require("node:fs");
+    const childProcess = require("node:child_process");
+    const originalSpawnSync = childProcess.spawnSync;
+    const originalReadFileSync = fs.readFileSync;
+    const originalWriteFileSync = fs.writeFileSync;
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-worker-route-drift-"));
+    const pluginRoot = path.join(base, "plugin");
+    const repositoryRoot = path.join(base, "repository");
+    const storageRoot = path.join(base, "storage");
+    for (const directory of [pluginRoot, repositoryRoot, storageRoot]) fs.mkdirSync(directory);
+    try {
+      const sessionId = "locked-route-reread";
+      const transcriptDirectory = path.join(storageRoot, "GitHub.copilot-chat", "transcripts");
+      fs.mkdirSync(transcriptDirectory, { recursive: true });
+      fs.writeFileSync(path.join(storageRoot, "workspace.json"), "{}\\n");
+      const transcriptPath = path.join(transcriptDirectory, sessionId + ".jsonl");
+      fs.writeFileSync(transcriptPath, "");
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const common = { session_id: sessionId, transcript_path: transcriptPath, cwd: pluginRoot };
+      const planTool = { tool_name: "Write", tool_input: { file_path: planPath(repositoryRoot) } };
+      handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse");
+      fs.writeFileSync(planPath(repositoryRoot), JSON.stringify({
+        schemaVersion: 1,
+        mode: "active",
+        goal: "Exercise locked route reread.",
+        items: [{ id: "one", title: "One", status: "pending" }],
+        completion: null,
+      }) + "\\n");
+      handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse");
+      const routePath = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-roots",
+        sha256(sessionId),
+        "route.json",
+      );
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      const ledgerPath = path.join(
+        repositoryRoot,
+        ".supervised-worker",
+        "runs",
+        sha256(sessionId) + ".jsonl",
+      );
+      const ledgerBefore = fs.readFileSync(ledgerPath, "utf8");
+      let routeReads = 0;
+      let uncachedCalls = 0;
+      let underLockCalls = 0;
+      fs.readFileSync = (filePath, ...args) => {
+        const bytes = originalReadFileSync(filePath, ...args);
+        if (path.resolve(String(filePath)) === path.resolve(routePath)) {
+          routeReads += 1;
+          if (routeReads === 1) {
+            const route = JSON.parse(Buffer.isBuffer(bytes) ? bytes.toString("utf8") : bytes);
+            route.repositoryRoot = "Q:\\\\uncached-route";
+            route.repositoryRootHash = sha256("q:\\\\uncached-route");
+            originalWriteFileSync(routePath, JSON.stringify(route, null, 2) + "\\n");
+          }
+        }
+        return bytes;
+      };
+      childProcess.spawnSync = (executable, args, options) => {
+        if (path.basename(String(executable)).toLowerCase() === "net.exe" && args?.[1] === "Q:") {
+          uncachedCalls += 1;
+          if (fs.existsSync(lockDirectory)) underLockCalls += 1;
+          return { status: 2, stdout: "", stderr: "" };
+        }
+        return originalSpawnSync(executable, args, options);
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        ...common,
+        hook_event_name: "PostToolUse",
+        tool_name: "read_file",
+        tool_input: { filePath: path.join(repositoryRoot, "README.md") },
+      }, "PostToolUse");
+      assert.match(output.systemMessage, /could not verify its local state/);
+      assert.equal(routeReads >= 2, true);
+      assert.equal(uncachedCalls, 0);
+      assert.equal(underLockCalls, 0);
+      assert.equal(fs.existsSync(lockDirectory), false);
+      assert.equal(originalReadFileSync(ledgerPath, "utf8"), ledgerBefore);
+    } finally {
+      childProcess.spawnSync = originalSpawnSync;
+      fs.readFileSync = originalReadFileSync;
+      fs.writeFileSync = originalWriteFileSync;
+      syncBuiltinESMExports();
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  `, 5_000);
 });
 
 for (const failurePoint of ["attachment-migration", "route-promotion"]) {

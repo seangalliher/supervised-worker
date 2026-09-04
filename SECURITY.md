@@ -113,6 +113,16 @@ Workspace session locks are not automatically expired or replaced. This favors
 exclusive ownership over unattended stale-lock recovery; operator-confirmed
 cleanup is required after an interrupted lock holder. Release paths report
 cleanup failure explicitly if route or attachment state cannot be updated.
+Concurrent same-session hooks use a 250 ms monotonic retry deadline before
+treating the lock as authoritative. A delayed scheduler wake may return later,
+but cannot make another acquisition attempt after that deadline. This overlap
+wait never reclaims or mutates another owner's lock. Claims use UUID-named owner files; acquisition requires exactly its own
+token, and cleanup never recursively removes the canonical session lock path.
+If directory identity or ownership becomes ambiguous, the lock is left in place
+for operator-confirmed recovery. Filesystems that cannot provide a stable,
+nonzero directory identity fail closed rather than weakening this rule.
+Potentially blocking Windows drive-locality probes run before the lock; locked
+authority checks may consume only those preflighted results.
 
 ## Reporting A Vulnerability
 

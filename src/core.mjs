@@ -4,6 +4,7 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmdirSync,
@@ -13,6 +14,7 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 
 import { WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
 
@@ -23,6 +25,11 @@ export const MAX_PLAN_BYTES = 1_048_576;
 export const MAX_TOOL_TARGETS = 256;
 const MAX_GIT_POINTER_BYTES = 4_096;
 const MAX_SESSION_LOCATOR_BYTES = 4_096;
+const SESSION_LOCK_WAIT_MS = 250;
+const SESSION_LOCK_POLL_MS = 10;
+const sessionLockWaitCell = new Int32Array(
+  new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
+);
 const WINDOWS_DRIVE_CHECK_TIMEOUT_MS = 500;
 const WINDOWS_PATH_CHECK_BUDGET_MS = 1_500;
 const MAX_WINDOWS_DRIVES_PER_OPERATION = 3;
@@ -30,6 +37,7 @@ const windowsLocalDriveCache = new Map();
 let windowsSubstDrivesCache;
 let windowsPathCheckDeadline = Number.POSITIVE_INFINITY;
 let windowsCheckedDrives = new Set();
+let windowsPathChecksMaySpawn = true;
 
 const ITEM_STATUSES = new Set(["pending", "in_progress", "banked", "parked"]);
 const PLAN_MODES = new Set(["active", "complete", "inactive"]);
@@ -132,7 +140,13 @@ function ensureSafeDirectory(cwd, directoryPath) {
   let currentPath = workspacePath;
   for (const segment of path.relative(workspacePath, safeDirectory).split(path.sep).filter(Boolean)) {
     currentPath = path.join(currentPath, segment);
-    if (!existsSync(currentPath)) mkdirSync(currentPath, { mode: 0o700 });
+    if (!existsSync(currentPath)) {
+      try {
+        mkdirSync(currentPath, { mode: 0o700 });
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+      }
+    }
     assertSafeStatePath(cwd, currentPath);
     if (!lstatSync(currentPath).isDirectory()) {
       throw new Error("state directory component is not a directory");
@@ -496,40 +510,99 @@ function acquireSessionLock(input, context = sessionLocatorContext(input)) {
   if (context === null) return null;
   const locksDirectory = path.join(context.storageRoot, "supervised-worker", "session-locks");
   const lockDirectory = path.join(locksDirectory, sessionHash(input));
-  const ownerPath = path.join(lockDirectory, "owner.json");
   ensureSafeDirectory(context.storageRoot, locksDirectory);
   const token = randomUUID();
+  const ownerPath = path.join(lockDirectory, `${token}.json`);
   assertSafeStatePath(context.storageRoot, lockDirectory);
-  try {
-    mkdirSync(lockDirectory, { mode: 0o700 });
-  } catch (error) {
-    if (error?.code === "EEXIST") throw new Error("session lifecycle lock is busy");
-    throw error;
+  const deadline = performance.now() + SESSION_LOCK_WAIT_MS;
+  let observedContention = false;
+  while (true) {
+    if (observedContention && performance.now() >= deadline) {
+      throw new Error("session lifecycle lock is busy");
+    }
+    try {
+      mkdirSync(lockDirectory, { mode: 0o700 });
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      observedContention = true;
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) throw new Error("session lifecycle lock is busy");
+      Atomics.wait(
+        sessionLockWaitCell,
+        0,
+        0,
+        Math.min(SESSION_LOCK_POLL_MS, remaining),
+      );
+    }
   }
-  try {
-    writeFileSync(
-      ownerPath,
-      `${JSON.stringify({
-        schemaVersion: 1,
-        token,
-        processId: process.pid,
-        acquiredAt: new Date().toISOString(),
-      }, null, 2)}\n`,
-      { encoding: "utf8", mode: 0o600, flag: "wx" },
-    );
-  } catch (error) {
-    rmSync(lockDirectory, { recursive: true, force: true });
-    throw error;
+  const directoryStats = lstatSync(lockDirectory, { bigint: true });
+  if (
+    !directoryStats.isDirectory() ||
+    directoryStats.isSymbolicLink() ||
+    directoryStats.dev === 0n ||
+    directoryStats.ino === 0n
+  ) {
+    throw new Error("session lifecycle lock identity is unavailable");
   }
-  return { storageRoot: context.storageRoot, lockDirectory, ownerPath, token };
+  writeFileSync(
+    ownerPath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      token,
+      processId: process.pid,
+      acquiredAt: new Date().toISOString(),
+    }, null, 2)}\n`,
+    { encoding: "utf8", mode: 0o600, flag: "wx" },
+  );
+  const currentStats = lstatSync(lockDirectory, { bigint: true });
+  const entries = readdirSync(lockDirectory);
+  const verifiedStats = lstatSync(lockDirectory, { bigint: true });
+  if (
+    !currentStats.isDirectory() ||
+    currentStats.isSymbolicLink() ||
+    currentStats.dev !== directoryStats.dev ||
+    currentStats.ino !== directoryStats.ino ||
+    !verifiedStats.isDirectory() ||
+    verifiedStats.isSymbolicLink() ||
+    verifiedStats.dev !== directoryStats.dev ||
+    verifiedStats.ino !== directoryStats.ino ||
+    entries.length !== 1 ||
+    entries[0] !== path.basename(ownerPath)
+  ) {
+    throw new Error("session lifecycle lock identity changed during acquisition");
+  }
+  return {
+    storageRoot: context.storageRoot,
+    lockDirectory,
+    ownerPath,
+    token,
+    directoryDev: directoryStats.dev,
+    directoryIno: directoryStats.ino,
+  };
+}
+
+function sessionLockIdentityMatches(lock) {
+  const stats = lstatSync(lock.lockDirectory, { bigint: true });
+  return (
+    stats.isDirectory() &&
+    !stats.isSymbolicLink() &&
+    lock.directoryDev !== 0n &&
+    lock.directoryIno !== 0n &&
+    stats.dev === lock.directoryDev &&
+    stats.ino === lock.directoryIno
+  );
 }
 
 function releaseSessionLock(lock) {
   if (lock === null) return;
   try {
+    if (!sessionLockIdentityMatches(lock)) return;
     const owner = readJson(lock.storageRoot, lock.ownerPath, MAX_SESSION_LOCATOR_BYTES);
     if (owner?.token !== lock.token || owner?.processId !== process.pid) return;
+    if (!sessionLockIdentityMatches(lock)) return;
     removeStateFile(lock.storageRoot, lock.ownerPath);
+    if (!sessionLockIdentityMatches(lock)) return;
     assertSafeStatePath(lock.storageRoot, lock.lockDirectory);
     rmdirSync(lock.lockDirectory);
   } catch {
@@ -612,6 +685,21 @@ function readSessionLocator(input) {
     throw new Error("session repository locator is invalid");
   }
   return { context, exists: true, locator };
+}
+
+function preflightSessionLocatorLocality(input) {
+  const context = sessionLocatorContext(input);
+  if (context === null) return;
+  try {
+    assertSafeStatePath(context.storageRoot, context.filePath);
+    if (!existsSync(context.filePath)) return;
+    const candidate = readJson(context.storageRoot, context.filePath, MAX_SESSION_LOCATOR_BYTES);
+    if (isFullyQualifiedRepositoryCwd(candidate?.repositoryRoot)) {
+      isLocalRepositoryPath(candidate.repositoryRoot);
+    }
+  } catch {
+    // Authoritative locator validation runs under the session lock.
+  }
 }
 
 function bindSessionLocator(input, cwd) {
@@ -974,6 +1062,7 @@ function resetWindowsPathChecks() {
   windowsSubstDrivesCache = undefined;
   windowsLocalDriveCache.clear();
   windowsCheckedDrives = new Set();
+  windowsPathChecksMaySpawn = true;
   windowsPathCheckDeadline = Date.now() + WINDOWS_PATH_CHECK_BUDGET_MS;
 }
 
@@ -1024,6 +1113,7 @@ function isLocalRepositoryPath(value) {
   const substDrives = windowsSubstDrives();
   if (substDrives === null || substDrives.has(drive)) return false;
   if (windowsLocalDriveCache.has(drive)) return windowsLocalDriveCache.get(drive);
+  if (!windowsPathChecksMaySpawn) return false;
   if (windowsCheckedDrives.size >= MAX_WINDOWS_DRIVES_PER_OPERATION) return false;
   windowsCheckedDrives.add(drive);
   const executable = windowsSystemExecutable("net.exe");
@@ -1730,9 +1820,11 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
   let sessionLock = null;
   let routedAttachmentObserved = false;
   try {
+    const preparedTargets = prepareToolTargets(input);
+    preflightSessionLocatorLocality(input);
     sessionContext = sessionLocatorContext(input);
     sessionLock = acquireSessionLock(input, sessionContext);
-    const preparedTargets = prepareToolTargets(input);
+    windowsPathChecksMaySpawn = false;
     effectiveCwd = resolveHookCwd(input, preparedTargets, cwd);
     const inspectedTargets = completeToolTargetInspection(preparedTargets, effectiveCwd);
     const attachment = attachedRecord(effectiveCwd, input);
@@ -1741,7 +1833,7 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
       throw new Error("routed attachment requires its workspace-scoped session lock");
     }
     return handleHookUnsafe(input, eventName, effectiveCwd, inspectedTargets);
-  } catch {
+  } catch (error) {
     if (eventName === "PreToolUse") {
       return preToolDecision(
         input,
@@ -1749,8 +1841,9 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
         "Supervised Worker could not verify plan ownership, so the plan write was denied.",
       );
     }
-    const reason =
-      "Supervised Worker could not verify its local state and allowed this hook to fail open visibly. Do not rely on this run as queue completion.";
+    const reason = error?.message === "session lifecycle lock is busy"
+      ? "Supervised Worker could not verify its local state because another lifecycle hook held the session lock beyond the bounded overlap window. This hook failed open visibly; do not rely on this run as queue completion."
+      : "Supervised Worker could not verify its local state and allowed this hook to fail open visibly. Do not rely on this run as queue completion.";
     return eventName === "Stop"
       ? allowStopOutput(input, reason)
       : {
