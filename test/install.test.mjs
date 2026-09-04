@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   rmSync,
   symlinkSync,
@@ -15,7 +16,6 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { performance } from "node:perf_hooks";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -24,6 +24,7 @@ import {
   defaultInstallBase,
   installLocalPlugin,
 } from "../src/install.mjs";
+import { spawnProcessTreeSync } from "./process-tree.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INSTALL_SOURCE_ENTRIES = [
@@ -41,7 +42,7 @@ const INSTALL_SOURCE_ENTRIES = [
 ];
 
 function temporaryDirectory(prefix) {
-  return mkdtempSync(path.join(os.tmpdir(), prefix));
+  return realpathSync(mkdtempSync(path.join(os.tmpdir(), prefix)));
 }
 
 function copyInstallSource(target, omittedEntry = null) {
@@ -125,6 +126,7 @@ test("installed Unix launchers use absolute trusted paths without cwd fallback",
     environment: {},
   });
   for (const [eventName, [entry]] of Object.entries(manifest.hooks)) {
+    assert.equal(entry.timeoutSec, 5, eventName);
     assert.match(entry.bash, /^unset NODE_OPTIONS COPILOT_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN;/);
     assert.match(entry.bash, /'\/usr\/bin\/node'/);
     assert.match(entry.bash, /'\/home\/example\/\.local\/share\/supervised-worker\/plugins\/release\/src\/hook-launcher\.mjs'/);
@@ -168,6 +170,9 @@ test("content-addressed Windows install runs trusted hooks outside the workspace
     );
     assert.deepEqual(namespacedHooks, rootHooks);
     const hooks = JSON.parse(rootHooks.toString("utf8")).hooks;
+    for (const [eventName, [entry]] of Object.entries(hooks)) {
+      assert.equal(entry.timeoutSec, 10, eventName);
+    }
 
     const plantedSource = path.join(untrustedWorkspace, "src");
     const plantedMarker = path.join(untrustedWorkspace, "planted-ran.txt");
@@ -198,15 +203,12 @@ test("content-addressed Windows install runs trusted hooks outside the workspace
       [process.env.ComSpec, ["/d", "/s", "/c", command]],
     ]) {
       rmSync(capturePath, { force: true });
-      const started = performance.now();
-      const execution = spawnSync(shell, args, {
+      const execution = spawnProcessTreeSync(shell, args, {
         cwd: untrustedWorkspace,
         env: environment,
         input: hookPayload(untrustedWorkspace),
-        encoding: "utf8",
-        timeout: 10_000,
+        timeout: 15_000,
       });
-      const elapsed = performance.now() - started;
       assert.equal(execution.error, undefined, execution.error?.message);
       assert.equal(execution.signal, null, execution.stderr);
       assert.equal(execution.status, 0, execution.stderr);
@@ -215,8 +217,8 @@ test("content-addressed Windows install runs trusted hooks outside the workspace
       assert.equal(existsSync(preloadMarker), false);
       assert.equal(existsSync(plantedMarker), false);
       assert.ok(
-        elapsed < hooks.SessionStart[0].timeoutSec * 1_000,
-        `${shell} exceeded the installed hook timeout: ${elapsed}ms`,
+        execution.elapsedMs < hooks.SessionStart[0].timeoutSec * 1_000,
+        `${shell} exceeded the installed hook timeout: ${execution.elapsedMs}ms`,
       );
     }
 
@@ -280,11 +282,10 @@ test("generated Windows launcher fails nonzero when Node cannot start", {
       ["pwsh", ["-NoProfile", "-NonInteractive", "-Command", command]],
       [process.env.ComSpec, ["/d", "/s", "/c", command]],
     ]) {
-      const execution = spawnSync(shell, args, {
+      const execution = spawnProcessTreeSync(shell, args, {
         cwd,
         input: hookPayload(cwd),
-        encoding: "utf8",
-        timeout: 4_000,
+        timeout: 15_000,
       });
       assert.equal(execution.error, undefined, execution.error?.message);
       assert.notEqual(execution.status, 0, `${shell}: ${execution.stderr}`);

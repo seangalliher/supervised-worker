@@ -34,9 +34,10 @@
 - Accepted canonical-equivalent host cwd spellings such as macOS `/var` and
 	`/private/var`, handled POSIX `ENOTDIR` during recoverable state setup, and
 	kept protected target aliases denied.
-- Raised the Windows installed-hook harness cutoff from four to ten seconds to
-	avoid killing nested PowerShell before completion, while independently
-	enforcing the manifest's five-second runtime budget.
+- Raised generated Windows immutable-install hook timeouts to ten seconds so
+	the nested trusted PowerShell launcher can complete on cold hosts, while
+	retaining five seconds elsewhere. Shell integration tests enforce those
+	product deadlines inside independent process-tree-aware watchdogs.
 - Disabled automatic stale-lock takeover, restored missing binding markers
 	before visible failure, and restricted explicit release to canonical local
 	repository roots.

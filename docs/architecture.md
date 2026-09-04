@@ -135,7 +135,9 @@ only after verifying that its existing parent is not a link. Repository
 authority comes from a fully qualified protected edit target, a previously
 verified session locator, or the hook payload cwd only when neither is present.
 Helper discovery and durable-state ownership therefore remain separate. Each
-command has a five-second timeout.
+checkout command has a five-second timeout. Generated immutable-install hooks
+retain that timeout on Unix; Windows installs use ten seconds so their nested
+trusted PowerShell launcher can complete on a cold host.
 Control responses carry Copilot CLI's top-level fields and VS Code's nested
 `hookSpecificOutput` fields. PascalCase `Edit` payloads are inspected for both
 ordinary path arguments and `apply_patch` headers before plan ownership is
@@ -156,7 +158,7 @@ before filesystem inspection, and larger sets fail closed before path traversal.
 On Windows, repository and transcript paths must be on local drive-letter
 storage. UNC, network-mapped, and `subst` roots are rejected before synchronous
 filesystem inspection. Locality checks share a 1.5-second aggregate deadline
-and admit at most three distinct drive letters per operation so the five-second
+and admit at most three distinct drive letters per operation so the checkout
 hook deadline remains enforceable.
 
 On Windows, Copilot CLI runs the `powershell` hook field through PowerShell 7

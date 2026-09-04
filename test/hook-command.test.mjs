@@ -15,6 +15,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { PLAN_WRITER_MATCHER, PLAN_WRITER_TOOLS, sha256 } from "../src/core.mjs";
+import { spawnProcessTreeSync } from "./process-tree.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const rootHooksBytes = readFileSync(path.join(root, "hooks.json"));
@@ -98,23 +99,37 @@ function vscodeTranscriptPath(storageRoot, sessionId) {
   return transcriptPath;
 }
 
-function invokePowerShell(eventName, input, cwd, extraEnv = {}, pluginRoot = root) {
+function assertWithinHookDeadline(shellName, eventName, elapsedMs) {
+  const deadlineMs = hooks[eventName][0].timeoutSec * 1_000;
+  assert.ok(
+    elapsedMs < deadlineMs,
+    `${shellName} ${eventName} exceeded the hook timeout: ${elapsedMs}ms`,
+  );
+}
+
+function invokePowerShell(
+  eventName,
+  input,
+  cwd,
+  extraEnv = {},
+  pluginRoot = root,
+) {
   assert.notEqual(path.resolve(cwd), root, "repository cwd must differ from plugin cwd");
   const command = hooks[eventName][0].powershell;
-  const result = spawnSync(
+  const result = spawnProcessTreeSync(
     "pwsh",
     ["-NoProfile", "-NonInteractive", "-Command", command],
     {
       cwd,
       env: { ...process.env, ...extraEnv, PLUGIN_ROOT: pluginRoot },
       input: JSON.stringify(input),
-      encoding: "utf8",
-      timeout: 4_000,
+      timeout: 10_000,
     },
   );
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.signal, null, result.stderr);
   assert.equal(result.status, 0, result.stderr);
+  assertWithinHookDeadline("PowerShell", eventName, result.elapsedMs);
   return JSON.parse(result.stdout.trim() || "{}");
 }
 
@@ -140,15 +155,27 @@ function invokeBash(
   assert.notEqual(path.resolve(cwd), root, "repository cwd must differ from plugin cwd");
   const executable = bashExecutable();
   assert.ok(executable, "Git Bash or bash is required for this test");
-  const result = spawnSync(executable, ["-lc", hooks[eventName][0].bash], {
+  const result = spawnProcessTreeSync(executable, ["-lc", hooks[eventName][0].bash], {
     cwd,
     env: { ...process.env, ...extraEnv, PLUGIN_ROOT: pluginRoot },
     input: JSON.stringify(input),
-    encoding: "utf8",
+    timeout: 10_000,
   });
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(result.signal, null, result.stderr);
   assert.equal(result.status, 0, result.stderr);
+  assertWithinHookDeadline("Bash", eventName, result.elapsedMs);
   return JSON.parse(result.stdout.trim() || "{}");
 }
+
+test("checkout harness binds elapsed checks to the manifest timeout", () => {
+  const deadlineMs = hooks.SessionStart[0].timeoutSec * 1_000;
+  assert.doesNotThrow(() => assertWithinHookDeadline("PowerShell", "SessionStart", deadlineMs - 1));
+  assert.throws(
+    () => assertWithinHookDeadline("PowerShell", "SessionStart", deadlineMs),
+    new RegExp(`PowerShell SessionStart exceeded the hook timeout: ${deadlineMs}ms`),
+  );
+});
 
 test("every checkout hook uses the trusted root and blocks Node startup injection", () => {
   const cwd = workspace();
@@ -709,18 +736,21 @@ test("checkout PowerShell hook fails closed without PLUGIN_ROOT", {
       path.join(plantedDirectory, "hook-launcher.mjs"),
       `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(markerPath)}, "ran");\n`,
     );
-    const result = spawnSync(
+    const result = spawnProcessTreeSync(
       "pwsh",
       ["-NoProfile", "-NonInteractive", "-Command", hooks.SessionStart[0].powershell],
       {
         cwd,
         env: { ...process.env, PLUGIN_ROOT: "" },
         input: JSON.stringify(payload(cwd, "SessionStart")),
-        encoding: "utf8",
-        timeout: 4_000,
+        timeout: 10_000,
       },
     );
     assert.equal(result.error, undefined, result.error?.message);
+    assert.ok(
+      result.elapsedMs < hooks.SessionStart[0].timeoutSec * 1_000,
+      `PowerShell SessionStart exceeded the hook timeout: ${result.elapsedMs}ms`,
+    );
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /requires PLUGIN_ROOT/);
     assert.equal(existsSync(markerPath), false);
