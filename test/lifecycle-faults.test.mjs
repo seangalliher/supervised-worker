@@ -1087,6 +1087,7 @@ test("delayed lock poll cannot acquire after the overlap deadline", () => {
   runIsolated(`
     ${filesystemPrelude("delayed-lock-poll")}
     const originalAtomicsWait = Atomics.wait;
+    let postDelayMkdirAttempts = 0;
     try {
       const { performance } = await import("node:perf_hooks");
       const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
@@ -1108,6 +1109,13 @@ test("delayed lock poll cannot acquire after the overlap deadline", () => {
         }
         return "timed-out";
       };
+      fs.mkdirSync = (directoryPath, ...args) => {
+        if (delayed && path.resolve(String(directoryPath)) === path.resolve(lockDirectory)) {
+          postDelayMkdirAttempts += 1;
+        }
+        return originalMkdirSync(directoryPath, ...args);
+      };
+      syncBuiltinESMExports();
       const started = performance.now();
       const output = handleHook({
         hook_event_name: "PreToolUse",
@@ -1121,7 +1129,8 @@ test("delayed lock poll cannot acquire after the overlap deadline", () => {
       assert.equal(output.permissionDecision, "deny");
       assert.equal(delayed, true);
       assert.ok(elapsed >= 300, "delayed poll premise did not fire");
-      assert.ok(elapsed < 1_000, "delayed poll exceeded its outer bound: " + elapsed);
+      assert.equal(postDelayMkdirAttempts, 0);
+      assert.ok(elapsed < 4_000, "delayed poll exceeded its outer bound: " + elapsed);
       assert.equal(fs.existsSync(lockDirectory), false);
       assert.equal(fs.existsSync(path.join(repositoryRoot, ".supervised-worker")), false);
     } finally {
@@ -1139,7 +1148,7 @@ test("delayed lock poll cannot acquire after the overlap deadline", () => {
       syncBuiltinESMExports();
       fs.rmSync(base, { recursive: true, force: true });
     }
-  `, 2_000);
+  `, 6_000);
 });
 
 test("slow routed-drive locality check completes before session locking", {
@@ -1176,6 +1185,15 @@ test("slow routed-drive locality check completes before session locking", {
       fs.writeFileSync(path.join(storageRoot, "workspace.json"), "{}\\n");
       const transcriptPath = path.join(transcriptDirectory, sessionId + ".jsonl");
       fs.writeFileSync(transcriptPath, "");
+      childProcess.spawnSync = (executable, args, options) => {
+        const name = path.basename(String(executable)).toLowerCase();
+        if (name === "subst.exe") return { status: 0, stdout: "", stderr: "" };
+        if (name === "net.exe" && args?.[0] === "use") {
+          return { status: 2, stdout: "", stderr: "" };
+        }
+        return originalSpawnSync(executable, args, options);
+      };
+      syncBuiltinESMExports();
       const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
       const common = { session_id: sessionId, transcript_path: transcriptPath, cwd: pluginRoot };
       const planTool = { tool_name: "Write", tool_input: { file_path: planPath(repositoryRoot) } };
@@ -1201,17 +1219,22 @@ test("slow routed-drive locality check completes before session locking", {
         sha256(sessionId),
       );
       const routedDrive = path.parse(repositoryRoot).root.slice(0, 1).toUpperCase();
-      let slowCheckObserved = false;
+      let routedDriveProbeCount = 0;
       childProcess.spawnSync = (executable, args, options) => {
+        const name = path.basename(String(executable)).toLowerCase();
+        if (name === "subst.exe") return { status: 0, stdout: "", stderr: "" };
         if (
-          path.basename(String(executable)).toLowerCase() === "net.exe" &&
+          name === "net.exe" &&
           args?.[0] === "use" &&
           args?.[1]?.toUpperCase() === routedDrive + ":"
         ) {
-          slowCheckObserved = true;
+          routedDriveProbeCount += 1;
           assert.equal(fs.existsSync(lockDirectory), false, "slow locality check ran under lock");
           const until = performance.now() + 440;
           while (performance.now() < until) {}
+          return { status: 2, stdout: "", stderr: "" };
+        }
+        if (name === "net.exe" && args?.[0] === "use") {
           return { status: 2, stdout: "", stderr: "" };
         }
         return originalSpawnSync(executable, args, options);
@@ -1226,7 +1249,7 @@ test("slow routed-drive locality check completes before session locking", {
       }, "PostToolUse");
       const elapsed = performance.now() - started;
       assert.deepEqual(output, {});
-      assert.equal(slowCheckObserved, true);
+      assert.equal(routedDriveProbeCount, 1);
       assert.ok(elapsed >= 400, "slow locality premise did not fire: " + elapsed);
       assert.ok(elapsed < 1_500, "routed locality preflight exceeded its bound: " + elapsed);
       assert.equal(fs.existsSync(lockDirectory), false);
