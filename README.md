@@ -1,6 +1,9 @@
 # Supervised Worker
 
-Evidence-gated queue execution for GitHub Copilot.
+Evidence-checking backlog workflows for GitHub Copilot.
+
+Give GitHub Copilot a backlog. Supervised Worker keeps the work resumable and
+makes its build and review evidence checkable before you trust "done."
 
 Supervised Worker is a small Agent Plugins 1.0 package that helps an existing
 GitHub Copilot agent finish a bounded task or authenticated issue queue without
@@ -25,6 +28,13 @@ Long-running coding sessions commonly fail between otherwise-correct steps:
 - useful lessons remain trapped in one conversation.
 
 Supervised Worker makes those transitions explicit and inspectable.
+
+The current alpha separately validates local completion-record shape and
+explicitly invoked build/review/Git-tree handoffs. Stop does not yet consume a
+verified handoff receipt. The plugin also does not independently verify GitHub
+pagination, remote pushes, CI, pull requests, reviewer identity, or issue
+closure. See [Launch Readiness](docs/launch-readiness.md) for the evidence
+required before broader claims.
 
 ## What It Provides
 
@@ -69,7 +79,7 @@ The Architect and Diff Reviewer are read-only. The Builder may edit only files
 listed in an approved contract. Companion agents never edit `.supervised-worker`,
 stage files, commit, push, close issues, or attest queue completion. Simple local
 changes may stay in the main worker; it still creates compact contract and build
-artifacts before independent review.
+artifacts before role-separated review.
 
 Delegated builds run in a clean isolated worktree. Final verification rejects
 unstaged tracked changes, non-state untracked files, staged paths omitted from
@@ -85,7 +95,7 @@ summaries under a directory derived from `sha256(itemId)`, then binds the build
 report to the contract hash and the review report to both artifact hashes plus
 the frozen staged-tree hash. The agents do not pin model names. A different
 reviewer model family is preferred when available, but context isolation is the
-required independence boundary.
+required role-separation boundary.
 
 The preferred filename ID is `seangalliher-supervised-worker`; the established
 `supervised-worker` ID remains available for backward compatibility. Copilot CLI
@@ -358,6 +368,10 @@ Learned procedures can recommend ordering and checks. They cannot grant tools,
 widen scope, waive review, satisfy evidence gates, or rewrite installed policy.
 Human corrections suspend conflicting advice. See [Architecture](docs/architecture.md)
 and [Roadmap](docs/roadmap.md).
+
+The public launch is evidence-gated too: see the measurable dogfood, provider
+verification, campaign-receipt, and demo gates in
+[Launch Readiness](docs/launch-readiness.md).
 
 ## Origins
 

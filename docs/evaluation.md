@@ -35,17 +35,13 @@ tests that would fail against the unprotected behavior.
   final verification; configured
   workflows require version 2 and an exact accepted hash.
 
-## Dogfood Threshold Before v0.1
+## Dogfood Evaluation
 
-- three complete queue campaigns;
-- at least two repositories;
-- at least 25 banked pre-existing items;
-- net backlog reduction reported honestly;
-- zero premature queue completions;
-- zero duplicate closures;
-- zero wrong-commit pushes;
-- zero unbudgeted issue creation; and
-- zero unverifiable release claims.
+Local exploratory campaigns may run before provider reconciliation ships, but
+they cannot satisfy the public-announcement gate with Worker-recorded facts.
+The sole authoritative gate, including counted-event denominators, admissible
+provenance, campaign receipt rules, and the claim ladder, lives in [Launch
+Readiness](launch-readiness.md).
 
 ## Learning Evaluation
 
