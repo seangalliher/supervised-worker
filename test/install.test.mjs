@@ -15,6 +15,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createRequire, syncBuiltinESMExports } from "node:module";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -197,13 +198,15 @@ test("content-addressed Windows install runs trusted hooks outside the workspace
       [process.env.ComSpec, ["/d", "/s", "/c", command]],
     ]) {
       rmSync(capturePath, { force: true });
+      const started = performance.now();
       const execution = spawnSync(shell, args, {
         cwd: untrustedWorkspace,
         env: environment,
         input: hookPayload(untrustedWorkspace),
         encoding: "utf8",
-        timeout: 4_000,
+        timeout: 10_000,
       });
+      const elapsed = performance.now() - started;
       assert.equal(execution.error, undefined, execution.error?.message);
       assert.equal(execution.signal, null, execution.stderr);
       assert.equal(execution.status, 0, execution.stderr);
@@ -211,6 +214,10 @@ test("content-addressed Windows install runs trusted hooks outside the workspace
       assert.equal(readFileSync(capturePath, "utf8").trim(), "clean");
       assert.equal(existsSync(preloadMarker), false);
       assert.equal(existsSync(plantedMarker), false);
+      assert.ok(
+        elapsed < hooks.SessionStart[0].timeoutSec * 1_000,
+        `${shell} exceeded the installed hook timeout: ${elapsed}ms`,
+      );
     }
 
     const reused = installLocalPlugin(root, {

@@ -120,7 +120,7 @@ function assertSafeStatePath(cwd, candidatePath) {
     try {
       stats = lstatSync(currentPath);
     } catch (error) {
-      if (error?.code === "ENOENT") break;
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") break;
       throw error;
     }
     if (stats.isSymbolicLink()) {

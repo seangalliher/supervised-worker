@@ -214,6 +214,46 @@ test("concurrent cold-start parent creation is validated and reused", () => {
   `);
 });
 
+test("POSIX ENOTDIR during state initialization still leaves a released route", () => {
+  runIsolated(`
+    ${filesystemPrelude("posix-enotdir-state")}
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const statePath = path.join(repositoryRoot, ".supervised-worker");
+      fs.writeFileSync(statePath, "not a directory\\n");
+      const targetPlanPath = planPath(repositoryRoot);
+      fs.lstatSync = (filePath, ...args) => {
+        if (path.resolve(String(filePath)) === path.resolve(targetPlanPath)) {
+          const error = new Error("not a directory");
+          error.code = "ENOTDIR";
+          throw error;
+        }
+        return originalLstatSync(filePath, ...args);
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: targetPlanPath },
+      }, "PreToolUse");
+      assert.equal(output.permissionDecision, "deny");
+      const routePath = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-roots",
+        sha256(sessionId),
+        "route.json",
+      );
+      const route = JSON.parse(fs.readFileSync(routePath, "utf8"));
+      assert.equal(route.status, "released");
+      assert.equal(fs.readFileSync(statePath, "utf8"), "not a directory\\n");
+    ${filesystemCleanup()}
+  `);
+});
+
 test("acquisition rejects an empty replacement lock directory", () => {
   runIsolated(`
     ${filesystemPrelude("empty-replacement-aba")}

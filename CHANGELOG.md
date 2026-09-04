@@ -31,6 +31,12 @@
 - Moved potentially blocking Windows drive-locality checks before session lock
 	acquisition and required stable nonzero device/inode identity, preventing a
 	healthy hook from holding the lock beyond the overlap window.
+- Accepted canonical-equivalent host cwd spellings such as macOS `/var` and
+	`/private/var`, handled POSIX `ENOTDIR` during recoverable state setup, and
+	kept protected target aliases denied.
+- Raised the Windows installed-hook harness cutoff from four to ten seconds to
+	avoid killing nested PowerShell before completion, while independently
+	enforcing the manifest's five-second runtime budget.
 - Disabled automatic stale-lock takeover, restored missing binding markers
 	before visible failure, and restricted explicit release to canonical local
 	repository roots.
