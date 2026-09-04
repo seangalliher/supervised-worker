@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -27,7 +28,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
 
 function temporaryWorkspace() {
-  return mkdtempSync(path.join(os.tmpdir(), "supervised-worker-campaign-"));
+  // macOS resolves os.tmpdir() through a symlink, which the canonical workspace guard rejects.
+  return realpathSync(mkdtempSync(path.join(os.tmpdir(), "supervised-worker-campaign-")));
 }
 
 function writeCampaignPlan(cwd, overrides = {}) {
