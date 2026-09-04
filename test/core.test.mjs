@@ -6,6 +6,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -178,6 +179,23 @@ test("PreToolUse claims the first plan writer before the file exists", () => {
   assert.equal(stop.hookSpecificOutput.decision, "block");
 });
 
+test("PreToolUse accepts a host cwd alias of the canonical target repository", () => {
+  const repositoryRoot = workspace();
+  const aliasParent = workspace();
+  const alias = path.join(aliasParent, "repository-alias");
+  symlinkSync(repositoryRoot, alias, process.platform === "win32" ? "junction" : "dir");
+  const input = {
+    hook_event_name: "PreToolUse",
+    session_id: "host-cwd-alias",
+    cwd: alias,
+    tool_name: "Write",
+    tool_input: { file_path: planPath(repositoryRoot) },
+  };
+
+  assert.deepEqual(handleHook(input, "PreToolUse"), {});
+  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), true);
+});
+
 test("VS Code plugin cwd routes targetless lifecycle hooks to the attached repository", () => {
   const pluginRoot = workspace();
   const repositoryRoot = workspace();
@@ -204,7 +222,7 @@ test("VS Code plugin cwd routes targetless lifecycle hooks to the attached repos
   const locatorPath = sessionRoutePath(storageRoot, sessionId);
   const locatorText = readFileSync(locatorPath, "utf8");
   const locator = JSON.parse(locatorText);
-  assert.equal(locator.repositoryRoot, repositoryRoot);
+  assert.equal(locator.repositoryRoot, realpathSync(repositoryRoot));
   assert.equal(locator.sessionHash, sha256(sessionId));
   assert.equal(locator.status, "provisional");
   assert.doesNotMatch(locatorText, new RegExp(sessionId));

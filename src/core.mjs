@@ -705,7 +705,8 @@ function preflightSessionLocatorLocality(input) {
 function bindSessionLocator(input, cwd) {
   const context = sessionLocatorContext(input);
   if (context === null) {
-    if (!pathEquals(cwd, input?.cwd ?? cwd)) {
+    const inputCwd = input?.cwd ?? cwd;
+    if (!pathEquals(cwd, inputCwd) && !pathsShareFilesystemIdentity(cwd, inputCwd)) {
       throw new Error("cross-directory hook routing requires a valid transcript anchor");
     }
     return { bound: false, created: false, conflict: false };
@@ -1014,12 +1015,6 @@ function resolveHookCwd(input, targets, fallbackCwd) {
     throw new Error("one hook invocation targets protected paths in multiple repositories");
   }
   if (targetRoots.length === 1) {
-    if (
-      !pathEquals(targetRoots[0], fallbackCwd) &&
-      pathsShareFilesystemIdentity(targetRoots[0], fallbackCwd)
-    ) {
-      throw new Error("protected target repository is a filesystem alias of the hook cwd");
-    }
     return targetRoots[0];
   }
   return attachedSessionRoot(input) ?? fallbackCwd;
