@@ -183,6 +183,32 @@ commands. Node is an alpha prerequisite. Release builds will replace this
 dependency with signed platform executables without changing schemas or hook
 behavior.
 
+The same helper exposes a read-only `local-campaign-receipt` v1 surface. Export
+reads the canonical current workspace and trusted plugin root, writes only to
+stdout, and has no clock, random, host, or network input. The checkout source
+identity reuses the installer's sorted, length-framed
+`supervised-worker-file-tree-v1` hash. Installed execution validates the
+format-v5 immutable install record and installed tree before returning the
+recorded original source hash. Completion audit records and campaign export
+likewise share one canonical plan hash implementation.
+
+Plan observations reveal only a domain-separated hash of each item ID and its
+status. Ledger observation is closed to the exact eight `appendLedger` event
+variants, rejects unsafe or unstable files, and is bounded by file count, file
+bytes, aggregate bytes, and record bytes. Only event names, counts, UTC bounds,
+and a length-framed ledger hash leave the parser; record details and session
+hashes do not. An existing empty `runs` directory is observed as an empty
+ledger. A missing directory or invalid observation remains unavailable with
+null dependent metrics.
+
+Every repository, queue, remote, pull-request, CI, reviewer, and closure field
+is fixed to unavailable with a null value and explicit reason. Markdown is
+derived only from a runtime-validated local receipt and visibly states
+`Local-only, not Provider-Verified Completion`. Saved-receipt validation is
+bounded to a single-link regular file inside the current workspace and compares
+canonical receipt values with newly observed local state. This surface neither
+writes durable state nor participates in completion or Stop.
+
 The Stop bound measures consecutive attempts against the same canonical,
 schema-valid plan state, not total session length. After two blocked Stops at
 that state, the following Stop releases visibly so a stuck agent cannot loop

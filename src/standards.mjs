@@ -5,6 +5,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { parseDocument } from "yaml";
 
+import { validateLocalCampaignReceipt } from "./campaign.mjs";
 import { validateHandoffValue } from "./handoff.mjs";
 import { validateWorkflowValue } from "./workflow.mjs";
 
@@ -31,6 +32,7 @@ const SKILL_KEYS = new Set([
 ]);
 const SCHEMA_FILES = [
   "episode.schema.json",
+  "local-campaign-receipt.schema.json",
   "model-receipt.schema.json",
   "plan.schema.json",
   "policy-proposal.schema.json",
@@ -46,6 +48,7 @@ const EXAMPLE_SCHEMAS = [
   ["examples/handoff.build-contract.json", "role-handoff.schema.json"],
   ["examples/handoff.build-report.json", "role-handoff.schema.json"],
   ["examples/handoff.review-report.json", "role-handoff.schema.json"],
+  ["examples/local-campaign-receipt.json", "local-campaign-receipt.schema.json"],
 ];
 
 function isRecord(value) {
@@ -315,6 +318,54 @@ function validateRoleHandoffGates(validate, root, errors) {
   }
 }
 
+function validateLocalCampaignGates(validate, root, errors) {
+  const baseline = readJson(root, "examples/local-campaign-receipt.json");
+  const reject = (name, mutate, schemaMustReject = true) => {
+    const value = structuredClone(baseline);
+    mutate(value);
+    if (schemaMustReject && validate(value)) {
+      errors.push(`local campaign receipt schema accepted unsafe state: ${name}`);
+    }
+    if (validateLocalCampaignReceipt(value).length === 0) {
+      errors.push(`local campaign receipt runtime accepted unsafe state: ${name}`);
+    }
+  };
+  reject("non-null provider fact", (value) => {
+    value.providerFacts.ci.value = { conclusion: "success" };
+  });
+  reject("unavailable plan carrying zero metrics", (value) => {
+    value.localDataStatus = "partial";
+    value.plan.status = "unavailable";
+    value.plan.reason = "plan-invalid";
+    value.plan.hash = null;
+    value.plan.mode = null;
+    value.plan.localCompletionShape = null;
+    value.plan.items = null;
+  });
+  reject("inconsistent localDataStatus", (value) => {
+    value.localDataStatus = "partial";
+  });
+  reject("unsorted item hashes", (value) => {
+    value.plan.items.reverse();
+  }, false);
+  reject("duplicate item hashes", (value) => {
+    value.plan.items[1].itemHash = value.plan.items[0].itemHash;
+  }, false);
+  reject("event totals differ from recordCount", (value) => {
+    value.runLedger.eventCounts[0].count += 1;
+  }, false);
+  const wrapped = [
+    ["plugin.version", (value) => { value.plugin.version = [value.plugin.version]; }],
+    ["plugin.sourceHash", (value) => { value.plugin.sourceHash = [value.plugin.sourceHash]; }],
+    ["plan.hash", (value) => { value.plan.hash = [value.plan.hash]; }],
+    ["plan item hash", (value) => { value.plan.items[0].itemHash = [value.plan.items[0].itemHash]; }],
+    ["runLedger.hash", (value) => { value.runLedger.hash = [value.runLedger.hash]; }],
+  ];
+  for (const [field, mutate] of wrapped) {
+    reject(`non-string ${field}`, mutate);
+  }
+}
+
 export function validatePublishedSchemas(root) {
   const errors = [];
   const discovered = readdirSync(path.join(root, "schemas"))
@@ -363,6 +414,9 @@ export function validatePublishedSchemas(root) {
       } else if (schemaFile === "workflow.schema.json") {
         const runtimeErrors = validateWorkflowValue(example);
         errors.push(...runtimeErrors.map((error) => `${examplePath} runtime: ${error}`));
+      } else if (schemaFile === "local-campaign-receipt.schema.json") {
+        const runtimeErrors = validateLocalCampaignReceipt(example);
+        errors.push(...runtimeErrors.map((error) => `${examplePath} runtime: ${error}`));
       }
     } catch (error) {
       errors.push(`${examplePath} could not be validated: ${error.message}`);
@@ -382,6 +436,10 @@ export function validatePublishedSchemas(root) {
   const roleHandoffValidate = roleHandoffSchemaId ? ajv.getSchema(roleHandoffSchemaId) : null;
   if (roleHandoffValidate) validateRoleHandoffGates(roleHandoffValidate, root, errors);
   else errors.push("role-handoff safety gates could not be exercised");
+  const campaignSchemaId = schemas.get("local-campaign-receipt.schema.json");
+  const campaignValidate = campaignSchemaId ? ajv.getSchema(campaignSchemaId) : null;
+  if (campaignValidate) validateLocalCampaignGates(campaignValidate, root, errors);
+  else errors.push("local campaign receipt safety gates could not be exercised");
   return errors;
 }
 

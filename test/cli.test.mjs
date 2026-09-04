@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -32,6 +33,22 @@ function run(args, options = {}) {
     encoding: "utf8",
     timeout: options.timeout,
   });
+}
+
+function writeCampaignState(cwd) {
+  const state = path.join(cwd, ".supervised-worker");
+  mkdirSync(path.join(state, "runs"), { recursive: true });
+  writeFileSync(
+    path.join(state, "plan.json"),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      mode: "active",
+      goal: "SECRET CLI GOAL",
+      items: [{ id: "secret-cli-id", title: "SECRET CLI TITLE", status: "pending" }],
+      completion: null,
+    }, null, 2)}\n`,
+  );
+  return state;
 }
 
 test("malformed hook JSON fails open without echoing its content", () => {
@@ -315,6 +332,128 @@ test("explicit help succeeds while malformed commands fail", () => {
     const result = run(args);
     assert.equal(result.status, 1, `${args.join(" ")}: ${result.stderr || result.stdout}`);
     assert.match(result.stdout, /^Usage:/);
+  }
+});
+
+test("campaign export supports only deterministic JSON and Markdown stdout forms", () => {
+  const cwd = workspace();
+  try {
+    const state = writeCampaignState(cwd);
+    const before = readdirSync(state).sort();
+    const defaultJson = run(["campaign", "export"], { cwd });
+    const explicitJson = run(["campaign", "export", "--format", "json"], { cwd });
+    const markdown = run(["campaign", "export", "--format", "markdown"], { cwd });
+
+    assert.equal(defaultJson.status, 0, defaultJson.stderr);
+    assert.equal(explicitJson.status, 0, explicitJson.stderr);
+    assert.equal(markdown.status, 0, markdown.stderr);
+    assert.equal(defaultJson.stderr, "");
+    assert.equal(explicitJson.stderr, "");
+    assert.equal(markdown.stderr, "");
+    assert.equal(defaultJson.stdout, explicitJson.stdout);
+    const receipt = JSON.parse(defaultJson.stdout);
+    assert.equal(receipt.kind, "local-campaign-receipt");
+    assert.equal(receipt.localDataStatus, "available");
+    assert.equal(receipt.providerFacts.ci.status, "unavailable");
+    assert.equal(receipt.providerFacts.ci.value, null);
+    assert.doesNotMatch(defaultJson.stdout, /SECRET CLI|secret-cli-id/);
+    assert.match(markdown.stdout, /^# Local Campaign Receipt/);
+    assert.match(markdown.stdout, /Local-only, not Provider-Verified Completion/);
+    assert.doesNotMatch(markdown.stdout, /SECRET CLI|secret-cli-id/);
+    assert.deepEqual(readdirSync(state).sort(), before);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("campaign export renders partial receipts and exits one without creating state", () => {
+  const cwd = workspace();
+  try {
+    const json = run(["campaign", "export"], { cwd });
+    assert.equal(json.status, 1, json.stderr);
+    assert.equal(json.stderr, "");
+    const receipt = JSON.parse(json.stdout);
+    assert.equal(receipt.localDataStatus, "partial");
+    assert.equal(receipt.plan.reason, "plan-absent");
+    assert.equal(receipt.plan.counts, null);
+    assert.equal(receipt.runLedger.reason, "run-ledger-absent");
+    assert.equal(receipt.runLedger.recordCount, null);
+    assert.equal(existsSync(path.join(cwd, ".supervised-worker")), false);
+
+    const markdown = run(["campaign", "export", "--format", "markdown"], { cwd });
+    assert.equal(markdown.status, 1, markdown.stderr);
+    assert.match(markdown.stdout, /Local-only, not Provider-Verified Completion/);
+    assert.match(markdown.stdout, /Unavailable/);
+    assert.equal(existsSync(path.join(cwd, ".supervised-worker")), false);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("campaign validate reports exact current reconciliation without echoing paths", () => {
+  const cwd = workspace();
+  try {
+    writeCampaignState(cwd);
+    const exported = run(["campaign", "export"], { cwd });
+    assert.equal(exported.status, 0, exported.stderr);
+    const receiptPath = path.join(cwd, "TOPSECRET-receipt.json");
+    writeFileSync(receiptPath, exported.stdout);
+
+    const valid = run(["campaign", "validate", "TOPSECRET-receipt.json"], { cwd });
+    assert.equal(valid.status, 0, valid.stderr);
+    const report = JSON.parse(valid.stdout);
+    assert.deepEqual(Object.keys(report), ["ok", "receiptHash", "matchesCurrentWorkspace", "errors"]);
+    assert.equal(report.ok, true);
+    assert.equal(report.matchesCurrentWorkspace, true);
+    assert.match(report.receiptHash, /^[0-9a-f]{64}$/);
+    assert.deepEqual(report.errors, []);
+    assert.doesNotMatch(valid.stdout, /TOPSECRET/);
+
+    writeCampaignState(cwd);
+    const planPath = path.join(cwd, ".supervised-worker", "plan.json");
+    const plan = JSON.parse(readFileSync(planPath, "utf8"));
+    plan.goal = "CHANGED SECRET GOAL";
+    writeFileSync(planPath, `${JSON.stringify(plan, null, 2)}\n`);
+    const stale = run(["campaign", "validate", receiptPath], { cwd });
+    assert.equal(stale.status, 1, stale.stderr);
+    assert.equal(JSON.parse(stale.stdout).matchesCurrentWorkspace, false);
+    assert.doesNotMatch(stale.stdout, /TOPSECRET|CHANGED SECRET/);
+
+    const missing = run(["campaign", "validate", "TOPSECRET-missing.json"], { cwd });
+    assert.equal(missing.status, 1, missing.stderr);
+    assert.deepEqual(
+      JSON.parse(missing.stdout).errors,
+      ["Receipt could not be inspected safely."],
+    );
+    assert.doesNotMatch(missing.stdout, /TOPSECRET/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("malformed campaign arities print usage before touching workspace state", () => {
+  const cwd = workspace();
+  try {
+    const sentinel = path.join(cwd, ".supervised-worker");
+    writeFileSync(sentinel, "SENTINEL\n");
+    for (const args of [
+      ["campaign"],
+      ["campaign", "export", "extra"],
+      ["campaign", "export", "--format"],
+      ["campaign", "export", "--format", "yaml"],
+      ["campaign", "export", "--format", "json", "extra"],
+      ["campaign", "validate"],
+      ["campaign", "validate", "one.json", "two.json"],
+      ["campaign", "unknown"],
+    ]) {
+      const result = run(args, { cwd });
+      assert.equal(result.status, 1, `${args.join(" ")}: ${result.stderr || result.stdout}`);
+      assert.equal(result.stderr, "");
+      assert.match(result.stdout, /^Usage:/);
+      assert.equal(readFileSync(sentinel, "utf8"), "SENTINEL\n");
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });
 

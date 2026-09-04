@@ -14,6 +14,7 @@
 - Documented complete-enumeration and queue-completion contract
 - Bounded Stop gate with visible fail-open
 - Metadata-only run ledger
+- Deterministic local campaign receipt export and current-workspace validation
 - Repository workflow and memory schemas
 - Package doctor and public cross-platform CI definition
 - One-command immutable local install
@@ -28,7 +29,10 @@ The alpha in this repository implements the first executable slice and the
 role-separated companion pack. Persisted responses and their staged candidate
 are verified by the helper; the host does not yet reject malformed subagent JSON
 before it reaches the Worker. The alpha also does not yet verify GitHub
-pagination, commit pushes, or external gate receipts itself.
+pagination, commit pushes, or external gate receipts itself. Its
+`local-campaign-receipt` reports sanitized local plan and ledger observations
+with provider facts fixed to unavailable; it is not Provider-Verified Completion
+and has no completion or Stop authority.
 
 ## v0.2 - Provider-Verified Completion
 
@@ -39,7 +43,7 @@ pagination, commit pushes, or external gate receipts itself.
 - Host-attested append-only operation witness
 - Host-attested reviewer identity and profile provenance
 - Remote branch and pushed-commit reconciliation
-- Campaign receipt export with verified-versus-recorded provenance
+- Provider campaign evidence/outcome receipt export with verified-versus-recorded provenance
 - Precommitted evaluation and complete admission/event inventories
 - Campaign attribution and public/private receipt projections
 - Receipt-to-completion and Stop integration

@@ -5,6 +5,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  createLocalCampaignReceipt,
+  inspectLocalCampaignReceiptFile,
+  renderLocalCampaignReceiptMarkdown,
+  serializeLocalCampaignReceipt,
+} from "./campaign.mjs";
+import {
   handleHook,
   PLAN_WRITER_MATCHER,
   releaseAttachment,
@@ -109,8 +115,10 @@ async function validateRepository() {
     "examples/handoff.build-contract.json",
     "examples/handoff.build-report.json",
     "examples/handoff.review-report.json",
+    "examples/local-campaign-receipt.json",
     "policy/constitution.json",
     "schemas/episode.schema.json",
+    "schemas/local-campaign-receipt.schema.json",
     "schemas/model-receipt.schema.json",
     "schemas/plan.schema.json",
     "schemas/policy-proposal.schema.json",
@@ -119,6 +127,7 @@ async function validateRepository() {
     "schemas/workflow.schema.json",
     "skills/governed-queue/SKILL.md",
     "src/core.mjs",
+    "src/campaign.mjs",
     "src/cli.mjs",
     "src/handoff.mjs",
     "src/hook-manifest.mjs",
@@ -319,7 +328,7 @@ async function main() {
   const [command = "help", argument, ...argumentsAfter] = process.argv.slice(2);
   const hasNoArguments = argument === undefined && argumentsAfter.length === 0;
   const usage =
-    "Usage: node src/cli.mjs <validate|doctor|install|status|release|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
+    "Usage: node src/cli.mjs <validate|doctor|install|status|release|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
   if (command === "help" && hasNoArguments) {
     process.stdout.write(usage);
     return;
@@ -365,6 +374,49 @@ async function main() {
       return;
     }
     process.stdout.write(`${JSON.stringify(handleHook(input, argument, input.cwd))}\n`);
+    return;
+  }
+  if (command === "campaign") {
+    const exportFormat = argument === "export" && argumentsAfter.length === 0
+      ? "json"
+      : argument === "export" &&
+          argumentsAfter.length === 2 &&
+          argumentsAfter[0] === "--format" &&
+          ["json", "markdown"].includes(argumentsAfter[1])
+        ? argumentsAfter[1]
+        : null;
+    if (exportFormat !== null) {
+      try {
+        const receipt = createLocalCampaignReceipt(process.cwd(), root);
+        process.stdout.write(
+          exportFormat === "markdown"
+            ? renderLocalCampaignReceiptMarkdown(receipt)
+            : serializeLocalCampaignReceipt(receipt),
+        );
+        if (receipt.localDataStatus !== "available") process.exitCode = 1;
+      } catch {
+        process.stdout.write(
+          `${JSON.stringify({
+            ok: false,
+            error: "Local campaign receipt could not be created safely.",
+          }, null, 2)}\n`,
+        );
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (argument === "validate" && argumentsAfter.length === 1) {
+      const report = inspectLocalCampaignReceiptFile(
+        process.cwd(),
+        argumentsAfter[0],
+        root,
+      );
+      process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      if (!report.ok) process.exitCode = 1;
+      return;
+    }
+    process.stdout.write(usage);
+    process.exitCode = 1;
     return;
   }
   if (command === "install" && hasNoArguments) {

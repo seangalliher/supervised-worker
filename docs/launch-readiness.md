@@ -262,16 +262,41 @@ new defects that remain open at the ending snapshot, and no ambient changes,
 reports `20 attributed closures`, `3 attributed creations`,
 `repositoryNetOpenChange = -17`, and `repositoryNetOpenReduction = 17`.
 
+## Local Campaign Receipt
+
+The v0.1 alpha implements a separate `local-campaign-receipt` v1 for local
+inspection and screenshots. `campaign export` emits deterministic JSON to
+stdout by default; `--format markdown` renders only the validated JSON facts,
+and `campaign validate <path>` safely reconciles a saved JSON receipt against
+the current workspace. A partial local observation is still rendered but exits
+`1` and carries null dependent metrics rather than false zeros.
+
+This artifact verifies only local plugin identity, plan structure and canonical
+hash, hashed item statuses, and the bounded metadata-only run ledger. It omits
+raw plan and execution content. Repository, queue, remote, pull-request, CI,
+reviewer, and closure facts are schema-fixed to unavailable with null values and
+explicit reasons. The Markdown warning is **Local-only, not Provider-Verified
+Completion**.
+
+The local receipt is not a partial instance of the provider receipt family
+below. It does not implement provider reconciliation, a provider canonicalizer,
+external verification, public/private projections, sealing, completion
+acceptance, or Stop integration, and it cannot satisfy any launch criterion in
+this document that requires provider or host authority.
+
 ## Campaign Receipt
 
-The highest-leverage missing product surface is a deterministic, versioned
-campaign receipt. A private canonical JSON receipt is authoritative. A public
-JSON projection is derived from an explicit allowlist and binds the private
-receipt hash. Markdown or static HTML renders only that public JSON.
+The highest-leverage missing provider product surface is a deterministic,
+versioned campaign evidence/outcome receipt family. A private canonical JSON
+receipt is authoritative. A public JSON projection is derived from an explicit
+allowlist and binds the private receipt hash. Markdown or static HTML renders
+only that public JSON.
 
-These are normative implementation requirements, not a claim that the schema
-exists today. Provider-Verified Completion remains unavailable until a checked-in
-schema, canonicalizer, verifier, and negative tests enforce them.
+These are normative implementation requirements, not a claim that either
+provider schema exists today. The checked-in local campaign receipt schema is a
+distinct artifact and does not satisfy them. Provider-Verified Completion
+remains unavailable until checked-in provider schemas, a provider canonicalizer,
+an external verifier, sealing, and negative tests enforce the full family.
 
 The private receipt family has two immutable phases. The external verifier first
 seals a **campaign evidence receipt** containing everything available before a

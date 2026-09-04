@@ -1,0 +1,348 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/seangalliher/supervised-worker/schemas/local-campaign-receipt.schema.json",
+  "title": "Supervised Worker Local Campaign Receipt",
+  "description": "A deterministic local-alpha observation. It is not a provider campaign receipt or Provider-Verified Completion.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "scope",
+    "localDataStatus",
+    "plugin",
+    "plan",
+    "runLedger",
+    "providerFacts"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "local-campaign-receipt" },
+    "scope": { "const": "current-workspace-local-alpha" },
+    "localDataStatus": { "enum": ["available", "partial"] },
+    "plugin": { "$ref": "#/$defs/plugin" },
+    "plan": { "$ref": "#/$defs/plan" },
+    "runLedger": { "$ref": "#/$defs/runLedger" },
+    "providerFacts": { "$ref": "#/$defs/providerFacts" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "localDataStatus": { "const": "available" } },
+        "required": ["localDataStatus"]
+      },
+      "then": {
+        "properties": {
+          "plan": { "$ref": "#/$defs/availablePlan" },
+          "runLedger": { "$ref": "#/$defs/availableRunLedger" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "localDataStatus": { "const": "partial" } },
+        "required": ["localDataStatus"]
+      },
+      "then": {
+        "anyOf": [
+          { "properties": { "plan": { "$ref": "#/$defs/unavailablePlan" } } },
+          { "properties": { "runLedger": { "$ref": "#/$defs/unavailableRunLedger" } } }
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "sourceHash", "sourceKind", "provenance"],
+      "properties": {
+        "version": {
+          "type": "string",
+          "pattern": "^(?!.*\\.\\.)\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$"
+        },
+        "sourceHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "sourceKind": { "enum": ["checkout-tree", "immutable-install-record"] },
+        "provenance": { "const": "plugin-verified-local" }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pending", "in_progress", "banked", "parked"],
+      "properties": {
+        "pending": { "type": "integer", "minimum": 0 },
+        "in_progress": { "type": "integer", "minimum": 0 },
+        "banked": { "type": "integer", "minimum": 0 },
+        "parked": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "planItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["itemHash", "status"],
+      "properties": {
+        "itemHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "status": { "enum": ["pending", "in_progress", "banked", "parked"] }
+      }
+    },
+    "availablePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "provenance",
+        "integrity",
+        "reason",
+        "hash",
+        "mode",
+        "localCompletionShape",
+        "counts",
+        "items"
+      ],
+      "properties": {
+        "status": { "const": "available" },
+        "provenance": { "const": "worker-recorded-local" },
+        "integrity": { "const": "plugin-verified-local" },
+        "reason": { "type": "null" },
+        "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "mode": { "enum": ["active", "complete", "inactive"] },
+        "localCompletionShape": { "type": "boolean" },
+        "counts": { "$ref": "#/$defs/counts" },
+        "items": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/planItem" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "mode": { "const": "complete" } },
+            "required": ["mode"]
+          },
+          "then": { "properties": { "localCompletionShape": { "const": true } } },
+          "else": { "properties": { "localCompletionShape": { "const": false } } }
+        }
+      ]
+    },
+    "unavailablePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "provenance",
+        "integrity",
+        "reason",
+        "hash",
+        "mode",
+        "localCompletionShape",
+        "counts",
+        "items"
+      ],
+      "properties": {
+        "status": { "const": "unavailable" },
+        "provenance": { "const": "worker-recorded-local" },
+        "integrity": { "const": "plugin-verified-local" },
+        "reason": { "enum": ["plan-absent", "plan-invalid", "plan-changed-during-read"] },
+        "hash": { "type": "null" },
+        "mode": { "type": "null" },
+        "localCompletionShape": { "type": "null" },
+        "counts": { "type": "null" },
+        "items": { "type": "null" }
+      }
+    },
+    "plan": {
+      "oneOf": [
+        { "$ref": "#/$defs/availablePlan" },
+        { "$ref": "#/$defs/unavailablePlan" }
+      ]
+    },
+    "eventCount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event", "count"],
+      "properties": {
+        "event": {
+          "enum": [
+            "completion_unverified_release",
+            "completion_verified",
+            "ownership_cleanup_failed",
+            "plan_inactive",
+            "pre_compact",
+            "provisional_claim_released",
+            "stop_blocked",
+            "tool_completed"
+          ]
+        },
+        "count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "availableRunLedger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "provenance",
+        "integrity",
+        "reason",
+        "hash",
+        "sessionCount",
+        "recordCount",
+        "eventCounts",
+        "firstObservedAt",
+        "lastObservedAt"
+      ],
+      "properties": {
+        "status": { "const": "available" },
+        "provenance": { "const": "worker-recorded-local" },
+        "integrity": { "const": "plugin-verified-local" },
+        "reason": { "type": "null" },
+        "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "sessionCount": { "type": "integer", "minimum": 0, "maximum": 256 },
+        "recordCount": { "type": "integer", "minimum": 0 },
+        "eventCounts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/eventCount" }
+        },
+        "firstObservedAt": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" }
+          ]
+        },
+        "lastObservedAt": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "recordCount": { "const": 0 } },
+            "required": ["recordCount"]
+          },
+          "then": {
+            "properties": {
+              "sessionCount": { "const": 0 },
+              "eventCounts": { "maxItems": 0 },
+              "firstObservedAt": { "type": "null" },
+              "lastObservedAt": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": {
+              "sessionCount": { "minimum": 1 },
+              "eventCounts": { "minItems": 1 },
+              "firstObservedAt": { "type": "string" },
+              "lastObservedAt": { "type": "string" }
+            }
+          }
+        }
+      ]
+    },
+    "unavailableRunLedger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "provenance",
+        "integrity",
+        "reason",
+        "hash",
+        "sessionCount",
+        "recordCount",
+        "eventCounts",
+        "firstObservedAt",
+        "lastObservedAt"
+      ],
+      "properties": {
+        "status": { "const": "unavailable" },
+        "provenance": { "const": "worker-recorded-local" },
+        "integrity": { "const": "plugin-verified-local" },
+        "reason": {
+          "enum": [
+            "run-ledger-absent",
+            "run-ledger-invalid",
+            "run-ledger-limit-exceeded",
+            "run-ledger-changed-during-read"
+          ]
+        },
+        "hash": { "type": "null" },
+        "sessionCount": { "type": "null" },
+        "recordCount": { "type": "null" },
+        "eventCounts": { "type": "null" },
+        "firstObservedAt": { "type": "null" },
+        "lastObservedAt": { "type": "null" }
+      }
+    },
+    "runLedger": {
+      "oneOf": [
+        { "$ref": "#/$defs/availableRunLedger" },
+        { "$ref": "#/$defs/unavailableRunLedger" }
+      ]
+    },
+    "providerFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "value", "reason"],
+      "properties": {
+        "status": { "const": "unavailable" },
+        "value": { "type": "null" },
+        "reason": { "type": "string" }
+      }
+    },
+    "providerFacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "queue", "remote", "pullRequests", "ci", "reviewer", "closures"],
+      "properties": {
+        "repository": {
+          "allOf": [
+            { "$ref": "#/$defs/providerFact" },
+            { "properties": { "reason": { "const": "provider-repository-verification-unavailable" } } }
+          ]
+        },
+        "queue": {
+          "allOf": [
+            { "$ref": "#/$defs/providerFact" },
+            { "properties": { "reason": { "const": "provider-queue-verification-unavailable" } } }
+          ]
+        },
+        "remote": {
+          "allOf": [
+            { "$ref": "#/$defs/providerFact" },
+            { "properties": { "reason": { "const": "provider-remote-verification-unavailable" } } }
+          ]
+        },
+        "pullRequests": {
+          "allOf": [
+            { "$ref": "#/$defs/providerFact" },
+            { "properties": { "reason": { "const": "provider-pull-request-verification-unavailable" } } }
+          ]
+        },
+        "ci": {
+          "allOf": [
+            { "$ref": "#/$defs/providerFact" },
+            { "properties": { "reason": { "const": "provider-ci-verification-unavailable" } } }
+          ]
+        },
+        "reviewer": {
+          "allOf": [
+            { "$ref": "#/$defs/providerFact" },
+            { "properties": { "reason": { "const": "provider-reviewer-attestation-unavailable" } } }
+          ]
+        },
+        "closures": {
+          "allOf": [
+            { "$ref": "#/$defs/providerFact" },
+            { "properties": { "reason": { "const": "provider-closure-verification-unavailable" } } }
+          ]
+        }
+      }
+    }
+  }
+}

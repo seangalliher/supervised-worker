@@ -36,6 +36,11 @@ pagination, remote pushes, CI, pull requests, reviewer identity, or issue
 closure. See [Launch Readiness](docs/launch-readiness.md) for the evidence
 required before broader claims.
 
+The alpha can export a deterministic `local-campaign-receipt` from the current
+workspace's plan and metadata-only run ledger. That artifact reports every
+provider fact as unavailable and is explicitly **local-only, not
+Provider-Verified Completion**.
+
 ## What It Provides
 
 - A preferred `seangalliher-supervised-worker` agent that owns queue and release
@@ -51,7 +56,8 @@ required before broader claims.
   After two blocked Stops at the same canonical valid-plan state, the following
   Stop fails open visibly. A changed canonical valid-plan state resets that
   bound; invalid plans share one stable state until repaired.
-- A runtime-dependency-free Node helper with repository validation and plan status.
+- A runtime-dependency-free Node helper with repository validation, plan status,
+  and deterministic local campaign receipt export and reconciliation.
 - Constitutional policy and schemas for future evidence-gated learning. The
   alpha does not yet capture outcome episodes or activate learned procedures.
 
@@ -284,10 +290,37 @@ npm run doctor
 node src/cli.mjs status
 node src/cli.mjs workflow roles
 node src/cli.mjs workflow accept <workflowHash>
+node src/cli.mjs campaign export
+node src/cli.mjs campaign export --format json
+node src/cli.mjs campaign export --format markdown
+node src/cli.mjs campaign validate <receipt.json>
 ```
 
 `doctor` validates the package and reports durable plan state for the current
 directory. The lifecycle host invokes `hook EVENT` automatically.
+
+`campaign export` writes only to stdout and defaults to deterministic,
+two-space JSON; `--format json` is the explicit equivalent and `--format
+markdown` renders the same validated facts. Redirect stdout when a saved copy
+is needed. Export exits `0` only when both the plan and run ledger are locally
+available. It still renders a partial receipt and exits `1` when either source
+is absent, invalid, over limit, or changes during inspection. The command does
+not create or mutate `.supervised-worker` state.
+
+The local receipt contains the plugin source identity, canonical plan hash,
+hashed item IDs and statuses, and bounded ledger aggregates. It excludes raw
+goals, titles, IDs, resume conditions, evidence locators, session identifiers,
+transcript paths, tool details, repository paths, prompts, arguments, payloads,
+outputs, source, and credentials. `campaign validate` accepts one bounded JSON
+file inside the canonical current workspace, validates it, and reconciles it
+against exact current local state without echoing the supplied path or content.
+See the [schema](schemas/local-campaign-receipt.schema.json) and
+[example](examples/local-campaign-receipt.json).
+
+This local artifact is not either phase of the future provider campaign receipt
+family. It has no provider canonicalizer, external verifier, public/private
+projection, cryptographic seal, provider attestation, completion authority, or
+Stop integration.
 
 The installed helper validates role artifacts without npm runtime dependencies:
 

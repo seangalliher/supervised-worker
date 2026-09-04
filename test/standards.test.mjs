@@ -95,6 +95,36 @@ test("standards validation detects optional independent review", () => {
   }
 });
 
+test("standards validation detects weakened local campaign provider facts", () => {
+  const target = fixture();
+  try {
+    mutateJson(target, "schemas/local-campaign-receipt.schema.json", (schema) => {
+      schema.$defs.providerFact.properties.value = {};
+    });
+    assert.match(
+      validateStandards(target).join("\n"),
+      /local campaign receipt schema accepted unsafe state: non-null provider fact/,
+    );
+  } finally {
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("standards validation detects local campaign aggregate drift", () => {
+  const target = fixture();
+  try {
+    mutateJson(target, "examples/local-campaign-receipt.json", (receipt) => {
+      receipt.runLedger.eventCounts[0].count += 1;
+    });
+    assert.match(
+      validateStandards(target).join("\n"),
+      /event counts must total recordCount/,
+    );
+  } finally {
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
 test("workflow accepts specialized role selectors", () => {
   const target = fixture();
   try {

@@ -15,6 +15,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { EXPECTED_HOOK_EVENTS } from "./hook-manifest.mjs";
+import { parseWorkflowJson } from "./workflow.mjs";
 
 const INSTALL_ENTRIES = [
   "LICENSE",
@@ -32,6 +33,19 @@ const INSTALL_ENTRIES = [
 const PLAN_WRITER_MATCHER =
   "Write|Edit|create|edit|apply_patch|create_file|str_replace_editor|insert|insert_edit_into_file|replace_string_in_file|multi_replace_string_in_file";
 const INSTALL_FORMAT_VERSION = 5;
+const INSTALL_RECORD_KEYS = new Set([
+  "schemaVersion",
+  "installFormatVersion",
+  "version",
+  "sourceHash",
+  "installedHash",
+  "installIdentityHash",
+  "installedAt",
+  "nodePath",
+  "platform",
+  "powerShellPath",
+  "baseDirectory",
+]);
 
 function quotedBash(value) {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
@@ -211,29 +225,27 @@ function expectedInstalledTree(files, sourceBytes, hooksText) {
   };
 }
 
-function installIdentity({
-  sourceHash: contentHash,
-  nodePath,
-  platform,
-  environment,
-  baseDirectory,
-}) {
+function installIdentityHash(fields) {
+  return createHash("sha256").update(JSON.stringify(fields)).digest("hex");
+}
+
+function installIdentity({ sourceHash: contentHash, nodePath, platform, environment, baseDirectory }) {
   const targetPath = platform === "win32" ? path.win32 : path.posix;
   const normalizedNodePath = targetPath.normalize(nodePath);
   const normalizedBaseDirectory = platform === "win32"
     ? path.win32.normalize(baseDirectory).toLowerCase()
     : path.posix.normalize(baseDirectory);
   const powerShellPath = platform === "win32" ? windowsPowerShellPath(environment) : null;
-  const value = JSON.stringify({
+  const fields = {
     installFormatVersion: INSTALL_FORMAT_VERSION,
     sourceHash: contentHash,
     platform,
     nodePath: normalizedNodePath,
     powerShellPath,
     baseDirectory: normalizedBaseDirectory,
-  });
+  };
   return {
-    hash: createHash("sha256").update(value).digest("hex"),
+    hash: installIdentityHash(fields),
     nodePath: normalizedNodePath,
     platform,
     powerShellPath,
@@ -312,6 +324,140 @@ function validateExistingInstall(installRoot, baseDirectory) {
     throw new Error("existing installation record is not a safe regular file");
   }
   return recordPath;
+}
+
+function pluginVersion(pluginRoot) {
+  const pluginPath = path.join(pluginRoot, "plugin.json");
+  const stats = lstatSync(pluginPath);
+  if (
+    !stats.isFile() ||
+    stats.isSymbolicLink() ||
+    stats.nlink > 1 ||
+    stats.size > 65_536
+  ) {
+    throw new Error("plugin manifest is not a safe bounded regular file");
+  }
+  const plugin = parseWorkflowJson(readFileSync(pluginPath));
+  if (
+    typeof plugin?.version !== "string" ||
+    !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(plugin.version) ||
+    plugin.version.includes("..")
+  ) {
+    throw new Error("plugin version must be a safe semantic version");
+  }
+  return plugin.version;
+}
+
+export function resolvePluginSourceIdentity(pluginRoot) {
+  const resolvedRoot = path.resolve(pluginRoot);
+  const rootStats = lstatSync(resolvedRoot);
+  if (
+    !rootStats.isDirectory() ||
+    rootStats.isSymbolicLink() ||
+    !pathEquals(resolvedRoot, realpathSync(resolvedRoot))
+  ) {
+    throw new Error("plugin root must be a canonical directory without links");
+  }
+  const version = pluginVersion(resolvedRoot);
+  const recordPath = path.join(resolvedRoot, "install-record.json");
+  if (!existsSync(recordPath)) {
+    const files = sourceFiles(resolvedRoot);
+    return {
+      version,
+      sourceHash: sourceHash(resolvedRoot, files),
+      sourceKind: "checkout-tree",
+      provenance: "plugin-verified-local",
+    };
+  }
+
+  const recordStats = lstatSync(recordPath);
+  if (
+    !recordStats.isFile() ||
+    recordStats.isSymbolicLink() ||
+    recordStats.nlink > 1 ||
+    recordStats.size > 65_536
+  ) {
+    throw new Error("installation record is not a safe bounded regular file");
+  }
+  const record = parseWorkflowJson(readFileSync(recordPath));
+  if (
+    !record ||
+    typeof record !== "object" ||
+    Array.isArray(record) ||
+    Object.keys(record).some((key) => !INSTALL_RECORD_KEYS.has(key)) ||
+    [...INSTALL_RECORD_KEYS].some((key) => !Object.hasOwn(record, key)) ||
+    record.schemaVersion !== 1 ||
+    record.installFormatVersion !== INSTALL_FORMAT_VERSION ||
+    record.version !== version ||
+    !/^[0-9a-f]{64}$/.test(record.sourceHash ?? "") ||
+    !/^[0-9a-f]{64}$/.test(record.installedHash ?? "") ||
+    !/^[0-9a-f]{64}$/.test(record.installIdentityHash ?? "") ||
+    typeof record.installedAt !== "string" ||
+    Number.isNaN(new Date(record.installedAt).valueOf()) ||
+    new Date(record.installedAt).toISOString() !== record.installedAt ||
+    record.platform !== process.platform
+  ) {
+    throw new Error("installation record is invalid");
+  }
+  const targetPath = record.platform === "win32" ? path.win32 : path.posix;
+  const normalizedNodePath = targetPath.normalize(record.nodePath ?? "");
+  const normalizedBaseDirectory = record.platform === "win32"
+    ? path.win32.normalize(record.baseDirectory ?? "").toLowerCase()
+    : path.posix.normalize(record.baseDirectory ?? "");
+  if (
+    !targetPath.isAbsolute(normalizedNodePath) ||
+    record.nodePath !== normalizedNodePath ||
+    !targetPath.isAbsolute(normalizedBaseDirectory) ||
+    record.baseDirectory !== normalizedBaseDirectory ||
+    (record.platform === "win32") !== (typeof record.powerShellPath === "string") ||
+    (record.platform !== "win32" && record.powerShellPath !== null)
+  ) {
+    throw new Error("installation identity fields are invalid");
+  }
+  const baseDirectory = path.resolve(record.baseDirectory);
+  const baseStats = lstatSync(baseDirectory);
+  if (
+    !baseStats.isDirectory() ||
+    baseStats.isSymbolicLink() ||
+    !pathEquals(baseDirectory, realpathSync(baseDirectory))
+  ) {
+    throw new Error("installation base is not canonical");
+  }
+  validateExistingInstall(resolvedRoot, baseDirectory);
+  const identityHash = installIdentityHash({
+    installFormatVersion: INSTALL_FORMAT_VERSION,
+    sourceHash: record.sourceHash,
+    platform: record.platform,
+    nodePath: record.nodePath,
+    powerShellPath: record.powerShellPath,
+    baseDirectory: record.baseDirectory,
+  });
+  const expectedRoot = path.resolve(
+    baseDirectory,
+    `${version}-${identityHash.slice(0, 16)}`,
+  );
+  if (
+    record.installIdentityHash !== identityHash ||
+    !pathEquals(expectedRoot, resolvedRoot)
+  ) {
+    throw new Error("installation identity does not match its canonical root");
+  }
+  const files = installedFiles(resolvedRoot);
+  for (const relativePath of files) {
+    const stats = lstatSync(path.join(resolvedRoot, ...relativePath.split("/")));
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink > 1) {
+      throw new Error("installed tree contains an unsafe file");
+    }
+  }
+  if (sourceHash(resolvedRoot, files) !== record.installedHash) {
+    throw new Error("installed tree does not match its immutable record");
+  }
+  return {
+    version,
+    sourceHash: record.sourceHash,
+    sourceKind: "immutable-install-record",
+    provenance: "plugin-verified-local",
+  };
 }
 
 export function defaultInstallBase({

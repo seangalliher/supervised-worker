@@ -2,6 +2,10 @@
 
 ## 0.1.2-alpha.1 - Unreleased
 
+- Added deterministic, stdout-only `local-campaign-receipt` JSON and Markdown
+	export plus safe current-workspace validation. The artifact exposes sanitized
+	plan and bounded ledger observations, fixes all provider facts to unavailable,
+	and is explicitly not Provider-Verified Completion or a Stop input.
 - Added Agent Plugins v1 GitHub Copilot extension copies under
 	`com.github.copilot/`, with byte-parity validation against the legacy root
 	agent and hook locations.

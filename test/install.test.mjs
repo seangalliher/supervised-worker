@@ -23,6 +23,7 @@ import {
   buildInstalledHookManifest,
   defaultInstallBase,
   installLocalPlugin,
+  resolvePluginSourceIdentity,
 } from "../src/install.mjs";
 import { spawnProcessTreeSync } from "./process-tree.mjs";
 
@@ -737,6 +738,58 @@ test("installer rejects staged plugin metadata drift before generated writes", (
     fs.cpSync = originalCpSync;
     syncBuiltinESMExports();
     rmSync(source, { recursive: true, force: true });
+    rmSync(installBase, { recursive: true, force: true });
+  }
+});
+
+test("campaign identity agrees across checkout and immutable installed execution", () => {
+  const installBase = temporaryDirectory("supervised-worker-campaign-install-");
+  const cwd = temporaryDirectory("supervised-worker-campaign-workspace-");
+  try {
+    const checkout = resolvePluginSourceIdentity(root);
+    assert.equal(checkout.sourceKind, "checkout-tree");
+    assert.equal(checkout.provenance, "plugin-verified-local");
+    const installed = installLocalPlugin(root, { baseDirectory: installBase });
+    assert.equal(checkout.sourceHash, installed.sourceHash);
+
+    const installedIdentity = resolvePluginSourceIdentity(installed.installRoot);
+    assert.deepEqual(installedIdentity, {
+      version: checkout.version,
+      sourceHash: checkout.sourceHash,
+      sourceKind: "immutable-install-record",
+      provenance: "plugin-verified-local",
+    });
+
+    const state = path.join(cwd, ".supervised-worker");
+    mkdirSync(path.join(state, "runs"), { recursive: true });
+    writeFileSync(
+      path.join(state, "plan.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        mode: "active",
+        goal: "Installed campaign identity",
+        items: [{ id: "item-1", title: "Item", status: "pending" }],
+        completion: null,
+      }, null, 2)}\n`,
+    );
+    const execution = spawnSync(
+      process.execPath,
+      [path.join(installed.installRoot, "src", "cli.mjs"), "campaign", "export"],
+      { cwd, encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(execution.status, 0, execution.stderr);
+    const receipt = JSON.parse(execution.stdout);
+    assert.equal(receipt.plugin.sourceKind, "immutable-install-record");
+    assert.equal(receipt.plugin.sourceHash, checkout.sourceHash);
+
+    const campaignPath = path.join(installed.installRoot, "src", "campaign.mjs");
+    writeFileSync(campaignPath, `${readFileSync(campaignPath, "utf8")}\n// tampered\n`);
+    assert.throws(
+      () => resolvePluginSourceIdentity(installed.installRoot),
+      /installed tree does not match/,
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
     rmSync(installBase, { recursive: true, force: true });
   }
 });

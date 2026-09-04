@@ -19,7 +19,7 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 
-import { WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
+import { parseWorkflowJson, WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
 
 export const STATE_DIRECTORY = ".supervised-worker";
 export const PLAN_FILE = "plan.json";
@@ -77,6 +77,25 @@ export const PLAN_WRITER_TOOLS = new Set(
   PLAN_WRITER_MATCHER.split("|").map((name) => name.toLowerCase()),
 );
 const PATH_KEYS = new Set(["filePath", "file_path", "path"]);
+const RUN_LEDGER_MAX_FILES = 256;
+const RUN_LEDGER_MAX_FILE_BYTES = 1_048_576;
+const RUN_LEDGER_MAX_TOTAL_BYTES = 16_777_216;
+const RUN_LEDGER_MAX_RECORD_BYTES = 16_384;
+const RUN_LEDGER_FILE_PATTERN = /^[0-9a-f]{64}\.jsonl$/;
+const RUN_LEDGER_COMMON_KEYS = new Set(["schemaVersion", "at", "event", "session"]);
+const RUN_LEDGER_EVENT_FIELDS = new Map([
+  ["plan_inactive", { required: [], optional: [] }],
+  ["completion_verified", { required: ["planHash"], optional: [] }],
+  ["completion_unverified_release", { required: ["progressHash", "reason"], optional: [] }],
+  ["stop_blocked", {
+    required: ["progressHash", "sameProgressBlocks", "totalBlocks"],
+    optional: [],
+  }],
+  ["tool_completed", { required: ["toolName", "success"], optional: [] }],
+  ["pre_compact", { required: ["trigger"], optional: [] }],
+  ["provisional_claim_released", { required: [], optional: ["trigger"] }],
+  ["ownership_cleanup_failed", { required: ["attemptedEvent"], optional: [] }],
+]);
 
 export function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -93,6 +112,10 @@ function canonicalJson(value) {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+export function canonicalPlanHash(plan) {
+  return sha256(canonicalJson(plan));
 }
 
 export function stateDirectory(cwd) {
@@ -1607,14 +1630,14 @@ function handleStop(input, cwd) {
       cwd,
       input,
       "completion_verified",
-      { planHash: sha256(canonicalJson(planResult.plan)) },
+      { planHash: canonicalPlanHash(planResult.plan) },
       {},
     );
   }
 
   const filePath = runtimeStatePath(cwd, input);
   const progressHash = planResult.errors.length === 0
-    ? sha256(canonicalJson(planResult.plan))
+    ? canonicalPlanHash(planResult.plan)
     : sha256("invalid-plan");
   const legacyProgressHash = sha256(JSON.stringify(planResult.plan ?? planResult.errors));
   let state = {
@@ -1969,6 +1992,291 @@ export function releaseAttachment(cwd) {
   }
   removeStateFile(cwd, filePath);
   return { released: true, message: "Released the stale session attachment." };
+}
+
+function runLedgerUnavailable(reason) {
+  return {
+    status: "unavailable",
+    provenance: "worker-recorded-local",
+    integrity: "plugin-verified-local",
+    reason,
+    hash: null,
+    sessionCount: null,
+    recordCount: null,
+    eventCounts: null,
+    firstObservedAt: null,
+    lastObservedAt: null,
+  };
+}
+
+function runLedgerFailure(reason) {
+  return Object.assign(new Error(reason), { runLedgerReason: reason });
+}
+
+function sameRunLedgerStats(left, right) {
+  return ["dev", "ino", "mode", "nlink", "size", "mtimeNs", "ctimeNs"]
+    .every((key) => left[key] === right[key]);
+}
+
+function requireRunLedgerRecord(record, expectedSession) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    throw runLedgerFailure("run-ledger-invalid");
+  }
+  const fields = RUN_LEDGER_EVENT_FIELDS.get(record.event);
+  if (!fields) throw runLedgerFailure("run-ledger-invalid");
+  const allowed = new Set([...RUN_LEDGER_COMMON_KEYS, ...fields.required, ...fields.optional]);
+  if (
+    Object.keys(record).some((key) => !allowed.has(key)) ||
+    [...RUN_LEDGER_COMMON_KEYS, ...fields.required].some((key) => !Object.hasOwn(record, key))
+  ) {
+    throw runLedgerFailure("run-ledger-invalid");
+  }
+  if (
+    record.schemaVersion !== 1 ||
+    record.session !== expectedSession ||
+    !isDateTime(record.at) ||
+    Number.isNaN(new Date(record.at).valueOf())
+  ) {
+    throw runLedgerFailure("run-ledger-invalid");
+  }
+  const hexadecimal = (value) => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+  if (Object.hasOwn(record, "planHash") && !hexadecimal(record.planHash)) {
+    throw runLedgerFailure("run-ledger-invalid");
+  }
+  if (Object.hasOwn(record, "progressHash") && !hexadecimal(record.progressHash)) {
+    throw runLedgerFailure("run-ledger-invalid");
+  }
+  if (
+    Object.hasOwn(record, "sameProgressBlocks") &&
+    (!Number.isInteger(record.sameProgressBlocks) || record.sameProgressBlocks < 0)
+  ) {
+    throw runLedgerFailure("run-ledger-invalid");
+  }
+  if (
+    Object.hasOwn(record, "totalBlocks") &&
+    (!Number.isInteger(record.totalBlocks) || record.totalBlocks < 0)
+  ) {
+    throw runLedgerFailure("run-ledger-invalid");
+  }
+  for (const key of ["toolName", "trigger", "attemptedEvent"]) {
+    if (Object.hasOwn(record, key) && !nonEmptyString(record[key])) {
+      throw runLedgerFailure("run-ledger-invalid");
+    }
+  }
+  if (Object.hasOwn(record, "success") && typeof record.success !== "boolean") {
+    throw runLedgerFailure("run-ledger-invalid");
+  }
+  if (
+    record.event === "completion_unverified_release" &&
+    !["invalid_runtime_state", "bounded_stop_limit"].includes(record.reason)
+  ) {
+    throw runLedgerFailure("run-ledger-invalid");
+  }
+  return new Date(record.at).toISOString();
+}
+
+function hashRunLedger(files) {
+  const hash = createHash("sha256");
+  hash.update("supervised-worker-run-ledger-v1\0");
+  const count = Buffer.alloc(8);
+  count.writeBigUInt64BE(BigInt(files.length));
+  hash.update(count);
+  for (const { name, bytes } of files) {
+    const nameBytes = Buffer.from(name, "utf8");
+    const nameLength = Buffer.alloc(8);
+    const contentLength = Buffer.alloc(8);
+    nameLength.writeBigUInt64BE(BigInt(nameBytes.length));
+    contentLength.writeBigUInt64BE(BigInt(bytes.length));
+    hash.update(nameLength);
+    hash.update(nameBytes);
+    hash.update(contentLength);
+    hash.update(bytes);
+  }
+  return hash.digest("hex");
+}
+
+export function summarizeRunLedger(cwd) {
+  const directory = path.join(stateDirectory(cwd), "runs");
+  try {
+    assertSafeStatePath(cwd, directory);
+    if (!existsSync(directory)) return runLedgerUnavailable("run-ledger-absent");
+    let directoryBefore;
+    try {
+      directoryBefore = lstatSync(directory, { bigint: true });
+    } catch (error) {
+      throw runLedgerFailure(
+        error?.code === "ENOENT" ? "run-ledger-changed-during-read" : "run-ledger-invalid",
+      );
+    }
+    if (!directoryBefore.isDirectory() || directoryBefore.isSymbolicLink()) {
+      throw runLedgerFailure("run-ledger-invalid");
+    }
+    const names = readdirSync(directory).sort();
+    if (names.length > RUN_LEDGER_MAX_FILES) {
+      throw runLedgerFailure("run-ledger-limit-exceeded");
+    }
+    if (names.some((name) => !RUN_LEDGER_FILE_PATTERN.test(name))) {
+      throw runLedgerFailure("run-ledger-invalid");
+    }
+
+    const files = [];
+    const canonicalRecords = new Set();
+    const eventCounts = new Map();
+    let aggregateBytes = 0;
+    let recordCount = 0;
+    let firstObservedAt = null;
+    let lastObservedAt = null;
+    for (const name of names) {
+      const filePath = path.join(directory, name);
+      assertSafeStatePath(cwd, filePath);
+      let before;
+      try {
+        before = lstatSync(filePath, { bigint: true });
+      } catch (error) {
+        throw runLedgerFailure(
+          error?.code === "ENOENT" ? "run-ledger-changed-during-read" : "run-ledger-invalid",
+        );
+      }
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) {
+        throw runLedgerFailure("run-ledger-invalid");
+      }
+      if (before.size > BigInt(RUN_LEDGER_MAX_FILE_BYTES)) {
+        throw runLedgerFailure("run-ledger-limit-exceeded");
+      }
+      aggregateBytes += Number(before.size);
+      if (aggregateBytes > RUN_LEDGER_MAX_TOTAL_BYTES) {
+        throw runLedgerFailure("run-ledger-limit-exceeded");
+      }
+
+      let descriptor;
+      let bytes;
+      let opened;
+      let afterRead;
+      try {
+        descriptor = openSync(filePath, "r");
+        opened = fstatSync(descriptor, { bigint: true });
+        if (!sameRunLedgerStats(before, opened)) {
+          throw runLedgerFailure("run-ledger-changed-during-read");
+        }
+        bytes = readFileSync(descriptor);
+        afterRead = fstatSync(descriptor, { bigint: true });
+      } catch (error) {
+        if (error?.runLedgerReason) throw error;
+        throw runLedgerFailure(
+          ["ENOENT", "ESTALE"].includes(error?.code)
+            ? "run-ledger-changed-during-read"
+            : "run-ledger-invalid",
+        );
+      } finally {
+        if (descriptor !== undefined) closeSync(descriptor);
+      }
+      let afterPath;
+      try {
+        afterPath = lstatSync(filePath, { bigint: true });
+      } catch {
+        throw runLedgerFailure("run-ledger-changed-during-read");
+      }
+      if (
+        !sameRunLedgerStats(opened, afterRead) ||
+        !sameRunLedgerStats(afterRead, afterPath) ||
+        bytes.length !== Number(afterRead.size)
+      ) {
+        throw runLedgerFailure("run-ledger-changed-during-read");
+      }
+      if (bytes.length === 0 || bytes.at(-1) !== 0x0a) {
+        throw runLedgerFailure("run-ledger-invalid");
+      }
+
+      const expectedSession = name.slice(0, 64);
+      let start = 0;
+      for (let index = 0; index < bytes.length; index += 1) {
+        if (bytes[index] !== 0x0a) continue;
+        const recordBytes = bytes.subarray(start, index);
+        start = index + 1;
+        if (recordBytes.length === 0) throw runLedgerFailure("run-ledger-invalid");
+        if (recordBytes.length > RUN_LEDGER_MAX_RECORD_BYTES) {
+          throw runLedgerFailure("run-ledger-limit-exceeded");
+        }
+        let record;
+        try {
+          record = parseWorkflowJson(recordBytes);
+        } catch {
+          throw runLedgerFailure("run-ledger-invalid");
+        }
+        const observedAt = requireRunLedgerRecord(record, expectedSession);
+        const canonicalRecord = canonicalJson(record);
+        if (canonicalRecords.has(canonicalRecord)) {
+          throw runLedgerFailure("run-ledger-invalid");
+        }
+        canonicalRecords.add(canonicalRecord);
+        recordCount += 1;
+        eventCounts.set(record.event, (eventCounts.get(record.event) ?? 0) + 1);
+        if (firstObservedAt === null || observedAt < firstObservedAt) firstObservedAt = observedAt;
+        if (lastObservedAt === null || observedAt > lastObservedAt) lastObservedAt = observedAt;
+      }
+      files.push({ name, bytes, stats: afterPath });
+    }
+
+    for (const file of files) {
+      const filePath = path.join(directory, file.name);
+      let beforeVerify;
+      let verifyBytes;
+      let afterVerify;
+      try {
+        beforeVerify = lstatSync(filePath, { bigint: true });
+        if (
+          !beforeVerify.isFile() ||
+          beforeVerify.isSymbolicLink() ||
+          beforeVerify.nlink !== 1n ||
+          !sameRunLedgerStats(file.stats, beforeVerify)
+        ) {
+          throw runLedgerFailure("run-ledger-changed-during-read");
+        }
+        verifyBytes = readFileSync(filePath);
+        afterVerify = lstatSync(filePath, { bigint: true });
+      } catch (error) {
+        if (error?.runLedgerReason) throw error;
+        throw runLedgerFailure("run-ledger-changed-during-read");
+      }
+      if (
+        !sameRunLedgerStats(beforeVerify, afterVerify) ||
+        !file.bytes.equals(verifyBytes)
+      ) {
+        throw runLedgerFailure("run-ledger-changed-during-read");
+      }
+    }
+
+    let namesAfter;
+    let directoryAfter;
+    try {
+      namesAfter = readdirSync(directory).sort();
+      directoryAfter = lstatSync(directory, { bigint: true });
+    } catch {
+      throw runLedgerFailure("run-ledger-changed-during-read");
+    }
+    if (
+      JSON.stringify(namesAfter) !== JSON.stringify(names) ||
+      !sameRunLedgerStats(directoryBefore, directoryAfter)
+    ) {
+      throw runLedgerFailure("run-ledger-changed-during-read");
+    }
+    return {
+      status: "available",
+      provenance: "worker-recorded-local",
+      integrity: "plugin-verified-local",
+      reason: null,
+      hash: hashRunLedger(files),
+      sessionCount: files.length,
+      recordCount,
+      eventCounts: [...eventCounts]
+        .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+        .map(([event, count]) => ({ event, count })),
+      firstObservedAt,
+      lastObservedAt,
+    };
+  } catch (error) {
+    return runLedgerUnavailable(error?.runLedgerReason ?? "run-ledger-invalid");
+  }
 }
 
 export function summarizePlan(cwd) {

@@ -21,10 +21,12 @@ import test, { afterEach } from "node:test";
 import { Worker } from "node:worker_threads";
 
 import {
+  canonicalPlanHash,
   handleHook,
   MAX_TOOL_TARGETS,
   planPath,
   sha256,
+  summarizeRunLedger,
   validatePlan,
 } from "../src/core.mjs";
 
@@ -1700,9 +1702,57 @@ test("complete plan audit hashes ignore object-key insertion order", () => {
           .split("\n")
           .map((line) => JSON.parse(line)),
       );
-    hashes.push(records.find((record) => record.event === "completion_verified").planHash);
+    const emittedHash = records.find((record) => record.event === "completion_verified").planHash;
+    assert.equal(emittedHash, canonicalPlanHash(plan));
+    hashes.push(emittedHash);
   }
   assert.equal(hashes[0], hashes[1]);
+});
+
+test("run ledger summary consumes appendLedger records without exposing detail", () => {
+  const cwd = workspace();
+  writePlan(cwd);
+  attachPlan(cwd, "aggregate-session");
+  handleHook(
+    {
+      hook_event_name: "PostToolUse",
+      session_id: "aggregate-session",
+      cwd,
+      tool_name: "SECRET_TOOL_NAME",
+      tool_input: { command: "SECRET_ARGUMENT" },
+      tool_result: { text: "SECRET_OUTPUT" },
+    },
+    "PostToolUse",
+  );
+
+  const summary = summarizeRunLedger(cwd);
+  assert.equal(summary.status, "available");
+  assert.equal(summary.sessionCount, 1);
+  assert.equal(summary.recordCount, 2);
+  assert.deepEqual(summary.eventCounts, [{ event: "tool_completed", count: 2 }]);
+  assert.match(summary.hash, /^[0-9a-f]{64}$/);
+  assert.doesNotMatch(
+    JSON.stringify(summary),
+    /SECRET_TOOL_NAME|SECRET_ARGUMENT|SECRET_OUTPUT|aggregate-session/,
+  );
+});
+
+test("run ledger summary distinguishes absent and observed-empty ledgers", () => {
+  const cwd = workspace();
+  const absent = summarizeRunLedger(cwd);
+  assert.equal(absent.status, "unavailable");
+  assert.equal(absent.reason, "run-ledger-absent");
+  assert.equal(absent.recordCount, null);
+
+  mkdirSync(path.join(cwd, ".supervised-worker", "runs"), { recursive: true });
+  const empty = summarizeRunLedger(cwd);
+  assert.equal(empty.status, "available");
+  assert.equal(empty.sessionCount, 0);
+  assert.equal(empty.recordCount, 0);
+  assert.deepEqual(empty.eventCounts, []);
+  assert.equal(empty.firstObservedAt, null);
+  assert.equal(empty.lastObservedAt, null);
+  assert.match(empty.hash, /^[0-9a-f]{64}$/);
 });
 
 test("Stop releases after its final warning when the ledger is unavailable", () => {

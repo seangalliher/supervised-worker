@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "kind": "local-campaign-receipt",
+  "scope": "current-workspace-local-alpha",
+  "localDataStatus": "available",
+  "plugin": {
+    "version": "0.1.2-alpha.1",
+    "sourceHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sourceKind": "checkout-tree",
+    "provenance": "plugin-verified-local"
+  },
+  "plan": {
+    "status": "available",
+    "provenance": "worker-recorded-local",
+    "integrity": "plugin-verified-local",
+    "reason": null,
+    "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "mode": "active",
+    "localCompletionShape": false,
+    "counts": {
+      "pending": 1,
+      "in_progress": 0,
+      "banked": 1,
+      "parked": 0
+    },
+    "items": [
+      {
+        "itemHash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "status": "pending"
+      },
+      {
+        "itemHash": "2222222222222222222222222222222222222222222222222222222222222222",
+        "status": "banked"
+      }
+    ]
+  },
+  "runLedger": {
+    "status": "available",
+    "provenance": "worker-recorded-local",
+    "integrity": "plugin-verified-local",
+    "reason": null,
+    "hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "sessionCount": 1,
+    "recordCount": 2,
+    "eventCounts": [
+      {
+        "event": "plan_inactive",
+        "count": 1
+      },
+      {
+        "event": "tool_completed",
+        "count": 1
+      }
+    ],
+    "firstObservedAt": "2026-09-04T12:00:00.000Z",
+    "lastObservedAt": "2026-09-04T12:01:00.000Z"
+  },
+  "providerFacts": {
+    "repository": {
+      "status": "unavailable",
+      "value": null,
+      "reason": "provider-repository-verification-unavailable"
+    },
+    "queue": {
+      "status": "unavailable",
+      "value": null,
+      "reason": "provider-queue-verification-unavailable"
+    },
+    "remote": {
+      "status": "unavailable",
+      "value": null,
+      "reason": "provider-remote-verification-unavailable"
+    },
+    "pullRequests": {
+      "status": "unavailable",
+      "value": null,
+      "reason": "provider-pull-request-verification-unavailable"
+    },
+    "ci": {
+      "status": "unavailable",
+      "value": null,
+      "reason": "provider-ci-verification-unavailable"
+    },
+    "reviewer": {
+      "status": "unavailable",
+      "value": null,
+      "reason": "provider-reviewer-attestation-unavailable"
+    },
+    "closures": {
+      "status": "unavailable",
+      "value": null,
+      "reason": "provider-closure-verification-unavailable"
+    }
+  }
+}
