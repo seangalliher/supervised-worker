@@ -115,7 +115,7 @@ export function buildInstalledHookManifest({
       powershell: platform === "win32"
         ? command
         : `Write-Error 'Supervised Worker installation requires the Bash launcher on this platform.'; exit 1`,
-      timeoutSec: platform === "win32" ? 10 : 5,
+      timeoutSec: platform === "win32" ? 15 : 5,
     }];
   }
   return { version: 1, hooks };

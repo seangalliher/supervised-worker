@@ -13,13 +13,12 @@ function windowsPathEquals(left, right) {
 
 export function canonicalWindowsTaskkill(environment = process.env) {
   const systemRoot = environment.SystemRoot ?? environment.WINDIR;
-  const normalizedRoot = typeof systemRoot === "string"
-    ? systemRoot.replaceAll("/", "\\")
-    : "";
-  const rootSegments = normalizedRoot.split("\\").filter(Boolean).slice(1);
+  const rawRoot = typeof systemRoot === "string" ? systemRoot.replaceAll("/", "\\") : "";
+  const rawSegments = rawRoot.split("\\").filter(Boolean).slice(1);
+  const normalizedRoot = path.win32.normalize(rawRoot);
   if (
-    !/^[A-Za-z]:\\(?:[A-Za-z0-9._-]+\\?)*$/.test(normalizedRoot) ||
-    rootSegments.some((segment) => segment === "." || segment === "..")
+    !/^[A-Za-z]:\\/.test(normalizedRoot) ||
+    rawSegments.some((segment) => segment === "." || segment === "..")
   ) {
     throw new Error("SystemRoot is required for the Windows process-tree watchdog");
   }

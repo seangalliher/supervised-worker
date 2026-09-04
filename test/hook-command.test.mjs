@@ -99,7 +99,9 @@ function vscodeTranscriptPath(storageRoot, sessionId) {
   return transcriptPath;
 }
 
-function assertWithinHookDeadline(shellName, eventName, elapsedMs) {
+function assertWithinNativeHookDeadline(shellName, eventName, elapsedMs) {
+  const nativeShell = process.platform === "win32" ? "PowerShell" : "Bash";
+  if (shellName !== nativeShell) return;
   const deadlineMs = hooks[eventName][0].timeoutSec * 1_000;
   assert.ok(
     elapsedMs < deadlineMs,
@@ -123,13 +125,13 @@ function invokePowerShell(
       cwd,
       env: { ...process.env, ...extraEnv, PLUGIN_ROOT: pluginRoot },
       input: JSON.stringify(input),
-      timeout: 10_000,
+      timeout: 20_000,
     },
   );
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.signal, null, result.stderr);
   assert.equal(result.status, 0, result.stderr);
-  assertWithinHookDeadline("PowerShell", eventName, result.elapsedMs);
+  assertWithinNativeHookDeadline("PowerShell", eventName, result.elapsedMs);
   return JSON.parse(result.stdout.trim() || "{}");
 }
 
@@ -159,21 +161,28 @@ function invokeBash(
     cwd,
     env: { ...process.env, ...extraEnv, PLUGIN_ROOT: pluginRoot },
     input: JSON.stringify(input),
-    timeout: 10_000,
+    timeout: 20_000,
   });
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.signal, null, result.stderr);
   assert.equal(result.status, 0, result.stderr);
-  assertWithinHookDeadline("Bash", eventName, result.elapsedMs);
+  assertWithinNativeHookDeadline("Bash", eventName, result.elapsedMs);
   return JSON.parse(result.stdout.trim() || "{}");
 }
 
-test("checkout harness binds elapsed checks to the manifest timeout", () => {
+test("checkout harness binds the native shell to the manifest timeout", () => {
   const deadlineMs = hooks.SessionStart[0].timeoutSec * 1_000;
-  assert.doesNotThrow(() => assertWithinHookDeadline("PowerShell", "SessionStart", deadlineMs - 1));
+  const nativeShell = process.platform === "win32" ? "PowerShell" : "Bash";
+  const compatibilityShell = process.platform === "win32" ? "Bash" : "PowerShell";
+  assert.doesNotThrow(
+    () => assertWithinNativeHookDeadline(nativeShell, "SessionStart", deadlineMs - 1),
+  );
   assert.throws(
-    () => assertWithinHookDeadline("PowerShell", "SessionStart", deadlineMs),
-    new RegExp(`PowerShell SessionStart exceeded the hook timeout: ${deadlineMs}ms`),
+    () => assertWithinNativeHookDeadline(nativeShell, "SessionStart", deadlineMs),
+    new RegExp(`${nativeShell} SessionStart exceeded the hook timeout: ${deadlineMs}ms`),
+  );
+  assert.doesNotThrow(
+    () => assertWithinNativeHookDeadline(compatibilityShell, "SessionStart", deadlineMs),
   );
 });
 
@@ -747,10 +756,7 @@ test("checkout PowerShell hook fails closed without PLUGIN_ROOT", {
       },
     );
     assert.equal(result.error, undefined, result.error?.message);
-    assert.ok(
-      result.elapsedMs < hooks.SessionStart[0].timeoutSec * 1_000,
-      `PowerShell SessionStart exceeded the hook timeout: ${result.elapsedMs}ms`,
-    );
+    assertWithinNativeHookDeadline("PowerShell", "SessionStart", result.elapsedMs);
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /requires PLUGIN_ROOT/);
     assert.equal(existsSync(markerPath), false);

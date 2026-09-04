@@ -117,10 +117,24 @@ Concurrent same-session hooks use a 250 ms monotonic retry deadline before
 treating the lock as authoritative. A delayed scheduler wake may return later,
 but cannot make another acquisition attempt after that deadline. This overlap
 wait never reclaims or mutates another owner's lock. Claims use UUID-named owner files; acquisition requires exactly its own
-token, and cleanup never recursively removes the canonical session lock path.
-If directory identity or ownership becomes ambiguous, the lock is left in place
-for operator-confirmed recovery. Filesystems that cannot provide a stable,
-nonzero directory identity fail closed rather than weakening this rule.
+token and a matching open file identity. Release atomically retires the
+canonical directory to a token-specific path before removing anything; cleanup
+never recursively removes the canonical session lock path. A newly acquired
+canonical lock is therefore outside the prior owner's cleanup path. If directory
+or owner identity becomes ambiguous before or immediately after retirement, the
+object is left for operator-confirmed recovery. Locking does not rely on birth
+or change timestamps. Filesystems that cannot provide stable, nonzero
+device/inode identity fail closed rather than weakening this rule.
+
+Retired-path cleanup is best-effort under the trusted same-user process model.
+Node does not expose handle-relative unlink or POSIX no-replace directory rename
+portably. A same-user process can race the token-specific retirement destination
+or replace its owner pathname after validation; cleanup may then replace or
+delete that retired-path object. This cannot target a new canonical session lock
+after retirement succeeds, but it is not a defense against a malicious same-user
+process. Interrupted or ambiguous `.retired` directories are left in
+`session-locks/` for operator inspection and removal after confirming no hook
+process owns them.
 Potentially blocking Windows drive-locality probes run before the lock; locked
 authority checks may consume only those preflighted results.
 

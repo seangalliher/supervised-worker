@@ -1,8 +1,11 @@
 import {
   appendFileSync,
+  closeSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -555,31 +558,55 @@ function acquireSessionLock(input, context = sessionLocatorContext(input)) {
     }, null, 2)}\n`,
     { encoding: "utf8", mode: 0o600, flag: "wx" },
   );
-  const currentStats = lstatSync(lockDirectory, { bigint: true });
-  const entries = readdirSync(lockDirectory);
-  const verifiedStats = lstatSync(lockDirectory, { bigint: true });
-  if (
-    !currentStats.isDirectory() ||
-    currentStats.isSymbolicLink() ||
-    currentStats.dev !== directoryStats.dev ||
-    currentStats.ino !== directoryStats.ino ||
-    !verifiedStats.isDirectory() ||
-    verifiedStats.isSymbolicLink() ||
-    verifiedStats.dev !== directoryStats.dev ||
-    verifiedStats.ino !== directoryStats.ino ||
-    entries.length !== 1 ||
-    entries[0] !== path.basename(ownerPath)
-  ) {
-    throw new Error("session lifecycle lock identity changed during acquisition");
+  let ownerFd = null;
+  try {
+    ownerFd = openSync(ownerPath, "r");
+    const ownerStats = fstatSync(ownerFd, { bigint: true });
+    const currentStats = lstatSync(lockDirectory, { bigint: true });
+    const currentOwnerStats = lstatSync(ownerPath, { bigint: true });
+    const entries = readdirSync(lockDirectory);
+    const verifiedStats = lstatSync(lockDirectory, { bigint: true });
+    const verifiedOwnerStats = lstatSync(ownerPath, { bigint: true });
+    if (
+      !currentStats.isDirectory() ||
+      currentStats.isSymbolicLink() ||
+      currentStats.dev !== directoryStats.dev ||
+      currentStats.ino !== directoryStats.ino ||
+      !verifiedStats.isDirectory() ||
+      verifiedStats.isSymbolicLink() ||
+      verifiedStats.dev !== directoryStats.dev ||
+      verifiedStats.ino !== directoryStats.ino ||
+      !ownerStats.isFile() ||
+      ownerStats.dev === 0n ||
+      ownerStats.ino === 0n ||
+      !currentOwnerStats.isFile() ||
+      currentOwnerStats.isSymbolicLink() ||
+      currentOwnerStats.dev !== ownerStats.dev ||
+      currentOwnerStats.ino !== ownerStats.ino ||
+      !verifiedOwnerStats.isFile() ||
+      verifiedOwnerStats.isSymbolicLink() ||
+      verifiedOwnerStats.dev !== ownerStats.dev ||
+      verifiedOwnerStats.ino !== ownerStats.ino ||
+      entries.length !== 1 ||
+      entries[0] !== path.basename(ownerPath)
+    ) {
+      throw new Error("session lifecycle lock identity changed during acquisition");
+    }
+    return {
+      storageRoot: context.storageRoot,
+      lockDirectory,
+      ownerPath,
+      ownerFd,
+      token,
+      directoryDev: directoryStats.dev,
+      directoryIno: directoryStats.ino,
+      ownerDev: ownerStats.dev,
+      ownerIno: ownerStats.ino,
+    };
+  } catch (error) {
+    if (ownerFd !== null) closeSync(ownerFd);
+    throw error;
   }
-  return {
-    storageRoot: context.storageRoot,
-    lockDirectory,
-    ownerPath,
-    token,
-    directoryDev: directoryStats.dev,
-    directoryIno: directoryStats.ino,
-  };
 }
 
 function sessionLockIdentityMatches(lock) {
@@ -594,19 +621,84 @@ function sessionLockIdentityMatches(lock) {
   );
 }
 
+function sessionLockOwnerIdentityMatches(lock, ownerPath = lock.ownerPath) {
+  const heldStats = fstatSync(lock.ownerFd, { bigint: true });
+  const pathStats = lstatSync(ownerPath, { bigint: true });
+  return (
+    heldStats.isFile() &&
+    heldStats.dev !== 0n &&
+    heldStats.ino !== 0n &&
+    heldStats.dev === lock.ownerDev &&
+    heldStats.ino === lock.ownerIno &&
+    pathStats.isFile() &&
+    !pathStats.isSymbolicLink() &&
+    pathStats.dev === heldStats.dev &&
+    pathStats.ino === heldStats.ino
+  );
+}
+
 function releaseSessionLock(lock) {
   if (lock === null) return;
+  let activeOwnerFd = lock.ownerFd;
+  let ownerFdOpen = true;
   try {
-    if (!sessionLockIdentityMatches(lock)) return;
+    if (!sessionLockIdentityMatches(lock) || !sessionLockOwnerIdentityMatches(lock)) return;
     const owner = readJson(lock.storageRoot, lock.ownerPath, MAX_SESSION_LOCATOR_BYTES);
     if (owner?.token !== lock.token || owner?.processId !== process.pid) return;
-    if (!sessionLockIdentityMatches(lock)) return;
-    removeStateFile(lock.storageRoot, lock.ownerPath);
-    if (!sessionLockIdentityMatches(lock)) return;
-    assertSafeStatePath(lock.storageRoot, lock.lockDirectory);
-    rmdirSync(lock.lockDirectory);
+    if (!sessionLockIdentityMatches(lock) || !sessionLockOwnerIdentityMatches(lock)) return;
+    const retiredDirectory = `${lock.lockDirectory}.${lock.token}.retired`;
+    const retiredOwnerPath = path.join(retiredDirectory, path.basename(lock.ownerPath));
+    assertSafeStatePath(lock.storageRoot, retiredDirectory);
+    if (existsSync(retiredDirectory)) return;
+    if (process.platform === "win32") {
+      closeSync(activeOwnerFd);
+      ownerFdOpen = false;
+    }
+    renameSync(lock.lockDirectory, retiredDirectory);
+    if (process.platform === "win32") {
+      activeOwnerFd = openSync(retiredOwnerPath, "r");
+      ownerFdOpen = true;
+    }
+    const retiredLock = {
+      ...lock,
+      lockDirectory: retiredDirectory,
+      ownerPath: retiredOwnerPath,
+      ownerFd: activeOwnerFd,
+    };
+    if (
+      !sessionLockIdentityMatches(retiredLock) ||
+      !sessionLockOwnerIdentityMatches(retiredLock, retiredOwnerPath)
+    ) return;
+    const retiredOwner = readJson(
+      lock.storageRoot,
+      retiredOwnerPath,
+      MAX_SESSION_LOCATOR_BYTES,
+    );
+    const entries = readdirSync(retiredDirectory);
+    if (
+      retiredOwner?.token !== lock.token ||
+      retiredOwner?.processId !== process.pid ||
+      entries.length !== 1 ||
+      entries[0] !== path.basename(retiredOwnerPath) ||
+      !sessionLockIdentityMatches(retiredLock) ||
+      !sessionLockOwnerIdentityMatches(retiredLock, retiredOwnerPath)
+    ) return;
+    closeSync(activeOwnerFd);
+    ownerFdOpen = false;
+    removeStateFile(lock.storageRoot, retiredOwnerPath);
+    if (!sessionLockIdentityMatches(retiredLock)) return;
+    assertSafeStatePath(lock.storageRoot, retiredDirectory);
+    rmdirSync(retiredDirectory);
   } catch {
     // An abandoned lock requires operator-confirmed cleanup.
+  } finally {
+    if (ownerFdOpen) {
+      try {
+        closeSync(activeOwnerFd);
+      } catch {
+        // The lock is already closed; no cleanup remains.
+      }
+    }
   }
 }
 

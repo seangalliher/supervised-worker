@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -53,5 +61,23 @@ test("Windows watchdog rejects a linked system root", {
   } finally {
     rmSync(alias, { recursive: true, force: true });
     rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("Windows watchdog accepts a canonical system root containing spaces", {
+  skip: process.platform !== "win32",
+}, () => {
+  const systemRoot = mkdtempSync(path.join(os.tmpdir(), "supervised worker system root "));
+  const systemDirectory = path.join(systemRoot, "System32");
+  const executable = path.join(systemDirectory, "taskkill.exe");
+  try {
+    mkdirSync(systemDirectory);
+    writeFileSync(executable, "fixture\n");
+    assert.equal(
+      canonicalWindowsTaskkill({ SystemRoot: systemRoot, WINDIR: systemRoot }),
+      realpathSync(executable),
+    );
+  } finally {
+    rmSync(systemRoot, { recursive: true, force: true });
   }
 });

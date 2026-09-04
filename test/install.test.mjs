@@ -52,11 +52,14 @@ function copyInstallSource(target, omittedEntry = null) {
   }
 }
 
-function hookPayload(cwd) {
+function hookPayload(cwd, eventName = "SessionStart") {
   return JSON.stringify({
-    hook_event_name: "SessionStart",
+    hook_event_name: eventName,
     session_id: "installed-hook-session",
     cwd,
+    ...(eventName === "PreToolUse"
+      ? { tool_name: "read_file", tool_input: { filePath: path.join(cwd, "README.md") } }
+      : {}),
   });
 }
 
@@ -171,7 +174,7 @@ test("content-addressed Windows install runs trusted hooks outside the workspace
     assert.deepEqual(namespacedHooks, rootHooks);
     const hooks = JSON.parse(rootHooks.toString("utf8")).hooks;
     for (const [eventName, [entry]] of Object.entries(hooks)) {
-      assert.equal(entry.timeoutSec, 10, eventName);
+      assert.equal(entry.timeoutSec, 15, eventName);
     }
 
     const plantedSource = path.join(untrustedWorkspace, "src");
@@ -197,29 +200,31 @@ test("content-addressed Windows install runs trusted hooks outside the workspace
       NODE_OPTIONS: `--require=${preloadPath}`,
       PLUGIN_ROOT: "",
     };
-    const command = hooks.SessionStart[0].powershell;
-    for (const [shell, args] of [
-      ["pwsh", ["-NoProfile", "-NonInteractive", "-Command", command]],
-      [process.env.ComSpec, ["/d", "/s", "/c", command]],
-    ]) {
-      rmSync(capturePath, { force: true });
-      const execution = spawnProcessTreeSync(shell, args, {
-        cwd: untrustedWorkspace,
-        env: environment,
-        input: hookPayload(untrustedWorkspace),
-        timeout: 15_000,
-      });
-      assert.equal(execution.error, undefined, execution.error?.message);
-      assert.equal(execution.signal, null, execution.stderr);
-      assert.equal(execution.status, 0, execution.stderr);
-      assert.deepEqual(JSON.parse(execution.stdout.trim()), {});
-      assert.equal(readFileSync(capturePath, "utf8").trim(), "clean");
-      assert.equal(existsSync(preloadMarker), false);
-      assert.equal(existsSync(plantedMarker), false);
-      assert.ok(
-        execution.elapsedMs < hooks.SessionStart[0].timeoutSec * 1_000,
-        `${shell} exceeded the installed hook timeout: ${execution.elapsedMs}ms`,
-      );
+    for (const eventName of ["SessionStart", "PreToolUse"]) {
+      const command = hooks[eventName][0].powershell;
+      for (const [shell, args] of [
+        ["pwsh", ["-NoProfile", "-NonInteractive", "-Command", command]],
+        [process.env.ComSpec, ["/d", "/s", "/c", command]],
+      ]) {
+        rmSync(capturePath, { force: true });
+        const execution = spawnProcessTreeSync(shell, args, {
+          cwd: untrustedWorkspace,
+          env: environment,
+          input: hookPayload(untrustedWorkspace, eventName),
+          timeout: 25_000,
+        });
+        assert.equal(execution.error, undefined, execution.error?.message);
+        assert.equal(execution.signal, null, execution.stderr);
+        assert.equal(execution.status, 0, execution.stderr);
+        assert.deepEqual(JSON.parse(execution.stdout.trim()), {});
+        assert.equal(readFileSync(capturePath, "utf8").trim(), "clean");
+        assert.equal(existsSync(preloadMarker), false);
+        assert.equal(existsSync(plantedMarker), false);
+        assert.ok(
+          execution.elapsedMs < hooks[eventName][0].timeoutSec * 1_000,
+          `${shell} ${eventName} exceeded the installed hook timeout: ${execution.elapsedMs}ms`,
+        );
+      }
     }
 
     const reused = installLocalPlugin(root, {
@@ -285,7 +290,7 @@ test("generated Windows launcher fails nonzero when Node cannot start", {
       const execution = spawnProcessTreeSync(shell, args, {
         cwd,
         input: hookPayload(cwd),
-        timeout: 15_000,
+        timeout: 25_000,
       });
       assert.equal(execution.error, undefined, execution.error?.message);
       assert.notEqual(execution.status, 0, `${shell}: ${execution.stderr}`);

@@ -25,19 +25,22 @@
 - Added a 250 ms monotonic retry deadline for overlapping same-session lifecycle hooks so
 	parallel tool completions do not emit false PostToolUse warnings; persistent
 	locks remain authoritative and are never reclaimed automatically.
-- Bound lock cleanup to UUID-named owner files and stable directory identity;
-	concurrent parent creation is validated, and ambiguous replacement state is
-	left authoritative instead of being recursively removed.
+- Bound lock ownership to an open UUID-named owner file, atomically retired the
+	canonical lock directory before cleanup, and confined deletion to the
+	token-specific retired path. Concurrent acquisitions and ambiguous
+	replacements are never deleted through the live lock name; same-user races on
+	the retired path remain outside the alpha threat model.
 - Moved potentially blocking Windows drive-locality checks before session lock
 	acquisition and required stable nonzero device/inode identity, preventing a
 	healthy hook from holding the lock beyond the overlap window.
 - Accepted canonical-equivalent host cwd spellings such as macOS `/var` and
 	`/private/var`, handled POSIX `ENOTDIR` during recoverable state setup, and
 	kept protected target aliases denied.
-- Raised generated Windows immutable-install hook timeouts to ten seconds so
+- Raised generated Windows immutable-install hook timeouts to fifteen seconds so
 	the nested trusted PowerShell launcher can complete on cold hosts, while
-	retaining five seconds elsewhere. Shell integration tests enforce those
-	product deadlines inside independent process-tree-aware watchdogs.
+	retaining five seconds elsewhere. Shell integration tests enforce the host's
+	native product deadline while compatibility launchers run inside independent
+	process-tree-aware watchdogs.
 - Disabled automatic stale-lock takeover, restored missing binding markers
 	before visible failure, and restricted explicit release to canonical local
 	repository roots.

@@ -136,7 +136,7 @@ authority comes from a fully qualified protected edit target, a previously
 verified session locator, or the hook payload cwd only when neither is present.
 Helper discovery and durable-state ownership therefore remain separate. Each
 checkout command has a five-second timeout. Generated immutable-install hooks
-retain that timeout on Unix; Windows installs use ten seconds so their nested
+retain that timeout on Unix; Windows installs use fifteen seconds so their nested
 trusted PowerShell launcher can complete on a cold host.
 Control responses carry Copilot CLI's top-level fields and VS Code's nested
 `hookSpecificOutput` fields. PascalCase `Edit` payloads are inspected for both
@@ -255,11 +255,19 @@ without deleting, renaming, or replacing its owner. A delayed scheduler wake
 may return later but cannot retry acquisition after the deadline. A lock that
 remains authoritative then fails visibly and requires operator-confirmed cleanup, while a new session uses
 a different hashed lock path. Each claim writes one UUID-named owner file and
-must remain the sole entry in the same stable, nonzero device/inode directory
-identity. Release
-removes only that token and only removes an empty directory; ambiguous or
-replacement state remains authoritative. A filesystem with no stable nonzero
-directory identity fails closed. Individual writes are atomic, while the shared
+holds that file open so copied contents cannot impersonate its filesystem
+identity. The owner must remain the sole entry in the same stable, nonzero
+device/inode directory identity. Release atomically renames the canonical lock
+to a token-specific retired path while the owner is still verified, then
+revalidates and removes only that retired object. A concurrent acquisition uses
+the canonical path and cannot be deleted by retired cleanup. Ambiguous or
+replacement state detected before cleanup is left for operator-confirmed
+recovery. Retired-path rename and unlink remain best-effort against same-user
+races because Node has no portable no-replace directory rename or
+handle-relative unlink; this is outside the alpha threat model. An interrupted
+`.retired` directory requires operator inspection. Locking does not depend on
+birth or change timestamps; a filesystem with no stable nonzero device/inode
+identity fails closed. Individual writes are atomic, while the shared
 generation and provisional state make a crash between files detectable and
 recoverable. A persistent hashed binding marker distinguishes a deleted route
 directory from a never-bound session; if an existing route loses its marker,

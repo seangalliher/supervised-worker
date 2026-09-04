@@ -26,7 +26,9 @@ function filesystemPrelude(sessionId) {
     import path from "node:path";
     const require = createRequire(${JSON.stringify(testModuleUrl)});
     const fs = require("node:fs");
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), "supervised-worker-fault-"));
+    const base = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "supervised-worker-fault-")),
+    );
     const pluginRoot = path.join(base, "plugin");
     const repositoryRoot = path.join(base, "repository");
     const storageRoot = path.join(base, "storage");
@@ -342,6 +344,7 @@ test("acquisition rejects a replacement directory containing the copied owner to
         "session-locks",
         sha256(sessionId),
       );
+      let acquiredIdentity = null;
       fs.readdirSync = (directoryPath, ...args) => {
         const entries = originalReaddirSync(directoryPath, ...args);
         if (!replaced && path.resolve(String(directoryPath)) === path.resolve(lockDirectory)) {
@@ -356,10 +359,16 @@ test("acquisition rejects a replacement directory containing the copied owner to
       };
       fs.lstatSync = (filePath, ...args) => {
         const stats = originalLstatSync(filePath, ...args);
-        if (replaced && path.resolve(String(filePath)) === path.resolve(lockDirectory)) {
+        if (path.resolve(String(filePath)) === path.resolve(lockDirectory)) {
+          if (!replaced) {
+            acquiredIdentity = stats;
+            return stats;
+          }
           return new Proxy(stats, {
             get(target, property) {
-              if (property === "ino") return target.ino + 1n;
+              if (property === "dev" || property === "ino") {
+                return acquiredIdentity[property];
+              }
               const value = Reflect.get(target, property, target);
               return typeof value === "function" ? value.bind(target) : value;
             },
@@ -378,6 +387,7 @@ test("acquisition rejects a replacement directory containing the copied owner to
       }, "PreToolUse");
       assert.equal(output.permissionDecision, "deny");
       assert.equal(replaced, true);
+      assert.notEqual(acquiredIdentity, null);
       assert.equal(originalReaddirSync(lockDirectory).length, 1);
       assert.equal(originalExistsSync(path.join(repositoryRoot, ".supervised-worker")), false);
     ${filesystemCleanup()}
@@ -460,6 +470,49 @@ test("acquisition fails closed when lock directory identity has zero device", ()
       assert.equal(output.permissionDecision, "deny");
       assert.deepEqual(originalReaddirSync(lockDirectory), []);
       assert.equal(originalExistsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("lock lifecycle does not depend on birthtime or ctime identity", () => {
+  runIsolated(`
+    ${filesystemPrelude("timestamp-independent-lock")}
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      let ctimeOffset = 0n;
+      fs.lstatSync = (filePath, ...args) => {
+        const stats = originalLstatSync(filePath, ...args);
+        if (path.resolve(String(filePath)) !== path.resolve(lockDirectory)) return stats;
+        return new Proxy(stats, {
+          get(target, property) {
+            if (property === "birthtimeNs") return 0n;
+            if (property === "ctimeNs") {
+              ctimeOffset += 1n;
+              return target.ctimeNs + ctimeOffset;
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      }, "PreToolUse");
+      assert.deepEqual(output, {});
+      assert.equal(originalExistsSync(lockDirectory), false);
+      assert.equal(originalExistsSync(path.join(repositoryRoot, ".supervised-worker")), true);
     ${filesystemCleanup()}
   `);
 });
@@ -594,6 +647,24 @@ test("release cannot delete an empty replacement session lock after owner read",
         sha256(sessionId),
       );
       let injected = false;
+      let acquiredIdentity = null;
+      let postReplacementIdentityChecks = 0;
+      fs.lstatSync = (filePath, ...args) => {
+        const stats = originalLstatSync(filePath, ...args);
+        if (path.resolve(String(filePath)) !== path.resolve(lockDirectory)) return stats;
+        if (!injected) {
+          acquiredIdentity = stats;
+          return stats;
+        }
+        postReplacementIdentityChecks += 1;
+        return new Proxy(stats, {
+          get(target, property) {
+            if (property === "dev" || property === "ino") return acquiredIdentity[property];
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      };
       fs.readFileSync = (filePath, ...args) => {
         const bytes = originalReadFileSync(filePath, ...args);
         if (!injected && path.dirname(String(filePath)) === lockDirectory) {
@@ -612,6 +683,8 @@ test("release cannot delete an empty replacement session lock after owner read",
       }, "PostToolUse");
       assert.deepEqual(output, {});
       assert.equal(injected, true);
+      assert.notEqual(acquiredIdentity, null);
+      assert.equal(postReplacementIdentityChecks > 0, true);
       assert.deepEqual(fs.readdirSync(lockDirectory), []);
       assert.equal(originalReadFileSync(routePath, "utf8"), routeBefore);
       assert.equal(originalReadFileSync(attachmentPath, "utf8"), attachmentBefore);
@@ -619,9 +692,9 @@ test("release cannot delete an empty replacement session lock after owner read",
   `);
 });
 
-test("release cannot delete an empty replacement after removing its token", () => {
+test("release cleanup cannot delete a new live lock after atomic retirement", () => {
   runIsolated(`
-    ${filesystemPrelude("release-remove-aba")}
+    ${filesystemPrelude("release-retirement-aba")}
     let injected = false;
     try {
       const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
@@ -659,12 +732,15 @@ test("release cannot delete an empty replacement after removing its token", () =
         "session-locks",
         sha256(sessionId),
       );
-      fs.rmSync = (filePath, ...args) => {
-        const result = originalRmSync(filePath, ...args);
-        if (!injected && path.dirname(String(filePath)) === lockDirectory) {
+      const replacementPath = path.join(lockDirectory, "replacement-owner.json");
+      let retiredDirectory = null;
+      fs.renameSync = (source, destination) => {
+        const result = originalRenameSync(source, destination);
+        if (!injected && path.resolve(String(source)) === path.resolve(lockDirectory)) {
           injected = true;
-          originalRmdirSync(lockDirectory);
+          retiredDirectory = String(destination);
           originalMkdirSync(lockDirectory, { recursive: true });
+          originalWriteFileSync(replacementPath, "replacement\\n");
         }
         return result;
       };
@@ -677,9 +753,77 @@ test("release cannot delete an empty replacement after removing its token", () =
       }, "PostToolUse");
       assert.deepEqual(output, {});
       assert.equal(injected, true);
-      assert.deepEqual(originalReaddirSync(lockDirectory), []);
+      assert.notEqual(retiredDirectory, null);
+      assert.deepEqual(originalReaddirSync(lockDirectory), ["replacement-owner.json"]);
+      assert.equal(originalReadFileSync(replacementPath, "utf8"), "replacement\\n");
+      assert.equal(originalExistsSync(retiredDirectory), false);
       assert.equal(originalReadFileSync(routePath, "utf8"), routeBefore);
       assert.equal(originalReadFileSync(attachmentPath, "utf8"), attachmentBefore);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("release cannot delete copied ownership swapped during atomic retirement", () => {
+  runIsolated(`
+    ${filesystemPrelude("release-rename-aba")}
+    let injected = false;
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const common = {
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+      };
+      const planTool = {
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      };
+      handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse");
+      fs.writeFileSync(planPath(repositoryRoot), JSON.stringify({
+        schemaVersion: 1,
+        mode: "active",
+        goal: "Exercise retirement identity validation.",
+        items: [{ id: "one", title: "One", status: "pending" }],
+        completion: null,
+      }) + "\\n");
+      handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse");
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      let retiredDirectory = null;
+      let copiedOwnerPath = null;
+      let copiedOwnerBytes = null;
+      fs.renameSync = (source, destination) => {
+        if (!injected && path.resolve(String(source)) === path.resolve(lockDirectory)) {
+          injected = true;
+          retiredDirectory = String(destination);
+          const [ownerName] = originalReaddirSync(lockDirectory);
+          const ownerPath = path.join(lockDirectory, ownerName);
+          copiedOwnerBytes = originalReadFileSync(ownerPath, "utf8");
+          originalRmSync(lockDirectory, { recursive: true, force: true });
+          originalMkdirSync(lockDirectory, { recursive: true });
+          copiedOwnerPath = path.join(lockDirectory, ownerName);
+          originalWriteFileSync(copiedOwnerPath, copiedOwnerBytes);
+        }
+        return originalRenameSync(source, destination);
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        ...common,
+        hook_event_name: "PostToolUse",
+        tool_name: "read_file",
+        tool_input: { filePath: path.join(repositoryRoot, "README.md") },
+      }, "PostToolUse");
+      assert.deepEqual(output, {});
+      assert.equal(injected, true);
+      assert.notEqual(retiredDirectory, null);
+      const retiredOwnerPath = path.join(retiredDirectory, path.basename(copiedOwnerPath));
+      assert.equal(originalReadFileSync(retiredOwnerPath, "utf8"), copiedOwnerBytes);
+      assert.deepEqual(originalReaddirSync(retiredDirectory), [path.basename(copiedOwnerPath)]);
+      assert.equal(originalExistsSync(lockDirectory), false);
     ${filesystemCleanup()}
   `);
 });
