@@ -15,6 +15,8 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { releaseAttachment } from "../src/core.mjs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cli = path.join(root, "src", "cli.mjs");
 const hookLauncher = path.join(root, "src", "hook-launcher.mjs");
@@ -240,7 +242,7 @@ test("release rejects a subst repository root without deleting ownership", {
   }
 });
 
-test("release rejects a junction or symlink repository root without deleting ownership", () => {
+test("release API rejects a junction or symlink repository root without deleting ownership", () => {
   const cwd = workspace();
   const alias = workspace();
   rmSync(alias, { recursive: true, force: true });
@@ -255,8 +257,35 @@ test("release rejects a junction or symlink repository root without deleting own
       attachedAt: "2026-09-01T00:00:00Z",
     })}\n`,
   );
-  symlinkSync(cwd, alias, process.platform === "win32" ? "junction" : "dir");
   try {
+    symlinkSync(cwd, alias, process.platform === "win32" ? "junction" : "dir");
+    assert.throws(() => releaseAttachment(alias), /canonical repository root/);
+    assert.equal(existsSync(attachmentPath), true);
+  } finally {
+    rmSync(alias, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("release CLI rejects a Windows junction cwd without deleting ownership", {
+  skip: process.platform !== "win32",
+}, () => {
+  const cwd = workspace();
+  const alias = workspace();
+  rmSync(alias, { recursive: true, force: true });
+  const state = path.join(cwd, ".supervised-worker");
+  mkdirSync(state, { recursive: true });
+  const attachmentPath = path.join(state, "attachment.json");
+  writeFileSync(
+    attachmentPath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      sessionHash: "a".repeat(64),
+      attachedAt: "2026-09-01T00:00:00Z",
+    })}\n`,
+  );
+  try {
+    symlinkSync(cwd, alias, "junction");
     const result = run(["release"], { cwd: alias });
     assert.equal(result.status, 1, result.stderr);
     assert.equal(JSON.parse(result.stdout).released, false);
