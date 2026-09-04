@@ -332,10 +332,10 @@ test("acquisition rejects multiple owner entries", () => {
   `);
 });
 
-test("acquisition rejects a replacement directory containing the copied owner token", () => {
+test("acquisition rejects copied owner identity at the canonical owner path", () => {
   runIsolated(`
     ${filesystemPrelude("copied-token-aba")}
-    let replaced = false;
+    let replacementCompleted = false;
     try {
       const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
       const lockDirectory = path.join(
@@ -344,37 +344,28 @@ test("acquisition rejects a replacement directory containing the copied owner to
         "session-locks",
         sha256(sessionId),
       );
-      let acquiredIdentity = null;
+      const copiedOwnerPath = path.join(storageRoot, "copied-owner.json");
+      let ownerPath = null;
       fs.readdirSync = (directoryPath, ...args) => {
         const entries = originalReaddirSync(directoryPath, ...args);
-        if (!replaced && path.resolve(String(directoryPath)) === path.resolve(lockDirectory)) {
-          replaced = true;
-          const tokenPath = path.join(lockDirectory, entries[0]);
-          const tokenBytes = originalReadFileSync(tokenPath);
-          originalRmSync(lockDirectory, { recursive: true, force: true });
-          originalMkdirSync(lockDirectory, { recursive: true });
-          originalWriteFileSync(tokenPath, tokenBytes);
+        if (
+          !replacementCompleted &&
+          path.resolve(String(directoryPath)) === path.resolve(lockDirectory)
+        ) {
+          ownerPath = path.join(lockDirectory, entries[0]);
+          originalWriteFileSync(copiedOwnerPath, originalReadFileSync(ownerPath));
+          replacementCompleted = true;
         }
         return entries;
       };
       fs.lstatSync = (filePath, ...args) => {
-        const stats = originalLstatSync(filePath, ...args);
-        if (path.resolve(String(filePath)) === path.resolve(lockDirectory)) {
-          if (!replaced) {
-            acquiredIdentity = stats;
-            return stats;
-          }
-          return new Proxy(stats, {
-            get(target, property) {
-              if (property === "dev" || property === "ino") {
-                return acquiredIdentity[property];
-              }
-              const value = Reflect.get(target, property, target);
-              return typeof value === "function" ? value.bind(target) : value;
-            },
-          });
+        if (
+          replacementCompleted &&
+          path.resolve(String(filePath)) === path.resolve(ownerPath)
+        ) {
+          return originalLstatSync(copiedOwnerPath, ...args);
         }
-        return stats;
+        return originalLstatSync(filePath, ...args);
       };
       syncBuiltinESMExports();
       const output = handleHook({
@@ -386,9 +377,55 @@ test("acquisition rejects a replacement directory containing the copied owner to
         tool_input: { file_path: planPath(repositoryRoot) },
       }, "PreToolUse");
       assert.equal(output.permissionDecision, "deny");
-      assert.equal(replaced, true);
-      assert.notEqual(acquiredIdentity, null);
+      assert.equal(replacementCompleted, true);
+      assert.notEqual(ownerPath, null);
+      assert.notEqual(
+        originalLstatSync(ownerPath, { bigint: true }).ino,
+        originalLstatSync(copiedOwnerPath, { bigint: true }).ino,
+      );
+      assert.equal(originalExistsSync(lockDirectory), true);
       assert.equal(originalReaddirSync(lockDirectory).length, 1);
+      assert.equal(originalExistsSync(path.join(repositoryRoot, ".supervised-worker")), false);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("acquisition fails closed when an open owner blocks replacement", () => {
+  runIsolated(`
+    ${filesystemPrelude("copied-token-enotempty")}
+    let replacementAttempted = false;
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      fs.readdirSync = (directoryPath, ...args) => {
+        if (
+          !replacementAttempted &&
+          path.resolve(String(directoryPath)) === path.resolve(lockDirectory)
+        ) {
+          replacementAttempted = true;
+          const error = new Error("open owner blocked recursive replacement");
+          error.code = "ENOTEMPTY";
+          throw error;
+        }
+        return originalReaddirSync(directoryPath, ...args);
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        hook_event_name: "PreToolUse",
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      }, "PreToolUse");
+      assert.equal(output.permissionDecision, "deny");
+      assert.equal(replacementAttempted, true);
+      assert.equal(originalExistsSync(lockDirectory), true);
       assert.equal(originalExistsSync(path.join(repositoryRoot, ".supervised-worker")), false);
     ${filesystemCleanup()}
   `);
@@ -607,7 +644,7 @@ test("owner creation failure cannot delete a replacement session lock", () => {
   `);
 });
 
-test("release cannot delete an empty replacement session lock after owner read", () => {
+test("release rejects copied owner identity after reading the owner", () => {
   runIsolated(`
     ${filesystemPrelude("release-read-aba")}
     try {
@@ -646,33 +683,33 @@ test("release cannot delete an empty replacement session lock after owner read",
         "session-locks",
         sha256(sessionId),
       );
-      let injected = false;
-      let acquiredIdentity = null;
-      let postReplacementIdentityChecks = 0;
+      const copiedOwnerPath = path.join(storageRoot, "copied-release-owner.json");
+      let replacementCompleted = false;
+      let ownerPath = null;
+      let retirementAttempted = false;
       fs.lstatSync = (filePath, ...args) => {
-        const stats = originalLstatSync(filePath, ...args);
-        if (path.resolve(String(filePath)) !== path.resolve(lockDirectory)) return stats;
-        if (!injected) {
-          acquiredIdentity = stats;
-          return stats;
+        if (
+          replacementCompleted &&
+          path.resolve(String(filePath)) === path.resolve(ownerPath)
+        ) {
+          return originalLstatSync(copiedOwnerPath, ...args);
         }
-        postReplacementIdentityChecks += 1;
-        return new Proxy(stats, {
-          get(target, property) {
-            if (property === "dev" || property === "ino") return acquiredIdentity[property];
-            const value = Reflect.get(target, property, target);
-            return typeof value === "function" ? value.bind(target) : value;
-          },
-        });
+        return originalLstatSync(filePath, ...args);
       };
       fs.readFileSync = (filePath, ...args) => {
         const bytes = originalReadFileSync(filePath, ...args);
-        if (!injected && path.dirname(String(filePath)) === lockDirectory) {
-          injected = true;
-          originalRmSync(lockDirectory, { recursive: true, force: true });
-          originalMkdirSync(lockDirectory, { recursive: true });
+        if (!replacementCompleted && path.dirname(String(filePath)) === lockDirectory) {
+          ownerPath = String(filePath);
+          originalWriteFileSync(copiedOwnerPath, bytes);
+          replacementCompleted = true;
         }
         return bytes;
+      };
+      fs.renameSync = (source, destination) => {
+        if (path.resolve(String(source)) === path.resolve(lockDirectory)) {
+          retirementAttempted = true;
+        }
+        return originalRenameSync(source, destination);
       };
       syncBuiltinESMExports();
       const output = handleHook({
@@ -682,10 +719,80 @@ test("release cannot delete an empty replacement session lock after owner read",
         tool_input: { filePath: path.join(repositoryRoot, "README.md") },
       }, "PostToolUse");
       assert.deepEqual(output, {});
-      assert.equal(injected, true);
-      assert.notEqual(acquiredIdentity, null);
-      assert.equal(postReplacementIdentityChecks > 0, true);
-      assert.deepEqual(fs.readdirSync(lockDirectory), []);
+      assert.equal(replacementCompleted, true);
+      assert.notEqual(ownerPath, null);
+      assert.notEqual(
+        originalLstatSync(ownerPath, { bigint: true }).ino,
+        originalLstatSync(copiedOwnerPath, { bigint: true }).ino,
+      );
+      assert.equal(retirementAttempted, false);
+      assert.equal(originalExistsSync(lockDirectory), true);
+      assert.equal(originalReaddirSync(lockDirectory).length, 1);
+      assert.equal(originalReadFileSync(routePath, "utf8"), routeBefore);
+      assert.equal(originalReadFileSync(attachmentPath, "utf8"), attachmentBefore);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("release fails closed when an open owner blocks replacement", () => {
+  runIsolated(`
+    ${filesystemPrelude("release-read-enotempty")}
+    let replacementAttempted = false;
+    try {
+      const { handleHook, planPath, sha256 } = await import(${JSON.stringify(coreUrl)});
+      const common = {
+        session_id: sessionId,
+        transcript_path: transcriptPath,
+        cwd: pluginRoot,
+      };
+      const planTool = {
+        tool_name: "Write",
+        tool_input: { file_path: planPath(repositoryRoot) },
+      };
+      handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse");
+      fs.writeFileSync(planPath(repositoryRoot), JSON.stringify({
+        schemaVersion: 1,
+        mode: "active",
+        goal: "Exercise blocked replacement during release.",
+        items: [{ id: "one", title: "One", status: "pending" }],
+        completion: null,
+      }) + "\\n");
+      handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse");
+      const routePath = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-roots",
+        sha256(sessionId),
+        "route.json",
+      );
+      const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
+      const routeBefore = fs.readFileSync(routePath, "utf8");
+      const attachmentBefore = fs.readFileSync(attachmentPath, "utf8");
+      const lockDirectory = path.join(
+        storageRoot,
+        "supervised-worker",
+        "session-locks",
+        sha256(sessionId),
+      );
+      fs.readFileSync = (filePath, ...args) => {
+        if (!replacementAttempted && path.dirname(String(filePath)) === lockDirectory) {
+          replacementAttempted = true;
+          const error = new Error("open owner blocked recursive replacement");
+          error.code = "ENOTEMPTY";
+          throw error;
+        }
+        return originalReadFileSync(filePath, ...args);
+      };
+      syncBuiltinESMExports();
+      const output = handleHook({
+        ...common,
+        hook_event_name: "PostToolUse",
+        tool_name: "read_file",
+        tool_input: { filePath: path.join(repositoryRoot, "README.md") },
+      }, "PostToolUse");
+      assert.deepEqual(output, {});
+      assert.equal(replacementAttempted, true);
+      assert.equal(originalExistsSync(lockDirectory), true);
       assert.equal(originalReadFileSync(routePath, "utf8"), routeBefore);
       assert.equal(originalReadFileSync(attachmentPath, "utf8"), attachmentBefore);
     ${filesystemCleanup()}
