@@ -13,7 +13,11 @@ import {
 import {
   checkpointSession,
   handleHook,
+  inspectLifecycleLock,
+  lifecycleFailureDetails,
   MAX_CHECKPOINT_REQUEST_BYTES,
+  MAX_LIFECYCLE_REQUEST_BYTES,
+  recoverLifecycleLock,
   releaseAttachment,
   resumeSession,
   summarizePlan,
@@ -123,6 +127,7 @@ async function validateRepository() {
     "policy/constitution.json",
     "schemas/checkpoint.schema.json",
     "schemas/episode.schema.json",
+    "schemas/lifecycle.schema.json",
     "schemas/local-campaign-receipt.schema.json",
     "schemas/model-receipt.schema.json",
     "schemas/plan.schema.json",
@@ -334,7 +339,7 @@ async function main() {
   const [command = "help", argument, ...argumentsAfter] = process.argv.slice(2);
   const hasNoArguments = argument === undefined && argumentsAfter.length === 0;
   const usage =
-    "Usage: node src/cli.mjs <validate|doctor|install|status|checkpoint|resume|release|queue inspect OWNER/REPO --state open|closed|all|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
+    "Usage: node src/cli.mjs <validate|doctor|install|status|checkpoint|resume|release|lifecycle inspect|lifecycle recover|queue inspect OWNER/REPO --state open|closed|all|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
   if (command === "help" && hasNoArguments) {
     process.stdout.write(usage);
     return;
@@ -365,7 +370,7 @@ async function main() {
         `${JSON.stringify(hookInputFailure(
           argument,
           argument === "PreToolUse"
-            ? "Supervised Worker denied a plan write because the hook input exceeded its size limit."
+            ? "Supervised Worker denied the invocation because the hook input exceeded its size limit."
             : "Supervised Worker ignored oversized hook input and failed open visibly.",
         ))}\n`,
       );
@@ -379,7 +384,7 @@ async function main() {
         `${JSON.stringify(hookInputFailure(
           argument,
           argument === "PreToolUse"
-            ? "Supervised Worker denied a plan write because the hook input was malformed."
+            ? "Supervised Worker denied the invocation because the hook input was malformed."
             : "Supervised Worker ignored malformed hook input and failed open visibly.",
         ))}\n`,
       );
@@ -390,7 +395,7 @@ async function main() {
         `${JSON.stringify(hookInputFailure(
           argument,
           argument === "PreToolUse"
-            ? "Supervised Worker denied a plan write because the hook input was not a JSON object."
+            ? "Supervised Worker denied the invocation because the hook input was not a JSON object."
             : "Supervised Worker ignored non-object hook input and failed open visibly.",
         ))}\n`,
       );
@@ -413,9 +418,22 @@ async function main() {
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       if (result.status !== (command === "checkpoint" ? "checkpointed" : "resumed")) process.exitCode = 1;
     } catch (error) {
-      process.stdout.write(`${JSON.stringify({ status: "unconfirmed", error: error.message })}\n`);
+      process.stdout.write(`${JSON.stringify(lifecycleFailureDetails(error) ?? { status: "unconfirmed", error: error.message })}\n`);
       process.exitCode = 1;
     }
+    return;
+  }
+  if (command === "lifecycle" && ["inspect", "recover"].includes(argument) && argumentsAfter.length === 0) {
+    let request = null;
+    try {
+      request = parseWorkflowJson(await readStdin(MAX_LIFECYCLE_REQUEST_BYTES));
+    } catch {
+      request = null;
+    }
+    const result = argument === "recover"
+      ? recoverLifecycleLock(process.cwd(), request) : inspectLifecycleLock(process.cwd(), request);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    if (result.status === "unconfirmed") process.exitCode = 1;
     return;
   }
   if (command === "campaign") {
@@ -486,9 +504,9 @@ async function main() {
   if (command === "release" && hasNoArguments) {
     try {
       process.stdout.write(`${JSON.stringify(releaseAttachment(process.cwd()), null, 2)}\n`);
-    } catch {
+    } catch (error) {
       process.stdout.write(
-        `${JSON.stringify({ released: false, message: "Local attachment could not be released safely." }, null, 2)}\n`,
+        `${JSON.stringify(lifecycleFailureDetails(error) ?? { released: false, message: "Local attachment could not be released safely." }, null, 2)}\n`,
       );
       process.exitCode = 1;
     }

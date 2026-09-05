@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervised-worker.dev/schemas/lifecycle.schema.json",
+  "title": "Explicit Lifecycle Lock Inspection And Recovery",
+  "anyOf": [
+    { "$ref": "#/$defs/diagnostic" }, { "$ref": "#/$defs/inspectRequest" },
+    { "$ref": "#/$defs/recoverRequest" }, { "$ref": "#/$defs/inspection" },
+    { "$ref": "#/$defs/recoveryIntent" }, { "$ref": "#/$defs/recoveryOutcome" },
+    { "$ref": "#/$defs/recoveryResult" }
+  ],
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "generation": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/uuid" }] },
+    "nullableHash": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/hash" }] },
+    "scope": { "enum": ["repository", "session"] },
+    "pid": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "identity": {
+      "type": "object", "additionalProperties": false, "required": ["dev", "ino"],
+      "properties": {
+        "dev": { "type": "string", "pattern": "^[1-9][0-9]{0,19}$" },
+        "ino": { "type": "string", "pattern": "^[1-9][0-9]{0,19}$" }
+      }
+    },
+    "boundary": {
+      "type": "object", "additionalProperties": false, "required": ["pathHash", "identity"],
+      "properties": { "pathHash": { "$ref": "#/$defs/hash" }, "identity": { "$ref": "#/$defs/identity" } }
+    },
+    "file": {
+      "type": "object", "additionalProperties": false, "required": ["hash", "identity"],
+      "properties": { "hash": { "$ref": "#/$defs/hash" }, "identity": { "$ref": "#/$defs/identity" } }
+    },
+    "attachment": {
+      "anyOf": [
+        { "type": "object", "additionalProperties": false, "required": ["state"], "properties": { "state": { "const": "absent" } } },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["state", "version", "file", "sessionHash", "status", "routeGeneration", "claimGeneration"],
+          "properties": {
+            "state": { "const": "present" }, "version": { "enum": [1, 2, 3] }, "file": { "$ref": "#/$defs/file" },
+            "sessionHash": { "$ref": "#/$defs/hash" }, "status": { "enum": ["active", "provisional", "checkpointed"] },
+            "routeGeneration": { "$ref": "#/$defs/generation" }, "claimGeneration": { "$ref": "#/$defs/generation" }
+          }
+        }
+      ]
+    },
+    "anchor": {
+      "type": "object", "additionalProperties": false, "required": ["sessionHash", "root", "transcript", "workspace"],
+      "properties": {
+        "sessionHash": { "$ref": "#/$defs/hash" }, "root": { "$ref": "#/$defs/boundary" },
+        "transcript": { "$ref": "#/$defs/identity" }, "workspace": { "$ref": "#/$defs/file" }
+      }
+    },
+    "routing": {
+      "anyOf": [
+        { "type": "object", "additionalProperties": false, "required": ["state"], "properties": { "state": { "enum": ["unattached", "unrouted"] } } },
+        {
+          "type": "object", "additionalProperties": false, "required": ["state", "anchor"],
+          "properties": { "state": { "const": "absent" }, "anchor": { "$ref": "#/$defs/anchor" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["state", "anchor", "route", "marker", "generation", "status", "repository"],
+          "properties": {
+            "state": { "const": "routed" }, "anchor": { "$ref": "#/$defs/anchor" },
+            "route": { "$ref": "#/$defs/file" }, "marker": { "$ref": "#/$defs/file" },
+            "generation": { "$ref": "#/$defs/uuid" }, "status": { "enum": ["active", "provisional", "released"] },
+            "repository": { "$ref": "#/$defs/boundary" }
+          }
+        }
+      ]
+    },
+    "snapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scope", "location", "token", "processId", "directory", "owner", "repository", "root", "parent", "attachment", "routing"],
+      "properties": {
+        "scope": { "$ref": "#/$defs/scope" }, "location": { "enum": ["canonical", "retired"] },
+        "token": { "$ref": "#/$defs/uuid" }, "processId": { "$ref": "#/$defs/pid" },
+        "directory": { "$ref": "#/$defs/identity" }, "owner": { "$ref": "#/$defs/file" },
+        "repository": { "$ref": "#/$defs/boundary" }, "root": { "$ref": "#/$defs/boundary" },
+        "parent": { "$ref": "#/$defs/boundary" }, "attachment": { "$ref": "#/$defs/attachment" },
+        "routing": { "$ref": "#/$defs/routing" }
+      }
+    },
+    "sessionId": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^\\/\u0000-\u0020\u007f:]+$" },
+    "transcriptPath": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\u0000-\u001f\u007f]+$" },
+    "inspectRequest": {
+      "type": "object", "additionalProperties": false, "required": ["scope"],
+      "properties": {
+        "scope": { "$ref": "#/$defs/scope" }, "location": { "enum": ["canonical", "retired"] },
+        "token": { "$ref": "#/$defs/uuid" }, "session_id": { "$ref": "#/$defs/sessionId" },
+        "transcript_path": { "$ref": "#/$defs/transcriptPath" }
+      },
+      "dependentRequired": { "session_id": ["transcript_path"], "transcript_path": ["session_id"] },
+      "allOf": [
+        { "if": { "required": ["scope"], "properties": { "scope": { "const": "session" } } }, "then": { "required": ["session_id", "transcript_path"] } },
+        { "if": { "required": ["location"], "properties": { "location": { "const": "retired" } } }, "then": { "required": ["token"] } }
+      ]
+    },
+    "recoverRequest": {
+      "type": "object", "additionalProperties": false, "required": ["expected"],
+      "properties": {
+        "expected": { "$ref": "#/$defs/snapshot" }, "intentHash": { "$ref": "#/$defs/hash" },
+        "session_id": { "$ref": "#/$defs/sessionId" }, "transcript_path": { "$ref": "#/$defs/transcriptPath" }
+      },
+      "dependentRequired": { "session_id": ["transcript_path"], "transcript_path": ["session_id"] },
+      "if": { "properties": { "expected": { "properties": { "scope": { "const": "session" } } } } },
+      "then": { "required": ["session_id", "transcript_path"] }
+    },
+    "diagnostic": {
+      "type": "object", "additionalProperties": false,
+      "required": ["code", "scope", "operation", "phase", "syscall", "errorCode", "attempts", "token", "processId", "cause", "nextStep"],
+      "properties": {
+        "code": { "enum": ["LIFECYCLE_ACQUISITION_CONTENTION", "LIFECYCLE_OWNER_LIVE", "LIFECYCLE_OWNER_DEAD", "LIFECYCLE_OWNER_UNKNOWN", "LIFECYCLE_IDENTITY_REJECTED", "LIFECYCLE_OWNER_MALFORMED", "LIFECYCLE_SYSCALL_FAILURE", "LIFECYCLE_EVIDENCE_PERSISTENCE_FAILURE"] },
+        "scope": { "enum": [null, "repository", "session"] }, "operation": { "enum": ["acquire", "release", "guard", "inspect", "recover"] },
+        "phase": { "enum": ["acquisition", "owner-observation", "ownership-validation", "descriptor-close", "retirement", "retired-validation", "owner-removal", "directory-removal", "request-validation", "binding-validation", "guard-acquisition", "intent-persistence", "outcome-persistence"] },
+        "syscall": { "enum": [null, "close", "fstat", "fsync", "kill", "lstat", "mkdir", "open", "read", "readdir", "realpath", "rename", "rm", "rmdir", "unlink", "write"] },
+        "errorCode": { "enum": [null, "UNKNOWN", "EACCES", "EBADF", "EBUSY", "EEXIST", "EINVAL", "EIO", "EISDIR", "ELOOP", "EMFILE", "ENAMETOOLONG", "ENFILE", "ENOENT", "ENOMEM", "ENOSPC", "ENOTDIR", "ENOTEMPTY", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EROFS", "ESRCH", "ESTALE", "ETXTBSY", "EXDEV"] },
+        "attempts": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "token": { "$ref": "#/$defs/generation" },
+        "processId": { "anyOf": [{ "type": "null" }, { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }] },
+        "cause": { "enum": ["cause-unobserved", "syscall-observed", "not-established"] },
+        "nextStep": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      }
+    },
+    "diagnostics": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/diagnostic" } },
+    "inspection": {
+      "type": "object", "additionalProperties": false, "required": ["schemaVersion", "kind", "status", "expected", "diagnostics"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "lifecycle-inspection" },
+        "status": { "enum": ["inspected", "absent", "unconfirmed"] },
+        "expected": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/snapshot" }] },
+        "diagnostics": { "$ref": "#/$defs/diagnostics" }
+      },
+      "if": { "properties": { "status": { "const": "inspected" } } },
+      "then": { "properties": { "expected": { "$ref": "#/$defs/snapshot" } } },
+      "else": { "properties": { "expected": { "type": "null" } } }
+    },
+    "recoveryIntent": {
+      "type": "object", "additionalProperties": false, "required": ["schemaVersion", "kind", "expected", "death", "destination"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "lifecycle-recovery-intent" }, "expected": { "$ref": "#/$defs/snapshot" },
+        "death": {
+          "type": "object", "additionalProperties": false, "required": ["processId", "errorCode"],
+          "properties": { "processId": { "$ref": "#/$defs/pid" }, "errorCode": { "const": "ESRCH" } }
+        },
+        "destination": { "type": "string", "pattern": "^(lifecycle|[0-9a-f]{64})\\.[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.recovered$" }
+      }
+    },
+    "recoveryOutcome": {
+      "type": "object", "additionalProperties": false, "required": ["schemaVersion", "kind", "intentHash", "status", "diagnostics"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "lifecycle-recovery-outcome" },
+        "intentHash": { "$ref": "#/$defs/hash" }, "status": { "enum": ["recovered", "unconfirmed"] }, "diagnostics": { "$ref": "#/$defs/diagnostics" }
+      },
+      "if": { "properties": { "status": { "const": "recovered" } } },
+      "then": { "properties": { "diagnostics": { "maxItems": 0 } } },
+      "else": { "properties": { "diagnostics": { "minItems": 1 } } }
+    },
+    "recoveryResult": {
+      "type": "object", "additionalProperties": false, "required": ["schemaVersion", "kind", "status", "intentHash", "outcomeHash", "diagnostics"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "lifecycle-recovery" },
+        "status": { "enum": ["recovered", "already-recovered", "unconfirmed"] },
+        "intentHash": { "$ref": "#/$defs/nullableHash" }, "outcomeHash": { "$ref": "#/$defs/nullableHash" }, "diagnostics": { "$ref": "#/$defs/diagnostics" }
+      },
+      "if": { "properties": { "status": { "enum": ["recovered", "already-recovered"] } } },
+      "then": { "properties": { "intentHash": { "$ref": "#/$defs/hash" }, "outcomeHash": { "$ref": "#/$defs/hash" }, "diagnostics": { "maxItems": 0 } } },
+      "else": { "properties": { "diagnostics": { "minItems": 1 } } }
+    }
+  }
+}

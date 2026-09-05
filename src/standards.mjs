@@ -34,6 +34,7 @@ const SKILL_KEYS = new Set([
 const SCHEMA_FILES = [
   "checkpoint.schema.json",
   "episode.schema.json",
+  "lifecycle.schema.json",
   "local-campaign-receipt.schema.json",
   "model-receipt.schema.json",
   "plan.schema.json",

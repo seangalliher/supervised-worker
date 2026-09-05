@@ -664,12 +664,14 @@ test("repository lock cleanup cannot remove a copied replacement owner", () => {
         return originalLstatSync(filePath, ...args);
       };
       syncBuiltinESMExports();
-      assert.deepEqual(handleHook({
+      const output = handleHook({
         cwd: repositoryRoot,
         session_id: sessionId,
         tool_name: "Write",
         tool_input: { file_path: planPath(repositoryRoot) },
-      }, "PreToolUse"), {});
+      }, "PreToolUse");
+      assert.equal(output.permissionDecision, "deny");
+      assert.match(output.permissionDecisionReason, /LIFECYCLE_IDENTITY_REJECTED/);
       assert.equal(injected, true);
       assert.equal(originalExistsSync(lockDirectory), true);
       assert.equal(originalExistsSync(ownerPath), true);
@@ -1325,7 +1327,7 @@ test("release rejects copied owner identity after reading the owner", () => {
         tool_name: "read_file",
         tool_input: { filePath: path.join(repositoryRoot, "README.md") },
       }, "PostToolUse");
-      assert.deepEqual(output, {});
+      assert.match(output.additionalContext, /LIFECYCLE_IDENTITY_REJECTED/);
       assert.equal(replacementCompleted, true);
       assert.notEqual(ownerPath, null);
       assert.notEqual(
@@ -1397,7 +1399,7 @@ test("release fails closed when an open owner blocks replacement", () => {
         tool_name: "read_file",
         tool_input: { filePath: path.join(repositoryRoot, "README.md") },
       }, "PostToolUse");
-      assert.deepEqual(output, {});
+      assert.match(output.additionalContext, /LIFECYCLE_SYSCALL_FAILURE/);
       assert.equal(replacementAttempted, true);
       assert.equal(originalExistsSync(lockDirectory), true);
       assert.equal(originalReadFileSync(routePath, "utf8"), routeBefore);
@@ -1531,7 +1533,7 @@ test("release cannot delete copied ownership swapped during atomic retirement", 
         tool_name: "read_file",
         tool_input: { filePath: path.join(repositoryRoot, "README.md") },
       }, "PostToolUse");
-      assert.deepEqual(output, {});
+      assert.match(output.additionalContext, /LIFECYCLE_IDENTITY_REJECTED/);
       assert.equal(injected, true);
       assert.notEqual(retiredDirectory, null);
       const retiredOwnerPath = path.join(retiredDirectory, path.basename(copiedOwnerPath));
@@ -1607,7 +1609,7 @@ test("release leaves its owner token when directory identity becomes zero", () =
         tool_name: "read_file",
         tool_input: { filePath: path.join(repositoryRoot, "README.md") },
       }, "PostToolUse");
-      assert.deepEqual(output, {});
+      assert.match(output.additionalContext, /LIFECYCLE_IDENTITY_REJECTED/);
       assert.equal(zeroIdentity, true);
       assert.equal(originalReaddirSync(lockDirectory).length, 1);
       assert.equal(originalReadFileSync(routePath, "utf8"), routeBefore);
@@ -1681,7 +1683,7 @@ test("release leaves its owner token when directory device becomes zero", () => 
         tool_name: "read_file",
         tool_input: { filePath: path.join(repositoryRoot, "README.md") },
       }, "PostToolUse");
-      assert.deepEqual(output, {});
+      assert.match(output.additionalContext, /LIFECYCLE_IDENTITY_REJECTED/);
       assert.equal(zeroIdentity, true);
       assert.equal(originalReaddirSync(lockDirectory).length, 1);
       assert.equal(originalReadFileSync(routePath, "utf8"), routeBefore);

@@ -294,8 +294,8 @@ where an uncached drive fails closed without spawning another check. A contender
 uses a 250 ms monotonic retry deadline for a concurrently completing hook,
 without deleting, renaming, or replacing its owner. A delayed scheduler wake
 may return later but cannot retry acquisition after the deadline. A lock that
-remains authoritative then fails visibly and requires operator-confirmed
-cleanup. A new session has a different hashed session lock but cannot bypass
+remains authoritative then fails visibly and requires explicit snapshot-bound
+recovery. A new session has a different hashed session lock but cannot bypass
 the repository's shared lifecycle lock. Each lock writes one UUID-named owner file and
 holds that file open so copied contents cannot impersonate its filesystem
 identity. The owner must remain the sole entry in the same stable, nonzero
@@ -317,6 +317,70 @@ the hook restores the marker and fails visibly. Normal Stop release removes the
 attachment and retains a released route tombstone for later reconciliation. If
 writing the tombstone or removing the attachment fails, the hook reports that
 cleanup failed and does not claim the ownership was released.
+
+### Lifecycle Failure And Recovery
+
+`inspectLifecycleLock(cwd, request)` and `recoverLifecycleLock(cwd, request)`
+share closed, bounded shapes with [the lifecycle schema](../schemas/lifecycle.schema.json).
+The `lifecycle inspect` and `lifecycle recover` CLI commands accept at most
+8 KiB of duplicate-key-free JSON. Paths are derived from the canonical local
+repository cwd and validated scope, UUID token and transcript/session anchor.
+Inspection never acquires a lock, migrates an attachment or repairs a route
+marker. An absent attachment, a legacy null generation, and unavailable state
+are different observations; null is not a wildcard.
+
+Diagnostics distinguish `LIFECYCLE_ACQUISITION_CONTENTION`,
+`LIFECYCLE_OWNER_LIVE`, `LIFECYCLE_OWNER_DEAD`, `LIFECYCLE_OWNER_UNKNOWN`,
+`LIFECYCLE_OWNER_MALFORMED`, `LIFECYCLE_IDENTITY_REJECTED`,
+`LIFECYCLE_SYSCALL_FAILURE` and `LIFECYCLE_EVIDENCE_PERSISTENCE_FAILURE`.
+They carry scope, operation, phase, allowlisted syscall/error code, attempt
+count, verified token/PID when available, cause classification and next step.
+No raw exception, tool argument or transcript content is included. The hook
+uses existing reason/context/system-message fields, not new host control fields.
+PreToolUse denies the invocation. A primary Stop block already recorded before
+cleanup remains a block with the diagnostic; acquisition failure before a primary
+Stop decision and other hook failures still fail open visibly. CLI lifecycle
+failures retain a known primary result separately from cleanup diagnostics and
+exit nonzero. Cleanup cannot establish rollback or verified queue completion.
+
+Owned retirement retries only `EBUSY` from its pre-retirement rename: at most
+three attempts in a 100 ms `performance.now()` budget, waiting at most 25 ms
+or the remaining budget between attempts. This is a retry budget, not a hard
+syscall deadline. Every retry revalidates root/parent and directory identities,
+sole owner entry, exact token/PID and owner identity. Windows closes the held
+owner before rename and reopens/verifies it after a failed rename. Changed
+identity, permission failure, an occupied destination or ambiguous retirement
+does not authorize another rename. Dead-owner recovery does not use this retry.
+
+Recovery binds the complete inspected snapshot: owner byte hash and nonzero
+device/inode, directory/root/parent identity, exact attachment bytes and identity,
+session/status/route and claim generations, and matching route, marker and
+repository identities. Routed recovery requires its validated transcript anchor.
+Valid v1 owners and legacy attachments remain unchanged. Only signal-zero
+`ESRCH` establishes death; a live PID or any other result prohibits recovery.
+Completely unbound session locks cannot prove their associated repository.
+
+Before retirement, the helper durably writes, flushes and reads back an immutable
+metadata-only intent under `.supervised-worker/lifecycle-evidence/`. Full bindings
+and PID death are rechecked before mutation. Canonical repository recovery uses
+the occupied old lock as exclusion; session and old `.retired` recovery also hold
+the associated repository guard without acquiring a session lock beneath it.
+If both canonical locks are dead, repository recovery must complete first.
+
+The rename destination `<canonical-lock>.<token>.recovered` remains permanently
+nonempty. It is the competing-recoverer fence: a delayed recoverer cannot rename
+a replacement into that occupied destination. It is never emptied, overwritten,
+garbage-collected or restored over a current owner. Post-rename identity checks
+retain unexpected objects and report unconfirmed state. Immutable outcome
+evidence references the intent hash; failed evidence persistence is not success.
+An interrupted request may confirm the exact already-retired object using its
+original snapshot and matching intent, while leaving a new canonical owner alone.
+Unprovable or empty remnants remain untouched when observed. This protocol
+covers cooperating hook/recovery processes, not external cleanup or same-user
+filesystem substitution. POSIX rename can replace an empty destination created
+or emptied after the last check; Windows refuses an existing destination. The
+retained nonempty fence is therefore mandatory on every platform, and no
+general portable compare-and-rename guarantee is claimed.
 
 ### Checkpoint State Machine
 

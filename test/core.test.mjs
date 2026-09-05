@@ -858,7 +858,8 @@ for (const lockScope of ["session", "repository"]) {
 
     const output = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");
     assert.equal(output.decision, "allow");
-    assert.match(output.systemMessage, new RegExp(`held the ${lockScope} lock beyond the bounded overlap window`));
+    assert.match(output.systemMessage, /LIFECYCLE_OWNER_MALFORMED/);
+    assert.match(output.systemMessage, new RegExp(`"scope":"${lockScope}"`));
     assert.equal(readFileSync(routePath, "utf8"), routeBefore);
     assert.equal(readFileSync(attachmentPath, "utf8"), attachmentBefore);
     assert.equal(existsSync(lockDirectory), true);

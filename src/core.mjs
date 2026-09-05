@@ -30,12 +30,33 @@ export const MAX_PLAN_BYTES = 1_048_576;
 export const MAX_TOOL_TARGETS = 256;
 export const MAX_CHECKPOINT_BYTES = 262_144;
 export const MAX_CHECKPOINT_REQUEST_BYTES = 8_192;
+export const MAX_LIFECYCLE_REQUEST_BYTES = 8_192;
+const MAX_LIFECYCLE_EVIDENCE_BYTES = 32_768;
+let lifecycleSchema = null;
 const MAX_CHECKPOINT_ITEMS = 4_096;
 const MAX_CHECKPOINT_ORPHANS = 256;
 const MAX_GIT_POINTER_BYTES = 4_096;
 const MAX_SESSION_LOCATOR_BYTES = 4_096;
 const SESSION_LOCK_WAIT_MS = 250;
 const SESSION_LOCK_POLL_MS = 10;
+const LIFECYCLE_RELEASE_WAIT_MS = 100;
+const LIFECYCLE_RELEASE_POLL_MS = 25;
+const MAX_LIFECYCLE_RELEASE_ATTEMPTS = 3;
+const LIFECYCLE_CODES = new Set([
+  "LIFECYCLE_ACQUISITION_CONTENTION", "LIFECYCLE_OWNER_LIVE", "LIFECYCLE_OWNER_DEAD",
+  "LIFECYCLE_OWNER_UNKNOWN", "LIFECYCLE_IDENTITY_REJECTED", "LIFECYCLE_OWNER_MALFORMED",
+  "LIFECYCLE_SYSCALL_FAILURE", "LIFECYCLE_EVIDENCE_PERSISTENCE_FAILURE",
+]);
+const LIFECYCLE_ERROR_CODES = new Set([
+  "EACCES", "EBADF", "EBUSY", "EEXIST", "EINVAL", "EIO", "EISDIR", "ELOOP",
+  "EMFILE", "ENAMETOOLONG", "ENFILE", "ENOENT", "ENOMEM", "ENOSPC", "ENOTDIR",
+  "ENOTEMPTY", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EROFS", "ESRCH", "ESTALE",
+  "ETXTBSY", "EXDEV",
+]);
+const LIFECYCLE_SYSCALLS = new Set([
+  "close", "fstat", "fsync", "kill", "lstat", "mkdir", "open", "read", "readdir",
+  "realpath", "rename", "rm", "rmdir", "unlink", "write",
+]);
 const sessionLockWaitCell = new Int32Array(
   new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
 );
@@ -641,25 +662,180 @@ function acquireSessionLock(input, context = sessionLocatorContext(input)) {
   return acquireLifecycleLock(context.storageRoot, lockDirectory, "session");
 }
 
+function lifecycleErrorCode(code) {
+  return code === null || code === undefined ? null : LIFECYCLE_ERROR_CODES.has(code) ? code : "UNKNOWN";
+}
+
+function lifecycleDiagnostic(code, scope, operation, phase, detail = {}) {
+  return {
+    code: LIFECYCLE_CODES.has(code) ? code : "LIFECYCLE_SYSCALL_FAILURE",
+    scope,
+    operation,
+    phase,
+    syscall: LIFECYCLE_SYSCALLS.has(detail.syscall) ? detail.syscall : null,
+    errorCode: lifecycleErrorCode(detail.errorCode),
+    attempts: boundedCounter(detail.attempts) ? detail.attempts : 0,
+    token: uuid(detail.token) ? detail.token : null,
+    processId: Number.isSafeInteger(detail.processId) && detail.processId > 0 ? detail.processId : null,
+    cause: code === "LIFECYCLE_OWNER_DEAD" ? "cause-unobserved" :
+      code === "LIFECYCLE_SYSCALL_FAILURE" ? "syscall-observed" : "not-established",
+    nextStep: "Request lifecycle inspect from the Worker/operator before explicit snapshot-bound recovery. Preserve the lock; do not delete it, reclaim a live or unknown owner, or replay prior side effects automatically.",
+  };
+}
+
+class LifecycleError extends Error {
+  constructor(diagnostics, { cause, primaryError = null, primaryResult = null, releases = [] } = {}) {
+    super(diagnostics.map((diagnostic) => {
+      const summary = diagnostic.code === "LIFECYCLE_IDENTITY_REJECTED"
+        ? "ownership changed or identity is unavailable"
+        : diagnostic.operation === "acquire" ? "is busy or could not be acquired" : "cleanup is unconfirmed";
+      return `${diagnostic.scope} lifecycle lock ${summary}: ${JSON.stringify(diagnostic)}`;
+    }).join(" "), { cause });
+    this.name = "LifecycleError";
+    this.diagnostics = diagnostics;
+    this.primaryError = primaryError;
+    this.primaryResult = primaryResult;
+    this.releases = releases;
+  }
+}
+
+export function lifecycleFailureDetails(error) {
+  if (!(error instanceof LifecycleError)) return null;
+  return {
+    status: "unconfirmed",
+    error: error.message,
+    lifecycleDiagnostics: error.diagnostics,
+    releaseOutcomes: error.releases,
+    primaryResult: error.primaryResult,
+    primaryError: error.primaryError === null ? null : {
+      code: "PRIMARY_OPERATION_FAILED",
+      errorCode: lifecycleErrorCode(error.primaryError?.code),
+    },
+    message: "Lifecycle handling is unconfirmed. Any prior state changes have not been rolled back; inspect the primary result and current state before retrying.",
+  };
+}
+
+function finalizeLifecycle(primaryResult, primaryError, releases) {
+  const previous = primaryError instanceof LifecycleError ? primaryError : null;
+  const diagnostics = [
+    ...(previous?.diagnostics ?? []),
+    ...releases.flatMap((outcome) => outcome.diagnostics),
+  ];
+  if (diagnostics.length > 0) {
+    throw new LifecycleError(diagnostics, {
+      cause: primaryError ?? undefined,
+      primaryError: previous === null ? primaryError : previous.primaryError,
+      primaryResult: previous?.primaryResult ?? primaryResult ?? null,
+      releases: [...(previous?.releases ?? []), ...releases],
+    });
+  }
+  if (primaryError !== null) throw primaryError;
+  return primaryResult;
+}
+
+function withLifecycleCleanup(action, heldLocks) {
+  let result = null;
+  let primaryError = null;
+  try {
+    result = action();
+  } catch (error) {
+    primaryError = error;
+  }
+  const releases = heldLocks().map((lock) => releaseLifecycleLock(lock));
+  return finalizeLifecycle(result, primaryError, releases);
+}
+
+function observeLifecycleContention(storageRoot, lockDirectory, scope, attempts) {
+  const detail = { attempts, syscall: "lstat" };
+  const diagnostic = (code) => lifecycleDiagnostic(code, scope, "acquire", "owner-observation", detail);
+  try {
+    assertSafeStatePath(storageRoot, lockDirectory);
+    const directoryStats = lstatSync(lockDirectory, { bigint: true });
+    if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink() ||
+      directoryStats.dev === 0n || directoryStats.ino === 0n) {
+      return diagnostic("LIFECYCLE_IDENTITY_REJECTED");
+    }
+    detail.syscall = "readdir";
+    const entries = readdirSync(lockDirectory);
+    if (entries.length !== 1 || !entries[0].endsWith(".json") || !uuid(entries[0].slice(0, -5))) {
+      return diagnostic("LIFECYCLE_OWNER_MALFORMED");
+    }
+    const ownerPath = path.join(lockDirectory, entries[0]);
+    detail.syscall = "read";
+    const snapshot = readBoundedStateBytes(storageRoot, ownerPath, MAX_SESSION_LOCATOR_BYTES);
+    if (snapshot.stats.dev === 0n || snapshot.stats.ino === 0n) {
+      return diagnostic("LIFECYCLE_IDENTITY_REJECTED");
+    }
+    const owner = parseWorkflowJson(snapshot.bytes);
+    if (!exactObject(owner, ["schemaVersion", "token", "processId", "acquiredAt"]) ||
+      owner.schemaVersion !== 1 || !uuid(owner.token) || entries[0] !== `${owner.token}.json` ||
+      !Number.isSafeInteger(owner.processId) || owner.processId <= 0 || !isDateTime(owner.acquiredAt)) {
+      return diagnostic("LIFECYCLE_OWNER_MALFORMED");
+    }
+    const lock = { lockDirectory, directoryDev: directoryStats.dev, directoryIno: directoryStats.ino };
+    const matches = () => {
+      assertSafeStatePath(storageRoot, ownerPath);
+      const currentEntries = readdirSync(lockDirectory);
+      const current = readBoundedStateBytes(storageRoot, ownerPath, MAX_SESSION_LOCATOR_BYTES);
+      return lifecycleLockIdentityMatches(lock) &&
+        currentEntries.length === 1 && currentEntries[0] === entries[0] &&
+        sameRunLedgerStats(snapshot.stats, current.stats) && snapshot.bytes.equals(current.bytes);
+    };
+    if (!matches()) return diagnostic("LIFECYCLE_IDENTITY_REJECTED");
+    let code = "LIFECYCLE_OWNER_LIVE";
+    let errorCode = null;
+    try {
+      process.kill(owner.processId, 0);
+    } catch (error) {
+      errorCode = error?.code ?? "UNKNOWN";
+      code = errorCode === "ESRCH" ? "LIFECYCLE_OWNER_DEAD" : "LIFECYCLE_OWNER_UNKNOWN";
+    }
+    if (!matches()) return diagnostic("LIFECYCLE_IDENTITY_REJECTED");
+    Object.assign(detail, { syscall: "kill", errorCode, token: owner.token, processId: owner.processId });
+    return diagnostic(code);
+  } catch (error) {
+    detail.errorCode = error?.code ?? "UNKNOWN";
+    return diagnostic(error instanceof SyntaxError ? "LIFECYCLE_OWNER_MALFORMED" :
+      error?.code === "ENOENT" ? "LIFECYCLE_ACQUISITION_CONTENTION" :
+      ["EPERM", "EACCES"].includes(error?.code) ? "LIFECYCLE_OWNER_UNKNOWN" :
+      error?.code ? "LIFECYCLE_SYSCALL_FAILURE" : "LIFECYCLE_IDENTITY_REJECTED");
+  }
+}
+
 function acquireLifecycleLock(storageRoot, lockDirectory, scope) {
+  try {
+    return createLifecycleLock(storageRoot, lockDirectory, scope);
+  } catch (error) {
+    if (error instanceof LifecycleError) throw error;
+    throw new LifecycleError([lifecycleDiagnostic("LIFECYCLE_SYSCALL_FAILURE", scope, "acquire", "acquisition", {
+      syscall: error?.syscall, errorCode: error?.code ?? "UNKNOWN",
+    })], { cause: error });
+  }
+}
+
+function createLifecycleLock(storageRoot, lockDirectory, scope) {
   ensureSafeDirectory(storageRoot, path.dirname(lockDirectory));
   const token = randomUUID();
   const ownerPath = path.join(lockDirectory, `${token}.json`);
   assertSafeStatePath(storageRoot, lockDirectory);
   const deadline = performance.now() + SESSION_LOCK_WAIT_MS;
   let observedContention = false;
+  let attempts = 0;
   while (true) {
     if (observedContention && performance.now() >= deadline) {
-      throw new Error(`${scope} lifecycle lock is busy`);
+      throw new LifecycleError([observeLifecycleContention(storageRoot, lockDirectory, scope, attempts)]);
     }
     try {
+      attempts += 1;
       mkdirSync(lockDirectory, { mode: 0o700 });
       break;
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       observedContention = true;
       const remaining = deadline - performance.now();
-      if (remaining <= 0) throw new Error(`${scope} lifecycle lock is busy`);
+      if (remaining <= 0) {
+        throw new LifecycleError([observeLifecycleContention(storageRoot, lockDirectory, scope, attempts)]);
+      }
       Atomics.wait(
         sessionLockWaitCell,
         0,
@@ -675,7 +851,7 @@ function acquireLifecycleLock(storageRoot, lockDirectory, scope) {
     directoryStats.dev === 0n ||
     directoryStats.ino === 0n
   ) {
-    throw new Error(`${scope} lifecycle lock identity is unavailable`);
+    throw new LifecycleError([lifecycleDiagnostic("LIFECYCLE_IDENTITY_REJECTED", scope, "acquire", "acquisition", { attempts })]);
   }
   writeFileSync(
     ownerPath,
@@ -719,9 +895,10 @@ function acquireLifecycleLock(storageRoot, lockDirectory, scope) {
       entries.length !== 1 ||
       entries[0] !== path.basename(ownerPath)
     ) {
-      throw new Error(`${scope} lifecycle lock identity changed during acquisition`);
+      throw new LifecycleError([lifecycleDiagnostic("LIFECYCLE_IDENTITY_REJECTED", scope, "acquire", "acquisition", { attempts })]);
     }
     return {
+      scope,
       storageRoot,
       lockDirectory,
       ownerPath,
@@ -733,8 +910,21 @@ function acquireLifecycleLock(storageRoot, lockDirectory, scope) {
       ownerIno: ownerStats.ino,
     };
   } catch (error) {
-    if (ownerFd !== null) closeSync(ownerFd);
-    throw error;
+    const diagnostics = error instanceof LifecycleError ? [...error.diagnostics] : [
+      lifecycleDiagnostic("LIFECYCLE_SYSCALL_FAILURE", scope, "acquire", "acquisition", {
+        attempts, syscall: error?.syscall, errorCode: error?.code ?? "UNKNOWN",
+      }),
+    ];
+    if (ownerFd !== null) {
+      try {
+        closeSync(ownerFd);
+      } catch (closeError) {
+        diagnostics.push(lifecycleDiagnostic("LIFECYCLE_SYSCALL_FAILURE", scope, "acquire", "descriptor-close", {
+          attempts, syscall: "close", errorCode: closeError?.code ?? "UNKNOWN",
+        }));
+      }
+    }
+    throw new LifecycleError(diagnostics, { cause: error });
   }
 }
 
@@ -755,11 +945,13 @@ function lifecycleLockOwnerIdentityMatches(lock, ownerPath = lock.ownerPath) {
   const pathStats = lstatSync(ownerPath, { bigint: true });
   return (
     heldStats.isFile() &&
+    heldStats.nlink === 1n &&
     heldStats.dev !== 0n &&
     heldStats.ino !== 0n &&
     heldStats.dev === lock.ownerDev &&
     heldStats.ino === lock.ownerIno &&
     pathStats.isFile() &&
+    pathStats.nlink === 1n &&
     !pathStats.isSymbolicLink() &&
     pathStats.dev === heldStats.dev &&
     pathStats.ino === heldStats.ino
@@ -767,24 +959,98 @@ function lifecycleLockOwnerIdentityMatches(lock, ownerPath = lock.ownerPath) {
 }
 
 function releaseLifecycleLock(lock) {
-  if (lock === null) return;
+  if (lock === null) return { scope: null, status: "not-held", retired: false, diagnostics: [] };
+  const outcome = { scope: lock.scope, status: "unconfirmed", retired: false, diagnostics: [] };
+  let phase = "ownership-validation";
+  let syscall = "lstat";
+  let attempts = 0;
+  const reject = (code, error = null) => {
+    outcome.status = "unconfirmed";
+    outcome.diagnostics.push(lifecycleDiagnostic(code, lock.scope, "release", phase, {
+      syscall, attempts, errorCode: error?.code ?? (error === null ? null : "UNKNOWN"),
+      token: lock.token, processId: process.pid,
+    }));
+    return outcome;
+  };
   let activeOwnerFd = lock.ownerFd;
   let ownerFdOpen = true;
+  const closeOwner = () => {
+    syscall = "close";
+    ownerFdOpen = false;
+    closeSync(activeOwnerFd);
+  };
   try {
-    if (!lifecycleLockIdentityMatches(lock) || !lifecycleLockOwnerIdentityMatches(lock)) return;
-    const owner = readJson(lock.storageRoot, lock.ownerPath, MAX_SESSION_LOCATOR_BYTES);
-    if (owner?.token !== lock.token || owner?.processId !== process.pid) return;
-    if (!lifecycleLockIdentityMatches(lock) || !lifecycleLockOwnerIdentityMatches(lock)) return;
     const retiredDirectory = `${lock.lockDirectory}.${lock.token}.retired`;
     const retiredOwnerPath = path.join(retiredDirectory, path.basename(lock.ownerPath));
-    assertSafeStatePath(lock.storageRoot, retiredDirectory);
-    if (existsSync(retiredDirectory)) return;
-    if (process.platform === "win32") {
-      closeSync(activeOwnerFd);
-      ownerFdOpen = false;
+    const canonicalRoot = realpathSync(lock.storageRoot);
+    const boundaries = [lock.storageRoot, path.dirname(lock.lockDirectory)].map((directory) => {
+      const stats = lstatSync(directory, { bigint: true });
+      return { lockDirectory: directory, directoryDev: stats.dev, directoryIno: stats.ino };
+    });
+    const boundariesMatch = () => realpathSync(lock.storageRoot) === canonicalRoot &&
+      boundaries.every((boundary) => lifecycleLockIdentityMatches(boundary));
+    let deadline = 0;
+    let retirementError = null;
+    while (true) {
+      phase = "ownership-validation";
+      syscall = "lstat";
+      assertSafeStatePath(lock.storageRoot, lock.ownerPath);
+      assertSafeStatePath(lock.storageRoot, retiredDirectory);
+      const canonicalStats = lstatSync(lock.lockDirectory, { bigint: true, throwIfNoEntry: false });
+      const retiredStats = lstatSync(retiredDirectory, { bigint: true, throwIfNoEntry: false });
+      if (!canonicalStats || retiredStats || !boundariesMatch() || !lifecycleLockIdentityMatches(lock)) {
+        return reject("LIFECYCLE_IDENTITY_REJECTED");
+      }
+      const ownerStats = lstatSync(lock.ownerPath, { bigint: true, throwIfNoEntry: false });
+      if (!ownerStats?.isFile() || ownerStats.isSymbolicLink() || ownerStats.nlink !== 1n ||
+        ownerStats.dev !== lock.ownerDev || ownerStats.ino !== lock.ownerIno) {
+        return reject("LIFECYCLE_IDENTITY_REJECTED");
+      }
+      if (!ownerFdOpen) {
+        syscall = "open";
+        activeOwnerFd = openSync(lock.ownerPath, "r");
+        ownerFdOpen = true;
+      }
+      const canonicalLock = { ...lock, ownerFd: activeOwnerFd };
+      syscall = "lstat";
+      if (!lifecycleLockOwnerIdentityMatches(canonicalLock)) return reject("LIFECYCLE_IDENTITY_REJECTED");
+      syscall = "read";
+      const owner = readJson(lock.storageRoot, lock.ownerPath, MAX_SESSION_LOCATOR_BYTES);
+      syscall = "readdir";
+      const entries = readdirSync(lock.lockDirectory);
+      syscall = "lstat";
+      if (owner?.token !== lock.token || owner?.processId !== process.pid ||
+        entries.length !== 1 || entries[0] !== `${lock.token}.json` ||
+        !boundariesMatch() || !lifecycleLockIdentityMatches(lock) ||
+        !lifecycleLockOwnerIdentityMatches(canonicalLock)) {
+        return reject("LIFECYCLE_IDENTITY_REJECTED");
+      }
+      assertSafeStatePath(lock.storageRoot, lock.ownerPath);
+      assertSafeStatePath(lock.storageRoot, retiredDirectory);
+      if (lstatSync(retiredDirectory, { bigint: true, throwIfNoEntry: false })) {
+        return reject("LIFECYCLE_IDENTITY_REJECTED");
+      }
+      phase = "retirement";
+      if (process.platform === "win32") closeOwner();
+      syscall = "rename";
+      if (attempts === 0) deadline = performance.now() + LIFECYCLE_RELEASE_WAIT_MS;
+      else if (performance.now() >= deadline) return reject("LIFECYCLE_SYSCALL_FAILURE", retirementError);
+      attempts += 1;
+      try {
+        renameSync(lock.lockDirectory, retiredDirectory);
+        outcome.retired = true;
+        break;
+      } catch (error) {
+        if (error?.code !== "EBUSY" || attempts >= MAX_LIFECYCLE_RELEASE_ATTEMPTS) throw error;
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) throw error;
+        retirementError = error;
+        Atomics.wait(sessionLockWaitCell, 0, 0, Math.min(LIFECYCLE_RELEASE_POLL_MS, remaining));
+      }
     }
-    renameSync(lock.lockDirectory, retiredDirectory);
+    phase = "retired-validation";
     if (process.platform === "win32") {
+      syscall = "open";
       activeOwnerFd = openSync(retiredOwnerPath, "r");
       ownerFdOpen = true;
     }
@@ -794,15 +1060,19 @@ function releaseLifecycleLock(lock) {
       ownerPath: retiredOwnerPath,
       ownerFd: activeOwnerFd,
     };
+    syscall = "lstat";
     if (
+      !boundariesMatch() ||
       !lifecycleLockIdentityMatches(retiredLock) ||
       !lifecycleLockOwnerIdentityMatches(retiredLock, retiredOwnerPath)
-    ) return;
+    ) return reject("LIFECYCLE_IDENTITY_REJECTED");
+    syscall = "read";
     const retiredOwner = readJson(
       lock.storageRoot,
       retiredOwnerPath,
       MAX_SESSION_LOCATOR_BYTES,
     );
+    syscall = "readdir";
     const entries = readdirSync(retiredDirectory);
     if (
       retiredOwner?.token !== lock.token ||
@@ -811,21 +1081,29 @@ function releaseLifecycleLock(lock) {
       entries[0] !== path.basename(retiredOwnerPath) ||
       !lifecycleLockIdentityMatches(retiredLock) ||
       !lifecycleLockOwnerIdentityMatches(retiredLock, retiredOwnerPath)
-    ) return;
-    closeSync(activeOwnerFd);
-    ownerFdOpen = false;
+    ) return reject("LIFECYCLE_IDENTITY_REJECTED");
+    phase = "descriptor-close";
+    closeOwner();
+    phase = "owner-removal";
+    syscall = "rm";
     removeStateFile(lock.storageRoot, retiredOwnerPath);
-    if (!lifecycleLockIdentityMatches(retiredLock)) return;
+    syscall = "lstat";
+    if (!lifecycleLockIdentityMatches(retiredLock)) return reject("LIFECYCLE_IDENTITY_REJECTED");
     assertSafeStatePath(lock.storageRoot, retiredDirectory);
+    phase = "directory-removal";
+    syscall = "rmdir";
     rmdirSync(retiredDirectory);
-  } catch {
-    // An abandoned lock requires operator-confirmed cleanup.
+    outcome.status = "released";
+    return outcome;
+  } catch (error) {
+    return reject(error instanceof SyntaxError ? "LIFECYCLE_OWNER_MALFORMED" : "LIFECYCLE_SYSCALL_FAILURE", error);
   } finally {
     if (ownerFdOpen) {
+      phase = "descriptor-close";
       try {
-        closeSync(activeOwnerFd);
-      } catch {
-        // The lock is already closed; no cleanup remains.
+        closeOwner();
+      } catch (error) {
+        reject("LIFECYCLE_SYSCALL_FAILURE", error);
       }
     }
   }
@@ -852,8 +1130,379 @@ function acquireRepositoryLocks(roots) {
     }
     return locks;
   } catch (error) {
-    for (const lock of locks.reverse()) releaseLifecycleLock(lock);
+    return finalizeLifecycle(null, error, locks.reverse().map((lock) => releaseLifecycleLock(lock)));
+  }
+}
+
+function lifecycleShapeMatches(shape, value) {
+  if (shape.$ref) return lifecycleShapeMatches(lifecycleSchema.$defs[shape.$ref.slice("#/$defs/".length)], value);
+  if (shape.anyOf && !shape.anyOf.some((branch) => lifecycleShapeMatches(branch, value))) return false;
+  if (shape.allOf && !shape.allOf.every((branch) => lifecycleShapeMatches(branch, value))) return false;
+  if (shape.if && !lifecycleShapeMatches(
+    lifecycleShapeMatches(shape.if, value) ? shape.then ?? {} : shape.else ?? {}, value,
+  )) return false;
+  if (Object.hasOwn(shape, "const") && value !== shape.const) return false;
+  if (shape.enum && !shape.enum.includes(value)) return false;
+  const object = value !== null && typeof value === "object" && !Array.isArray(value);
+  const types = {
+    object, array: Array.isArray(value), string: typeof value === "string",
+    integer: Number.isSafeInteger(value), null: value === null,
+  };
+  if (shape.type && !types[shape.type]) return false;
+  if (typeof value === "string") {
+    const length = [...value].length;
+    if (length < (shape.minLength ?? 0) || length > (shape.maxLength ?? Infinity) ||
+      (shape.pattern && !new RegExp(shape.pattern, "u").test(value))) return false;
+  }
+  if (typeof value === "number" && (value < (shape.minimum ?? -Infinity) || value > (shape.maximum ?? Infinity))) return false;
+  if (Array.isArray(value)) {
+    if (value.length < (shape.minItems ?? 0) || value.length > (shape.maxItems ?? Infinity)) return false;
+    if (shape.items && !value.every((entry) => lifecycleShapeMatches(shape.items, entry))) return false;
+  }
+  if (object) {
+    if (shape.required?.some((key) => !Object.hasOwn(value, key))) return false;
+    if (shape.additionalProperties === false && Object.keys(value).some((key) => !Object.hasOwn(shape.properties ?? {}, key))) return false;
+    for (const [key, property] of Object.entries(shape.properties ?? {})) {
+      if (Object.hasOwn(value, key) && !lifecycleShapeMatches(property, value[key])) return false;
+    }
+    for (const [key, required] of Object.entries(shape.dependentRequired ?? {})) {
+      if (Object.hasOwn(value, key) && required.some((name) => !Object.hasOwn(value, name))) return false;
+    }
+  }
+  return true;
+}
+
+export function validateLifecycle(value, definition = null) {
+  try {
+    lifecycleSchema ??= parseWorkflowJson(readFileSync(new URL("../schemas/lifecycle.schema.json", import.meta.url)));
+    const maximum = ["inspectRequest", "recoverRequest"].includes(definition)
+      ? MAX_LIFECYCLE_REQUEST_BYTES : MAX_LIFECYCLE_EVIDENCE_BYTES;
+    const shape = definition === null ? lifecycleSchema : lifecycleSchema.$defs[definition];
+    if (!shape || Buffer.byteLength(JSON.stringify(value)) > maximum || !lifecycleShapeMatches(shape, value)) throw new Error();
+    return [];
+  } catch {
+    return ["lifecycle value is invalid or exceeds its published bound"];
+  }
+}
+
+function rejectRecoveryIdentity(code = "LIFECYCLE_IDENTITY_REJECTED") {
+  throw Object.assign(new Error("lifecycle recovery evidence is unavailable or does not match"), { lifecycleCode: code });
+}
+
+function recoveryIdentity(stats, directory = false) {
+  if (!stats || stats.isSymbolicLink() || stats.dev === 0n || stats.ino === 0n ||
+    (directory ? !stats.isDirectory() : !stats.isFile() || stats.nlink !== 1n)) rejectRecoveryIdentity();
+  return { dev: String(stats.dev), ino: String(stats.ino) };
+}
+
+function recoveryPathStats(root, filePath) {
+  assertSafeStatePath(root, filePath);
+  try {
+    return lstatSync(filePath, { bigint: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
     throw error;
+  }
+}
+
+function recoveryBoundary(root, directory) {
+  assertSafeStatePath(root, directory);
+  if (!pathEquals(path.resolve(directory), realpathSync(directory))) rejectRecoveryIdentity();
+  return { pathHash: sha256(pathIdentity(realpathSync(directory))), identity: recoveryIdentity(lstatSync(directory, { bigint: true }), true) };
+}
+
+function recoveryFile(root, filePath, maximum = MAX_SESSION_LOCATOR_BYTES, flush = false) {
+  if (recoveryPathStats(root, filePath) === null) return null;
+  const snapshot = readBoundedStateBytes(root, filePath, maximum, flush);
+  return { bytes: snapshot.bytes, file: { hash: sha256(snapshot.bytes), identity: recoveryIdentity(snapshot.stats) } };
+}
+
+function recoveryContext(cwd, request, operation) {
+  if (process.platform === "win32") resetWindowsPathChecks();
+  if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd) ||
+    !pathEquals(path.resolve(cwd), realpathSync(cwd))) rejectRecoveryIdentity();
+  const root = realpathSync(cwd);
+  recoveryBoundary(root, root);
+  const selector = operation === "inspect" ? request : request.expected;
+  const scope = selector.scope;
+  const location = selector.location ?? "canonical";
+  const token = selector.token ?? null;
+  const input = { session_id: request.session_id, transcript_path: request.transcript_path };
+  const session = request.session_id === undefined ? null : sessionLocatorContext(input);
+  if ((request.session_id !== undefined && session === null) || (scope === "session" && session === null)) rejectRecoveryIdentity();
+  if (session !== null) {
+    if (!pathEquals(session.storageRoot, realpathSync(session.storageRoot))) rejectRecoveryIdentity();
+    recoveryBoundary(session.storageRoot, session.storageRoot);
+    recoveryIdentity(recoveryPathStats(session.storageRoot, request.transcript_path));
+    if (recoveryFile(session.storageRoot, path.join(session.storageRoot, "workspace.json")) === null) rejectRecoveryIdentity();
+  }
+  const storageRoot = scope === "repository" ? root : session.storageRoot;
+  const canonicalDirectory = scope === "repository"
+    ? path.join(stateDirectory(root), "locks", "lifecycle")
+    : path.join(storageRoot, "supervised-worker", "session-locks", sessionHash(input));
+  const sourceDirectory = location === "canonical" ? canonicalDirectory : `${canonicalDirectory}.${token}.retired`;
+  return { root, storageRoot, canonicalDirectory, sourceDirectory, scope, location, token, input, session, operation };
+}
+
+function recoveryOwner(context, directory) {
+  const identity = recoveryIdentity(recoveryPathStats(context.storageRoot, directory), true);
+  const entries = readdirSync(directory);
+  if (entries.length !== 1 || !uuid(entries[0].slice(0, -5)) || !entries[0].endsWith(".json")) {
+    rejectRecoveryIdentity("LIFECYCLE_OWNER_MALFORMED");
+  }
+  const snapshot = recoveryFile(context.storageRoot, path.join(directory, entries[0]));
+  if (snapshot === null) rejectRecoveryIdentity("LIFECYCLE_OWNER_MALFORMED");
+  let owner;
+  try {
+    owner = parseWorkflowJson(snapshot.bytes);
+  } catch {
+    rejectRecoveryIdentity("LIFECYCLE_OWNER_MALFORMED");
+  }
+  if (!exactObject(owner, ["schemaVersion", "token", "processId", "acquiredAt"]) || owner.schemaVersion !== 1 ||
+    !uuid(owner.token) || entries[0] !== `${owner.token}.json` ||
+    !Number.isSafeInteger(owner.processId) || owner.processId <= 0 || owner.processId > 2_147_483_647 || !isDateTime(owner.acquiredAt)) {
+    rejectRecoveryIdentity("LIFECYCLE_OWNER_MALFORMED");
+  }
+  if ((context.token !== null && context.token !== owner.token) ||
+    canonicalJson(recoveryIdentity(recoveryPathStats(context.storageRoot, directory), true)) !== canonicalJson(identity) ||
+    canonicalJson(readdirSync(directory)) !== canonicalJson(entries)) rejectRecoveryIdentity();
+  return { token: owner.token, processId: owner.processId, directory: identity, owner: snapshot.file };
+}
+
+function recoveryAttachment(root) {
+  const snapshot = recoveryFile(root, attachmentPath(root));
+  if (snapshot === null) return { state: "absent" };
+  const raw = parseWorkflowJson(snapshot.bytes);
+  const keys = raw?.schemaVersion === 1 ? ["schemaVersion", "sessionHash", "attachedAt"] :
+    raw?.schemaVersion === 2 ? [...ATTACHMENT_KEYS] : [...ATTACHMENT_V3_KEYS];
+  if (!exactObject(raw, keys)) rejectRecoveryIdentity();
+  const attachment = attachmentFromSnapshot(snapshot);
+  return {
+    state: "present", version: raw.schemaVersion, file: snapshot.file, sessionHash: attachment.sessionHash,
+    status: attachment.status, routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration,
+  };
+}
+
+function recoveryRouting(context, attachment) {
+  if (context.session === null) {
+    if (attachment.state === "present" && attachment.routeGeneration !== null) rejectRecoveryIdentity();
+    return { state: attachment.state === "absent" ? "unattached" : "unrouted" };
+  }
+  const session = sessionLocatorContext(context.input);
+  if (session === null || !pathEquals(session.storageRoot, context.session.storageRoot)) rejectRecoveryIdentity();
+  const workspace = recoveryFile(session.storageRoot, path.join(session.storageRoot, "workspace.json"));
+  if (workspace === null) rejectRecoveryIdentity();
+  const anchor = {
+    sessionHash: sessionHash(context.input), root: recoveryBoundary(session.storageRoot, session.storageRoot),
+    transcript: recoveryIdentity(recoveryPathStats(session.storageRoot, context.input.transcript_path)), workspace: workspace.file,
+  };
+  if (attachment.state === "present" && attachment.sessionHash !== anchor.sessionHash) rejectRecoveryIdentity();
+  const route = recoveryFile(session.storageRoot, session.filePath);
+  const marker = recoveryFile(session.storageRoot, session.markerPath);
+  if (route === null) {
+    if (marker !== null || recoveryPathStats(session.storageRoot, session.directoryPath) !== null ||
+      (attachment.state === "present" && attachment.routeGeneration !== null)) rejectRecoveryIdentity();
+    return { state: "absent", anchor };
+  }
+  if (marker === null) rejectRecoveryIdentity();
+  const value = parseWorkflowJson(route.bytes);
+  const binding = parseWorkflowJson(marker.bytes);
+  if (!exactObject(value, [...SESSION_LOCATOR_KEYS]) || !exactObject(binding, [...SESSION_MARKER_KEYS]) ||
+    !pathEquals(value.repositoryRoot, context.root)) rejectRecoveryIdentity();
+  const routing = readSessionLocator(context.input, false);
+  if (!routing.exists || canonicalJson(routing.locator) !== canonicalJson(value)) rejectRecoveryIdentity();
+  if (attachment.state === "present" && (attachment.routeGeneration === null
+    ? value.status !== "released" : attachment.routeGeneration !== value.generation)) rejectRecoveryIdentity();
+  return {
+    state: "routed", anchor, route: route.file, marker: marker.file,
+    generation: value.generation, status: value.status, repository: recoveryBoundary(context.root, context.root),
+  };
+}
+
+function recoverySnapshot(context, directory = context.sourceDirectory) {
+  const boundaries = {
+    repository: recoveryBoundary(context.root, context.root),
+    root: recoveryBoundary(context.storageRoot, context.storageRoot),
+    parent: recoveryBoundary(context.storageRoot, path.dirname(context.sourceDirectory)),
+  };
+  const owner = recoveryOwner(context, directory);
+  const attachment = recoveryAttachment(context.root);
+  const routing = recoveryRouting(context, attachment);
+  if (context.scope === "session" && attachment.state === "absent" && routing.state !== "routed") rejectRecoveryIdentity();
+  const snapshot = { scope: context.scope, location: context.location, ...owner, ...boundaries, attachment, routing };
+  if (validateLifecycle(snapshot, "snapshot").length > 0) rejectRecoveryIdentity();
+  return snapshot;
+}
+
+function recoveryLiveness(context, owner) {
+  let code = "LIFECYCLE_OWNER_LIVE";
+  let errorCode = null;
+  try {
+    process.kill(owner.processId, 0);
+  } catch (error) {
+    errorCode = error?.code ?? "UNKNOWN";
+    code = errorCode === "ESRCH" ? "LIFECYCLE_OWNER_DEAD" : "LIFECYCLE_OWNER_UNKNOWN";
+  }
+  return lifecycleDiagnostic(code, context.scope, context.operation, "owner-observation", {
+    syscall: "kill", errorCode, token: owner.token, processId: owner.processId,
+  });
+}
+
+function recoveryDiagnostics(error, scope, operation, phase, attempts = 0) {
+  if (error instanceof LifecycleError) return error.diagnostics;
+  return [lifecycleDiagnostic(error?.lifecycleCode ?? (error?.code ? "LIFECYCLE_SYSCALL_FAILURE" : "LIFECYCLE_IDENTITY_REJECTED"),
+    scope, operation, phase, { syscall: error?.syscall, errorCode: error?.code ?? null, attempts })];
+}
+
+export function inspectLifecycleLock(cwd, request) {
+  const result = { schemaVersion: 1, kind: "lifecycle-inspection", status: "unconfirmed", expected: null, diagnostics: [] };
+  let context = null;
+  let phase = "request-validation";
+  try {
+    if (validateLifecycle(request, "inspectRequest").length > 0) rejectRecoveryIdentity();
+    context = recoveryContext(cwd, request, "inspect");
+    phase = "binding-validation";
+    if (recoveryPathStats(context.storageRoot, context.sourceDirectory) === null) {
+      result.status = "absent";
+      return result;
+    }
+    const expected = recoverySnapshot(context);
+    const observation = recoveryLiveness(context, expected);
+    if (canonicalJson(recoverySnapshot(context)) !== canonicalJson(expected)) rejectRecoveryIdentity();
+    result.diagnostics = [observation];
+    if (observation.code !== "LIFECYCLE_OWNER_UNKNOWN") {
+      result.status = "inspected";
+      result.expected = expected;
+    }
+    return result;
+  } catch (error) {
+    result.diagnostics = recoveryDiagnostics(error, context?.scope ?? null, "inspect", phase);
+    return result;
+  }
+}
+
+export function recoverLifecycleLock(cwd, request) {
+  let result = { schemaVersion: 1, kind: "lifecycle-recovery", status: "unconfirmed", intentHash: null, outcomeHash: null, diagnostics: [] };
+  let context = null;
+  let phase = "request-validation";
+  let attempts = 0;
+  let guards = [];
+  try {
+    if (validateLifecycle(request, "recoverRequest").length > 0) rejectRecoveryIdentity();
+    context = recoveryContext(cwd, request, "recover");
+    const expected = request.expected;
+    const recoveredDirectory = `${context.canonicalDirectory}.${expected.token}.recovered`;
+    const intent = {
+      schemaVersion: 1, kind: "lifecycle-recovery-intent", expected,
+      death: { processId: expected.processId, errorCode: "ESRCH" }, destination: path.basename(recoveredDirectory),
+    };
+    const intentBytes = Buffer.from(`${canonicalJson(intent)}\n`);
+    const intentHash = sha256(intentBytes);
+    if (request.intentHash !== undefined && request.intentHash !== intentHash) rejectRecoveryIdentity();
+    const evidenceDirectory = path.join(stateDirectory(context.root), "lifecycle-evidence");
+    const intentPath = path.join(evidenceDirectory, `${intentHash}.intent.json`);
+    let intentIdentity = null;
+    let evidenceIdentity = null;
+    const requireRepository = () => {
+      if (canonicalJson(recoveryBoundary(context.root, context.root)) !== canonicalJson(expected.repository)) rejectRecoveryIdentity();
+      for (const guard of guards) {
+        if (!lifecycleLockIdentityMatches(guard) || !lifecycleLockOwnerIdentityMatches(guard)) rejectRecoveryIdentity();
+        const current = recoveryOwner({ ...context, storageRoot: context.root, token: guard.token }, guard.lockDirectory);
+        if (current.processId !== process.pid || current.owner.identity.dev !== String(guard.ownerDev) ||
+          current.owner.identity.ino !== String(guard.ownerIno)) rejectRecoveryIdentity();
+      }
+    };
+    const requireExpected = (directory) => {
+      requireRepository();
+      if (canonicalJson(recoverySnapshot(context, directory)) !== canonicalJson(expected)) rejectRecoveryIdentity();
+      const observation = recoveryLiveness(context, expected);
+      if (observation.code !== "LIFECYCLE_OWNER_DEAD") throw new LifecycleError([observation]);
+      if (canonicalJson(recoverySnapshot(context, directory)) !== canonicalJson(expected)) rejectRecoveryIdentity();
+      requireRepository();
+    };
+    const readIntent = (flush = false) => {
+      const snapshot = recoveryFile(context.root, intentPath, MAX_LIFECYCLE_EVIDENCE_BYTES, flush);
+      if (snapshot !== null && (!snapshot.bytes.equals(intentBytes) || validateLifecycle(parseWorkflowJson(snapshot.bytes), "recoveryIntent").length > 0)) rejectRecoveryIdentity();
+      return snapshot;
+    };
+    const requireIntent = () => {
+      requireRepository();
+      const current = readIntent();
+      if (current === null || canonicalJson(current.file) !== canonicalJson(intentIdentity) ||
+        canonicalJson(recoveryBoundary(context.root, evidenceDirectory)) !== canonicalJson(evidenceIdentity)) rejectRecoveryIdentity();
+    };
+    const publishOutcome = (status, diagnostics) => {
+      requireIntent();
+      const outcome = { schemaVersion: 1, kind: "lifecycle-recovery-outcome", intentHash, status, diagnostics };
+      if (validateLifecycle(outcome, "recoveryOutcome").length > 0) rejectRecoveryIdentity();
+      const bytes = Buffer.from(`${canonicalJson(outcome)}\n`);
+      const hash = sha256(bytes);
+      const filePath = path.join(evidenceDirectory, `${hash}.outcome.json`);
+      durableWriteBytes(context.root, filePath, bytes, MAX_LIFECYCLE_EVIDENCE_BYTES, true, null, requireIntent);
+      const confirmed = recoveryFile(context.root, filePath, MAX_LIFECYCLE_EVIDENCE_BYTES, true);
+      if (confirmed === null || !confirmed.bytes.equals(bytes)) rejectRecoveryIdentity();
+      requireIntent();
+      result.outcomeHash = hash;
+    };
+    const evidenceFailure = (error) => lifecycleDiagnostic("LIFECYCLE_EVIDENCE_PERSISTENCE_FAILURE", context.scope, "recover", phase, {
+      syscall: error?.syscall, errorCode: error?.code ?? "UNKNOWN", attempts, token: expected.token, processId: expected.processId,
+    });
+    const action = () => {
+      try {
+        phase = "guard-acquisition";
+        if (context.scope === "session" || context.location === "retired") {
+          windowsPathChecksMaySpawn = false;
+          guards = acquireRepositoryLocks([context.root]);
+        }
+        phase = "binding-validation";
+        requireRepository();
+        const priorIntent = readIntent();
+        const alreadyRecovered = recoveryPathStats(context.storageRoot, recoveredDirectory) !== null;
+        if (alreadyRecovered && priorIntent === null) rejectRecoveryIdentity();
+        requireExpected(alreadyRecovered ? recoveredDirectory : context.sourceDirectory);
+        phase = "intent-persistence";
+        if (validateLifecycle(intent, "recoveryIntent").length > 0) rejectRecoveryIdentity();
+        durableWriteBytes(context.root, intentPath, intentBytes, MAX_LIFECYCLE_EVIDENCE_BYTES, true, null,
+          () => requireExpected(alreadyRecovered ? recoveredDirectory : context.sourceDirectory));
+        const confirmedIntent = readIntent(true);
+        if (confirmedIntent === null) rejectRecoveryIdentity();
+        intentIdentity = confirmedIntent.file;
+        evidenceIdentity = recoveryBoundary(context.root, evidenceDirectory);
+        result.intentHash = intentHash;
+        phase = "binding-validation";
+        requireExpected(alreadyRecovered ? recoveredDirectory : context.sourceDirectory);
+        requireIntent();
+        if (!alreadyRecovered) {
+          if (recoveryPathStats(context.storageRoot, recoveredDirectory) !== null) rejectRecoveryIdentity();
+          phase = "retirement";
+          attempts = 1;
+          renameSync(context.sourceDirectory, recoveredDirectory);
+        }
+        phase = "retired-validation";
+        requireExpected(recoveredDirectory);
+        phase = "outcome-persistence";
+        publishOutcome("recovered", []);
+        result.status = alreadyRecovered ? "already-recovered" : "recovered";
+      } catch (error) {
+        result.diagnostics = ["intent-persistence", "outcome-persistence"].includes(phase)
+          ? [evidenceFailure(error)] : recoveryDiagnostics(error, context.scope, "recover", phase, attempts);
+        if (result.intentHash !== null && phase !== "outcome-persistence") {
+          phase = "outcome-persistence";
+          try {
+            publishOutcome("unconfirmed", result.diagnostics);
+          } catch (outcomeError) {
+            result.diagnostics.push(evidenceFailure(outcomeError));
+          }
+        }
+      }
+      return result;
+    };
+    result = withLifecycleCleanup(action, () => [...guards].reverse());
+    return result;
+  } catch (error) {
+    result.status = "unconfirmed";
+    result.diagnostics = [...result.diagnostics, ...recoveryDiagnostics(error, context?.scope ?? null, "recover", phase, attempts)];
+    return result;
   }
 }
 
@@ -2048,7 +2697,7 @@ function withSessionLifecycle(cwd, request, operation, action) {
   requireSessionRequest(request, operation);
   let sessionLock = null;
   let repositoryLocks = [];
-  try {
+  const guardedAction = () => {
     if (process.platform === "win32") resetWindowsPathChecks();
     if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd) ||
       !pathEquals(path.resolve(cwd), realpathSync(cwd))) {
@@ -2076,18 +2725,20 @@ function withSessionLifecycle(cwd, request, operation, action) {
     const requireGuards = () => {
       for (const lock of [sessionLock, ...repositoryLocks].filter((value) => value !== null)) {
         if (!lifecycleLockIdentityMatches(lock) || !lifecycleLockOwnerIdentityMatches(lock)) {
-          checkpointFailure("lifecycle lock ownership changed; no replacement owner may be modified");
+          throw new LifecycleError([lifecycleDiagnostic("LIFECYCLE_IDENTITY_REJECTED", lock.scope, "guard", "ownership-validation", {
+            token: lock.token, processId: process.pid,
+          })]);
         }
       }
     };
     requireGuards();
     return action(root, input, routing, requireGuards);
+  };
+  try {
+    return withLifecycleCleanup(guardedAction, () => [...repositoryLocks].reverse().concat(sessionLock));
   } catch (error) {
-    if (error?.checkpointReason) throw error;
-    throw new Error(`${operation} could not confirm its local lifecycle state; inspect status, ledger integrity, and ownership before retrying`);
-  } finally {
-    for (const lock of repositoryLocks.reverse()) releaseLifecycleLock(lock);
-    releaseLifecycleLock(sessionLock);
+    if (error instanceof LifecycleError || error?.checkpointReason) throw error;
+    throw new Error(`${operation} could not confirm its local lifecycle state; inspect status, ledger integrity, and ownership before retrying`, { cause: error });
   }
 }
 
@@ -2767,7 +3418,7 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
       return preToolDecision(
         input,
         "deny",
-        "Supervised Worker denied the file edit because the hook payload did not provide an absolute repository cwd.",
+        "Supervised Worker denied the invocation because the hook payload did not provide an absolute repository cwd.",
       );
     }
     return eventName === "Stop"
@@ -2782,7 +3433,7 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
   let sessionLock = null;
   let repositoryLocks = [];
   let routedAttachmentObserved = false;
-  try {
+  const action = () => {
     const preparedTargets = prepareToolTargets(input);
     for (const target of preparedTargets) {
       if (target.canonical !== undefined) isLocalRepositoryPath(target.canonical);
@@ -2822,29 +3473,35 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
       }
     }
     return output;
+  };
+  try {
+    return withLifecycleCleanup(action, () => [...repositoryLocks].reverse().concat(sessionLock));
   } catch (error) {
+    const lifecycleError = error instanceof LifecycleError ? error : null;
+    const primaryOutput = lifecycleError?.primaryResult;
+    const primaryContext = primaryOutput?.permissionDecisionReason ?? primaryOutput?.reason ?? primaryOutput?.additionalContext;
+    const detail = lifecycleError === null ? "" :
+      ` ${lifecycleError.message}${primaryContext ? ` Primary hook context before cleanup: ${primaryContext}` : ""}` +
+      `${lifecycleError.primaryError === null ? "" : " The primary hook operation also failed."}` +
+      " Any prior state changes have not been rolled back; do not replay side effects automatically.";
     if (eventName === "PreToolUse") {
       return preToolDecision(
         input,
         "deny",
-        "Supervised Worker could not verify plan ownership, so the plan write was denied.",
+        `Supervised Worker could not verify local lifecycle state, so the invocation was denied.${detail}`,
       );
     }
-    const lockScope = error?.message === "session lifecycle lock is busy"
-      ? "session"
-      : error?.message === "repository lifecycle lock is busy" ? "repository" : null;
-    const reason = lockScope !== null
-      ? `Supervised Worker could not verify its local state because another lifecycle operation held the ${lockScope} lock beyond the bounded overlap window. This hook failed open visibly; do not rely on this run as queue completion.`
-      : "Supervised Worker could not verify its local state and allowed this hook to fail open visibly. Do not rely on this run as queue completion.";
+    if (eventName === "Stop" && primaryOutput?.decision === "block" && lifecycleError.primaryError === null) {
+      const reason = "Supervised Worker preserved the recorded Stop block, but lifecycle lock cleanup was not confirmed. Do not rely on this run as queue completion." + detail;
+      return { ...blockOutput(input, "Stop", reason), systemMessage: reason };
+    }
+    const reason = "Supervised Worker could not verify its local state and allowed this hook to fail open visibly. Do not rely on this run as queue completion." + detail;
     return eventName === "Stop"
       ? allowStopOutput(input, reason)
       : {
           ...contextOutput(input, eventName, reason),
           systemMessage: reason,
         };
-  } finally {
-    for (const lock of repositoryLocks.reverse()) releaseLifecycleLock(lock);
-    releaseLifecycleLock(sessionLock);
   }
 }
 
@@ -2863,7 +3520,7 @@ export function releaseAttachment(cwd) {
   if (intended === null) return { released: false, message: "No attachment found." };
   windowsPathChecksMaySpawn = false;
   const locks = acquireRepositoryLocks([resolvedCwd]);
-  try {
+  return withLifecycleCleanup(() => {
     requireAttachmentSnapshot(cwd, intended);
     let attachment = null;
     try {
@@ -2880,9 +3537,7 @@ export function releaseAttachment(cwd) {
     }
     removeAttachmentSnapshot(cwd, intended);
     return { released: true, message: "Released the stale session attachment." };
-  } finally {
-    for (const lock of locks.reverse()) releaseLifecycleLock(lock);
-  }
+  }, () => [...locks].reverse());
 }
 
 function runLedgerUnavailable(reason) {

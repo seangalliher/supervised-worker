@@ -283,13 +283,54 @@ network-mapped, and `subst` repository roots fail closed before filesystem
 inspection. Locality checks share a 1.5-second budget and allow at most three
 distinct drive letters per operation.
 
-Session and repository lifecycle locks are never reclaimed automatically. If a
-process terminates while holding one, inspect the UUID owner record and confirm
-that its process and lifecycle operation have ended before manually removing
-that exact stale lock. Time, transcript size, compaction, and model selection
-are not reclamation authority. New sessions have different session locks but
-share `.supervised-worker/locks/lifecycle`; they cannot bypass a stale repository
-lock. Inspect any token-specific retired lock directory separately.
+Session and repository lifecycle locks are never reclaimed automatically.
+Owned release retries only a verified `EBUSY` retirement failure, at most three
+attempts within a 100 ms monotonic retry budget. Exhausted or ambiguous cleanup
+is reported with a typed lifecycle code, even if the preceding operation already
+changed state. A denied read-only tool is described as an invocation, not a plan
+write. Do not replay side effects on the assumption that cleanup failure rolled
+them back.
+An already-recorded Stop block remains a block with the cleanup diagnostic;
+failure before a primary Stop decision still fails open visibly.
+
+### Recovering A Stranded Lock
+
+Use the installed helper from the affected canonical repository directory, not
+from the plugin directory. Recovery is distinct from `release`: it does not
+detach, checkpoint, resume, or change the plan, attachment, route, claim, ledger,
+Git index, or working files.
+
+1. Run `node <plugin-root>/src/cli.mjs lifecycle inspect` with JSON stdin
+  containing `{"scope":"repository"}`. For a routed attachment, also supply
+  its exact `session_id` and absolute `transcript_path`. Inspection is read-only
+  and does not need the stranded lock. A session lock requires those two anchor
+  fields and `"scope":"session"`. Inspect an old token-specific `.retired`
+  directory with `"location":"retired"` and its UUID `token`.
+2. Require `status: "inspected"` and diagnostic `LIFECYCLE_OWNER_DEAD`. Only an
+  `ESRCH` PID observation permits recovery. Live, unknown, malformed, linked,
+  or identity-unconfirmed owners must remain untouched. A dead PID alone does
+  not identify the historical syscall failure.
+3. Run `node <plugin-root>/src/cli.mjs lifecycle recover` with JSON stdin
+  containing `expected` set to the complete inspection snapshot and the same
+  session anchor fields, when supplied. Do not edit the snapshot. Requests are
+  limited to 8 KiB, reject duplicate/unknown keys, and have no force option.
+  Any changed binding requires fresh inspection. If both scopes are blocked,
+  recover the repository lock first, then inspect the session lock again.
+4. Require `status: "recovered"` or `"already-recovered"`, exit code zero, and
+  both evidence hashes. Keep `.supervised-worker/lifecycle-evidence/` and the
+  permanent nonempty `<lock>.<token>.recovered` directory. Never delete or reuse
+  that directory: it prevents a delayed recoverer from moving a new owner.
+  External cleanup that empties or replaces a fence is outside this protocol;
+  on POSIX an empty destination appearing between the check and rename can be
+  replaced, unlike a nonempty retained fence.
+
+After interruption, retain the original request and retry with its returned
+`intentHash` when available. Only matching evidence and unchanged bindings can
+confirm an already-retired object. `status: "unconfirmed"` and exit code one
+are not recovery receipts. Empty or unprovable remnants require investigation,
+not manual deletion. Valid legacy owners and explicitly absent attachments are
+supported without manufacturing new ownership. Time, transcript size,
+compaction, and model selection never authorize reclamation.
 
 See [the active example](examples/plan.active.json), [the complete
 example](examples/plan.complete.json), and [the plan schema](schemas/plan.schema.json).
