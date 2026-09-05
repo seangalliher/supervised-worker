@@ -35,6 +35,8 @@ const faultingHookScript = `
 
   const input = JSON.parse(process.argv[1]);
   const fault = process.argv[2] ?? "persistent";
+  let monotonicTime = 0;
+  Object.defineProperty(performance, "now", { value: () => monotonicTime });
   const lockDirectory = path.join(input.cwd, ".supervised-worker", "locks", "lifecycle");
   const displacedDirectory = path.join(path.dirname(input.cwd), "displaced-lock");
   const replacementToken = "11111111-1111-4111-8111-111111111111";
@@ -207,7 +209,8 @@ const faultingHookScript = `
     if (injectionCount > 0) {
       waits.push({ requestedMs: timeout, elapsedMs: performance.now() - attemptTimes[0] });
       if (!mutationFired) replaceBetweenAttempts();
-      if (fault === "deadline") return originalWait(cell, index, expected, 125);
+      monotonicTime += fault === "deadline" ? 125 : timeout;
+      return "timed-out";
     }
     return originalWait(cell, index, expected, timeout);
   };
@@ -1401,7 +1404,8 @@ for (const scope of ["repository", "session"]) {
   });
 }
 
-test("Git campaign snapshots survive recovery before 16 serial hooks and two four-way batches", { timeout: 90_000 }, async () => {
+for (const holdLiveOwner of [false, true]) {
+test(`Git campaign snapshots survive recovery before 16 serial hooks and two four-way batches (held owner: ${holdLiveOwner})`, { timeout: 90_000 }, async () => {
   await withRecoveryFixture(async (fixture) => {
     const git = (...args) => {
       const result = spawnSync("git", args, { cwd: fixture.cwd, env: childEnvironment(), encoding: "utf8", timeout: 20_000 });
@@ -1438,8 +1442,66 @@ test("Git campaign snapshots survive recovery before 16 serial hooks and two fou
       assert.deepEqual(fixture.invoke("PostToolUse", tool(`serial-${index}`)), {});
     }
     for (const event of ["PreToolUse", "PostToolUse"]) {
-      const batch = Array.from({ length: 4 }, (_, index) => asyncNode(fixture.cwd, [launcherPath, event], JSON.stringify({ cwd: fixture.cwd, ...fixture.anchor, hook_event_name: event, ...tool(`parallel-${index}`) })));
-      for (const output of await Promise.all(batch.map((entry) => entry.done))) assert.deepEqual(output, {});
+      const payload = (index) => JSON.stringify({ cwd: fixture.cwd, ...fixture.anchor, hook_event_name: event, ...tool(`parallel-${index}`) });
+      let outputs;
+      if (holdLiveOwner) {
+        const gate = path.join(fixture.base, `${event}.continue`);
+        const script = `
+          import fs from "node:fs";
+          import path from "node:path";
+          import { syncBuiltinESMExports } from "node:module";
+          const [event, directory, gate] = process.argv.slice(1);
+          const rename = fs.renameSync;
+          fs.renameSync = (source, destination, ...args) => {
+            if (String(source) === directory) {
+              const entries = fs.readdirSync(directory);
+              const owner = JSON.parse(fs.readFileSync(path.join(directory, entries[0])));
+              process.send({ processId: process.pid, owner });
+              const deadline = performance.now() + 20000;
+              while (!fs.existsSync(gate)) {
+                if (performance.now() >= deadline) throw new Error("held-owner premise was not released");
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+              }
+            }
+            return rename(source, destination, ...args);
+          };
+          syncBuiltinESMExports();
+          process.argv = [process.execPath, "hook-launcher.mjs", event];
+          await import(${JSON.stringify(new URL("../src/hook-launcher.mjs", import.meta.url).href)});
+          process.disconnect();
+        `;
+        const owner = asyncNode(fixture.cwd, ["--input-type=module", "--eval", script, event, fixture.canonical("session"), gate], payload(0), true);
+        try {
+          const ready = await childMessage(owner.child);
+          assert.equal(ready.owner.processId, owner.child.pid);
+          assert.doesNotThrow(() => process.kill(ready.processId, 0));
+          const competitors = Array.from({ length: 3 }, (_, index) => asyncNode(fixture.cwd, [launcherPath, event], payload(index + 1)));
+          const rejected = await Promise.all(competitors.map((entry) => entry.done));
+          for (const output of rejected) assert.notDeepEqual(output, {}, "the held live owner must force the contention path");
+          writeFileSync(gate, "continue");
+          outputs = [await owner.done, ...rejected];
+        } finally {
+          if (!existsSync(gate)) writeFileSync(gate, "cleanup");
+          await owner.done;
+        }
+      } else {
+        const batch = Array.from({ length: 4 }, (_, index) => asyncNode(fixture.cwd, [launcherPath, event], payload(index)));
+        outputs = await Promise.all(batch.map((entry) => entry.done));
+      }
+      const eventName = event === "PreToolUse" ? "tool_started" : "tool_completed";
+      const observations = readFileSync(fixture.ledgerPath, "utf8").trim().split("\n").map(JSON.parse).filter((entry) => entry.event === eventName);
+      const accepted = outputs.filter((output) => Object.keys(output).length === 0).length;
+      assert.equal(observations.length, 9 + accepted, "contended hooks must not have recorded a primary operation");
+      for (const [index, output] of outputs.entries()) {
+        if (Object.keys(output).length === 0) continue;
+        const reason = event === "PreToolUse" ? output.permissionDecisionReason : output.additionalContext;
+        assert.match(reason, /LIFECYCLE_OWNER_LIVE/);
+        assert.match(reason, /"operation":"acquire"/);
+        assert.match(reason, /"scope":"session"/);
+        assert.doesNotMatch(reason, /LIFECYCLE_OWNER_DEAD|LIFECYCLE_SYSCALL_FAILURE|Primary hook context/);
+        if (event === "PreToolUse") assert.equal(output.permissionDecision, "deny");
+        assert.deepEqual(fixture.invoke(event, tool(`parallel-${index}`)), {});
+      }
     }
     const records = readFileSync(fixture.ledgerPath, "utf8").trim().split("\n").map(JSON.parse);
     const starts = records.filter((record) => record.event === "tool_started");
@@ -1459,3 +1521,4 @@ test("Git campaign snapshots survive recovery before 16 serial hooks and two fou
     assert.deepEqual(lockState(target.recovered), target.before);
   });
 });
+}
