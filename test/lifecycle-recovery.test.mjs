@@ -1404,6 +1404,53 @@ for (const scope of ["repository", "session"]) {
   });
 }
 
+test("owner retirement during contention observation leaves the invocation unrecorded and retryable", () => {
+  withActiveHookFixture((fixture) => {
+    const sessionHash = sha256(fixture.session.session_id);
+    const sessionLock = path.join(fixture.storage, "supervised-worker", "session-locks", sessionHash);
+    const ledgerPath = path.join(fixture.cwd, ".supervised-worker", "runs", `${sessionHash}.jsonl`);
+    const ledgerBefore = readFileSync(ledgerPath);
+    const tool = { ...fixture.readTool, tool_use_id: "retiring-owner-observation" };
+    const script = `
+      import fs from "node:fs";
+      import path from "node:path";
+      import { syncBuiltinESMExports } from "node:module";
+      const [lock, inputText] = process.argv.slice(1);
+      const token = "11111111-1111-4111-8111-111111111111";
+      fs.mkdirSync(lock);
+      const ownerPath = path.join(lock, token + ".json");
+      fs.writeFileSync(ownerPath, JSON.stringify({ schemaVersion: 1, token, processId: process.pid, acquiredAt: new Date().toISOString() }));
+      const open = fs.openSync;
+      let retiredAtObservation = false;
+      fs.openSync = (filePath, ...args) => {
+        if (String(filePath) === ownerPath && !retiredAtObservation) {
+          retiredAtObservation = true;
+          fs.renameSync(lock, lock + "." + token + ".retired");
+        }
+        return open(filePath, ...args);
+      };
+      syncBuiltinESMExports();
+      const { handleHook } = await import(${JSON.stringify(coreUrl)});
+      const output = handleHook(JSON.parse(inputText), "PreToolUse");
+      process.stdout.write(JSON.stringify({ output, retiredAtObservation }));
+    `;
+    const result = JSON.parse(runChild(fixture.cwd, ["--input-type=module", "--eval", script, sessionLock, JSON.stringify({ ...fixture.session, ...tool })]).stdout);
+    assert.equal(result.retiredAtObservation, true, "the owner must retire inside diagnostic observation");
+    assert.equal(result.output.permissionDecision, "deny");
+    assert.match(result.output.permissionDecisionReason, /LIFECYCLE_ACQUISITION_CONTENTION/);
+    assert.match(result.output.permissionDecisionReason, /"errorCode":"ENOENT"/);
+    assert.match(result.output.permissionDecisionReason, /"operation":"acquire"/);
+    assert.deepEqual(readFileSync(ledgerPath), ledgerBefore);
+    assert.deepEqual(readFileSync(fixture.attachmentPath), fixture.attachmentBefore);
+    assert.deepEqual(fixture.invokeHook("PreToolUse", tool), {});
+    assert.deepEqual(fixture.invokeHook("PostToolUse", tool), {});
+    const added = readFileSync(ledgerPath, "utf8").slice(ledgerBefore.length).trim().split("\n").map(JSON.parse);
+    assert.deepEqual(added.map((entry) => entry.event), ["tool_started", "tool_completed"]);
+    assert.equal(added[0].operationId, added[1].operationId);
+    assert.equal(added[0].invocationHash, added[1].invocationHash);
+  });
+});
+
 for (const holdLiveOwner of [false, true]) {
 test(`Git campaign snapshots survive recovery before 16 serial hooks and two four-way batches (held owner: ${holdLiveOwner})`, { timeout: 90_000 }, async () => {
   await withRecoveryFixture(async (fixture) => {
@@ -1495,7 +1542,9 @@ test(`Git campaign snapshots survive recovery before 16 serial hooks and two fou
       for (const [index, output] of outputs.entries()) {
         if (Object.keys(output).length === 0) continue;
         const reason = event === "PreToolUse" ? output.permissionDecisionReason : output.additionalContext;
-        assert.match(reason, /LIFECYCLE_OWNER_LIVE/);
+        assert.match(reason, /LIFECYCLE_(OWNER_LIVE|ACQUISITION_CONTENTION)/);
+        if (holdLiveOwner) assert.match(reason, /LIFECYCLE_OWNER_LIVE/);
+        if (reason.includes("LIFECYCLE_ACQUISITION_CONTENTION")) assert.match(reason, /"errorCode":"ENOENT"/);
         assert.match(reason, /"operation":"acquire"/);
         assert.match(reason, /"scope":"session"/);
         assert.doesNotMatch(reason, /LIFECYCLE_OWNER_DEAD|LIFECYCLE_SYSCALL_FAILURE|Primary hook context/);
