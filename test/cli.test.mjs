@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import {
+  chmodSync,
+  copyFileSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
@@ -15,9 +17,10 @@ import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { releaseAttachment } from "../src/core.mjs";
+import { validateGitHubQueueObservation } from "../src/github-queue.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cli = path.join(root, "src", "cli.mjs");
@@ -637,6 +640,280 @@ test("hook launcher with trailing arguments leaves attachment ownership untouche
     assert.equal(result.status, 1, result.stderr);
     assert.match(result.stderr, /unsupported hook event/);
     assert.equal(readFileSync(attachmentPath, "utf8"), attachment);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+const QUEUE_QUERY = `query QueueInspection($owner: String!, $name: String!, $states: [IssueState!]!, $cursor: String) {
+  viewer { id }
+  repository(owner: $owner, name: $name) {
+    id
+    nameWithOwner
+    issues(first: 100, after: $cursor, states: $states, orderBy: {field: CREATED_AT, direction: ASC}) {
+      totalCount
+      nodes { id number state updatedAt }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}`;
+
+function queuePage(nodes = [], { totalCount = nodes.length, hasNextPage = false, endCursor = nodes.length ? "terminal:cursor" : null } = {}) {
+  return { data: { viewer: { id: "viewer:1" }, repository: {
+    id: "repository:1", nameWithOwner: "Example/Queue", issues: { totalCount, nodes, pageInfo: { hasNextPage, endCursor } },
+  } } };
+}
+
+function queueIssue(number, state = "OPEN") {
+  return { id: `issue:${number}`, number, state, updatedAt: "2026-09-04T12:00:00Z" };
+}
+
+function queueResponse(body, status = 0, stderr = "") {
+  return { status, signal: null, stdout: Buffer.from(JSON.stringify(body)).toString("base64"), stderr: Buffer.from(stderr).toString("base64") };
+}
+
+function withQueueProcess(cwd, action) {
+  const tools = workspace();
+  const executable = path.join(tools, process.platform === "win32" ? "gh.exe" : "gh");
+  const marker = path.join(tools, "interceptions.json");
+  try {
+    copyFileSync(process.execPath, executable);
+    chmodSync(executable, 0o755);
+    const inspect = (args, { responses = [queueResponse(queuePage())], states = ["OPEN", "CLOSED"], cursors = [null] } = {}) => {
+      rmSync(marker, { force: true });
+      const expected = responses.map((_, index) => ({ owner: "Example", name: "Queue", states, cursor: cursors[index] }));
+      assert.equal(cursors.length, responses.length, "every intended invocation has explicit cursor evidence");
+      const script = `
+        import assert from "node:assert/strict";
+        import childProcess from "node:child_process";
+        import { writeFileSync } from "node:fs";
+        import { syncBuiltinESMExports } from "node:module";
+        const responses = ${JSON.stringify(responses)};
+        const expected = ${JSON.stringify(expected)};
+        const calls = [];
+        for (const method of ["exec", "execFile", "execSync", "execFileSync", "fork", "spawn"]) {
+          childProcess[method] = () => { throw new Error("Unexpected subprocess in isolated queue test"); };
+        }
+        childProcess.spawnSync = (executable, args, options) => {
+          const index = calls.length;
+          const request = JSON.parse(options.input);
+          calls.push({ executable, args, request });
+          assert.equal(executable, ${JSON.stringify(realpathSync(executable))});
+          assert.deepEqual(args, ["api", "graphql", "--hostname", "github.com", "--method", "POST", "--input", "-"]);
+          assert.deepEqual(request, { query: ${JSON.stringify(QUEUE_QUERY)}, variables: expected[index] });
+          assert.equal(options.cwd, ${JSON.stringify(realpathSync(tools))});
+          assert.equal(options.shell, false);
+          assert.equal(options.killSignal, "SIGKILL");
+          assert.equal(options.timeout, 10000);
+          assert.equal(options.maxBuffer, 2097152);
+          assert.equal(options.encoding, null);
+          assert.equal(options.windowsHide, true);
+          assert.deepEqual(options.stdio, ["pipe", "pipe", "pipe"]);
+          assert.equal(options.env.GH_TOKEN, "PRIVATE_QUEUE_GH_TOKEN");
+          assert.equal(options.env.GITHUB_TOKEN, "PRIVATE_QUEUE_GITHUB_TOKEN");
+          assert.equal(options.env.GH_PROMPT_DISABLED, "1");
+          assert.equal(options.env.GH_NO_UPDATE_NOTIFIER, "1");
+          assert.equal(options.env.GH_NO_EXTENSION_UPDATE_NOTIFIER, "1");
+          for (const key of ["GH_HOST", "GH_REPO", "GH_DEBUG", "GH_HTTP_UNIX_SOCKET", "GITHUB_API_URL", "HTTPS_PROXY", "NODE_OPTIONS"]) {
+            assert.equal(Object.hasOwn(options.env, key), false);
+          }
+          assert.ok(index < responses.length, "the real CLI reached an expected intercepted transport call");
+          const response = responses[index];
+          return { ...response, stdout: Buffer.from(response.stdout, "base64"), stderr: Buffer.from(response.stderr, "base64") };
+        };
+        syncBuiltinESMExports();
+        process.argv = [process.execPath, ${JSON.stringify(cli)}, ...${JSON.stringify(args)}];
+        await import(${JSON.stringify(pathToFileURL(cli).href)});
+        assert.equal(calls.length, expected.length, "the interception premise and invocation count must hold");
+        writeFileSync(${JSON.stringify(marker)}, JSON.stringify(calls));
+      `;
+      const environment = { ...process.env };
+      for (const key of Object.keys(environment)) {
+        if (/^(?:GH_|GITHUB_)/i.test(key) || ["PATH", "NODE_OPTIONS", "NODE_PATH"].includes(key.toUpperCase())) delete environment[key];
+      }
+      Object.assign(environment, {
+        PATH: tools, NODE_OPTIONS: "", GH_TOKEN: "PRIVATE_QUEUE_GH_TOKEN", GITHUB_TOKEN: "PRIVATE_QUEUE_GITHUB_TOKEN",
+        GH_HOST: "PRIVATE_QUEUE_HOST", GH_REPO: "PRIVATE_QUEUE_REPO", GH_DEBUG: "api",
+        GH_HTTP_UNIX_SOCKET: "PRIVATE_QUEUE_SOCKET", GITHUB_API_URL: "PRIVATE_QUEUE_ENDPOINT", HTTPS_PROXY: "PRIVATE_QUEUE_PROXY",
+      });
+      const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+        cwd, env: environment, encoding: "utf8", timeout: 15_000,
+      });
+      assert.equal(result.error, undefined, result.error?.message);
+      assert.equal(result.stderr, "");
+      assert.ok(existsSync(marker), "the child imported the actual CLI and completed its interception assertions");
+      const calls = JSON.parse(readFileSync(marker, "utf8"));
+      assert.deepEqual(calls, expected.map((variables) => ({
+        executable: realpathSync(executable),
+        args: ["api", "graphql", "--hostname", "github.com", "--method", "POST", "--input", "-"],
+        request: { query: QUEUE_QUERY, variables },
+      })));
+      const observation = JSON.parse(result.stdout);
+      assert.deepEqual(validateGitHubQueueObservation(observation), []);
+      assert.doesNotMatch(result.stdout, /PRIVATE_QUEUE_|SECRET CLI|secret-cli-id/);
+      return { ...result, observation, calls };
+    };
+    action(inspect);
+  } finally {
+    rmSync(tools, { recursive: true, force: true });
+  }
+}
+
+function queueStateBytes(directory) {
+  const entries = [];
+  function visit(relative = "") {
+    for (const entry of readdirSync(path.join(directory, relative), { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+      const name = path.join(relative, entry.name);
+      if (entry.isDirectory()) {
+        entries.push([name, null]);
+        visit(name);
+      } else entries.push([name, readFileSync(path.join(directory, name))]);
+    }
+  }
+  visit();
+  return entries;
+}
+
+test("queue CLI reaches the real adapter for explicit open, closed, and all observations with no network", () => {
+  const cwd = workspace();
+  try {
+    withQueueProcess(cwd, (inspect) => {
+      for (const [state, states] of [["open", ["OPEN"]], ["closed", ["CLOSED"]], ["all", ["OPEN", "CLOSED"]]]) {
+        const before = Date.now();
+        const observed = inspect(["queue", "inspect", "Example/Queue", "--state", state], {
+          states, responses: [queueResponse(queuePage([queueIssue(3, states[0])]))],
+        });
+        assert.equal(observed.status, 0);
+        assert.equal(observed.calls.length, 1);
+        assert.equal(observed.observation.status, "complete");
+        assert.equal(observed.observation.scope.state, state);
+        assert.equal(observed.observation.totalCount, 1);
+        assert.ok(Date.parse(observed.observation.startedAt) >= before);
+        assert.ok(Date.parse(observed.observation.finishedAt) <= Date.now());
+      }
+      const empty = inspect(["queue", "inspect", "Example/Queue", "--state", "all"]);
+      assert.equal(empty.status, 0);
+      assert.equal(empty.calls.length, 1);
+      assert.equal(empty.observation.pageCount, 1);
+      assert.deepEqual(empty.observation.issues, []);
+      assert.equal(existsSync(path.join(cwd, ".supervised-worker")), false);
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("queue CLI rejects every unsupported arity, flag, and injection before transport", () => {
+  const cwd = workspace();
+  try {
+    const sentinel = path.join(cwd, ".supervised-worker");
+    writeFileSync(sentinel, "STATE SENTINEL");
+    withQueueProcess(cwd, (inspect) => {
+      const prefix = ["queue", "inspect", "Example/Queue"];
+      for (const args of [
+        ["queue"], ["queue", "other"], ["queue", "inspect"], prefix,
+        [...prefix, "--state"], [...prefix, "--state", "OPEN"], [...prefix, "--state", "all", "extra"],
+        [...prefix, "--state", "all", "--state", "open"], [...prefix, "--state=all"],
+        ["queue", "inspect", "--state", "all", "Example/Queue"],
+        ...["--host", "--hostname", "--endpoint", "--executable", "--output", "--query"].map((flag) => [...prefix, "--state", "all", flag, "PRIVATE_QUEUE_OPTION"]),
+        ...["https://github.com/Example/Queue", "../Queue", "Example/..", " Example/Queue", "Example/Queue\n",
+          "Example/Queue;PRIVATE_QUEUE_COMMAND", "Example/Queue$(PRIVATE_QUEUE_COMMAND)", "Example/Queue|PRIVATE_QUEUE_COMMAND",
+          "Example/Queue&&PRIVATE_QUEUE_COMMAND", "Example/Queue\u0001"].map((repository) => ["queue", "inspect", repository, "--state", "all"]),
+      ]) {
+        const observed = inspect(args, { responses: [], cursors: [] });
+        assert.equal(observed.status, 1);
+        assert.equal(observed.calls.length, 0);
+        assert.equal(observed.observation.status, "unavailable");
+        assert.equal(observed.observation.reason, "invalid-input");
+        assert.equal(observed.observation.scope, null);
+        assert.equal(readFileSync(sentinel, "utf8"), "STATE SENTINEL");
+      }
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("queue CLI failures emit only validated unavailable JSON and discard earlier pages", () => {
+  const cwd = workspace();
+  try {
+    withQueueProcess(cwd, (inspect) => {
+      const args = ["queue", "inspect", "Example/Queue", "--state", "all"];
+      const first = queuePage([queueIssue(1)], { totalCount: 2, hasNextPage: true, endCursor: "opaque:next /?=+" });
+      const last = queuePage([queueIssue(2, "CLOSED")], { totalCount: 2 });
+      const cursors = [null, "opaque:next /?=+"];
+      const valid = inspect(args, { responses: [queueResponse(first), queueResponse(last)], cursors });
+      assert.equal(valid.status, 0);
+      assert.equal(valid.calls.length, 2);
+      const authentication = inspect(args, { responses: [queueResponse(null, 4, "PRIVATE_QUEUE_CREDENTIAL")] });
+      assert.equal(authentication.status, 1);
+      assert.equal(authentication.calls.length, 1);
+      assert.equal(authentication.observation.reason, "authentication-unavailable");
+      const partial = inspect(args, {
+        responses: [queueResponse(first), queueResponse({ ...last, errors: [{ message: "PRIVATE_QUEUE_PAYLOAD" }] }, 1)], cursors,
+      });
+      assert.equal(partial.status, 1);
+      assert.equal(partial.calls.length, 2);
+      assert.equal(partial.observation.reason, "provider-error");
+      for (const key of ["actor", "repository", "totalCount", "pageCount", "issues"]) assert.equal(partial.observation[key], null);
+      assert.equal(existsSync(path.join(cwd, ".supervised-worker")), false);
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("queue inspection preserves active state bytes, all seven campaign facts, reconciliation, and Stop authority", () => {
+  const cwd = workspace();
+  try {
+    const state = writeCampaignState(cwd);
+    const planFile = path.join(state, "plan.json");
+    const input = { cwd, session_id: "queue-compatibility", tool_name: "Write", tool_use_id: "queue-setup", tool_input: { file_path: planFile } };
+    for (const event of ["PreToolUse", "PostToolUse"]) {
+      const attached = run(["hook", event], { cwd, input: JSON.stringify(input) });
+      assert.equal(attached.status, 0, attached.stderr);
+      assert.deepEqual(JSON.parse(attached.stdout), {});
+    }
+    const status = run(["status"], { cwd });
+    assert.equal(status.status, 0, status.stderr);
+    assert.equal(JSON.parse(status.stdout).attachment.status, "active");
+    const exported = run(["campaign", "export"], { cwd });
+    assert.equal(exported.status, 0, exported.stderr);
+    const original = JSON.parse(exported.stdout);
+    assert.equal(original.localDataStatus, "available");
+    assert.ok(original.runLedger.recordCount > 0, "actual hook producers populated the ledger");
+    assert.equal(Object.keys(original.providerFacts).length, 7);
+    for (const fact of Object.values(original.providerFacts)) {
+      assert.equal(fact.status, "unavailable");
+      assert.equal(fact.value, null);
+      assert.equal(typeof fact.reason, "string");
+      assert.ok(fact.reason.length > 0);
+    }
+    const receipt = path.join(cwd, "queue-baseline-receipt.json");
+    writeFileSync(receipt, exported.stdout);
+    const before = queueStateBytes(state);
+    assert.ok(before.some(([name]) => name === "plan.json"));
+    assert.ok(before.some(([name]) => name === "attachment.json"));
+    withQueueProcess(cwd, (inspect) => {
+      const observed = inspect(["queue", "inspect", "Example/Queue", "--state", "all"], {
+        responses: [queueResponse(queuePage([queueIssue(3)]))],
+      });
+      assert.equal(observed.status, 0);
+      assert.equal(observed.calls.length, 1);
+      assert.deepEqual(observed.observation.issues, [queueIssue(3)]);
+    });
+    assert.deepEqual(queueStateBytes(state), before);
+    const after = run(["campaign", "export"], { cwd });
+    assert.equal(after.status, 0, after.stderr);
+    assert.deepEqual(JSON.parse(after.stdout).providerFacts, original.providerFacts);
+    assert.equal(after.stdout, exported.stdout);
+    const reconciled = run(["campaign", "validate", receipt], { cwd });
+    assert.equal(reconciled.status, 0, reconciled.stderr);
+    assert.equal(JSON.parse(reconciled.stdout).matchesCurrentWorkspace, true);
+    assert.deepEqual(queueStateBytes(state), before);
+    const stop = run(["hook", "Stop"], { cwd, input: JSON.stringify({ cwd, session_id: input.session_id }) });
+    assert.equal(stop.status, 0, stop.stderr);
+    assert.equal(JSON.parse(stop.stdout).decision, "block");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

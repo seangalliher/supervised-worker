@@ -33,7 +33,8 @@ The current alpha separately validates local completion-record shape and
 explicitly invoked build/review/Git-tree handoffs. Stop does not yet consume a
 verified handoff receipt. The plugin also does not independently verify GitHub
 pagination, remote pushes, CI, pull requests, reviewer identity, or issue
-closure. See [Launch Readiness](docs/launch-readiness.md) for the evidence
+closure as completion evidence. The standalone queue command below returns
+unattested interval observations only. See [Launch Readiness](docs/launch-readiness.md) for the evidence
 required before broader claims.
 
 The alpha can export a deterministic `local-campaign-receipt` from the current
@@ -59,6 +60,8 @@ Provider-Verified Completion**.
 - A runtime-dependency-free Node helper with repository validation, plan status,
   explicit checkpoint/resume, and deterministic local campaign receipt export
   and reconciliation.
+- A standalone authenticated, read-only GitHub issue inspection command with
+  bounded pagination and metadata-only interval observations.
 - Constitutional policy and schemas for future evidence-gated learning. The
   alpha does not yet capture outcome episodes or activate learned procedures.
 
@@ -308,10 +311,92 @@ node src/cli.mjs campaign export
 node src/cli.mjs campaign export --format json
 node src/cli.mjs campaign export --format markdown
 node src/cli.mjs campaign validate <receipt.json>
+node src/cli.mjs queue inspect OWNER/REPO --state all
 ```
 
 `doctor` validates the package and reports durable plan state for the current
 directory. The lifecycle host invokes `hook EVENT` automatically.
+
+### Read-Only GitHub Queue Inspection
+
+Queue inspection requires a separately installed native GitHub CLI (`gh.exe`
+on Windows, `gh` on macOS/Linux) and existing authentication for `github.com`,
+including for public repositories. The operator installs and authenticates gh;
+this adapter never installs it, logs in, prompts, or acquires credentials:
+
+```bash
+gh auth login --hostname github.com
+node src/cli.mjs queue inspect OWNER/REPO --state open
+node src/cli.mjs queue inspect OWNER/REPO --state closed
+node src/cli.mjs queue inspect OWNER/REPO --state all
+```
+
+Run from the target workspace's root. The native executable must resolve from
+an absolute PATH entry outside both that workspace and the plugin checkout.
+Workspace executables, links resolving into those directories, relative PATH
+entries, and batch/shell wrappers are rejected. Existing host authentication
+(including `GH_TOKEN` or `GITHUB_TOKEN`) is passed only to gh in a restricted
+environment. Host/endpoint overrides, debug output, pagers, prompts, and update
+notifications are disabled. Requests use a fixed `github.com` GraphQL query,
+JSON variables, and `shell: false`; no query text comes from the command line.
+
+The command accepts exactly `queue inspect OWNER/REPO --state open|closed|all`.
+State is mandatory. URLs, traversal, whitespace/control characters, duplicate
+or additional arguments, and host/executable/query/output-path options are not
+accepted. It enumerates issues, not pull requests, and performs no provider
+mutations or local state writes. Only the CLI writes stdout.
+
+Stdout is one validated, two-space JSON `github-queue-observation` with
+`schemaVersion: 1`. Exit `0` means `status: "complete"` and `reason: null`;
+exit `1` means `status: "unavailable"` with a fixed reason code. Stderr is empty.
+Every observation includes the requested `scope` (host, repository, state),
+real UTC `startedAt` and `finishedAt`, `consistency: "interval-observation"`,
+and `integrity: "unattested"`.
+
+Complete observations contain only authenticated `actor: {id}`, immutable
+`repository: {id, nameWithOwner}`, `totalCount`, `pageCount`, and number-sorted
+`issues: [{id, number, state, updatedAt}]`. Issue states are `OPEN` or `CLOSED`.
+No titles, bodies, comments, credentials, raw errors, or provider payloads are
+returned or persisted. Empty success still requires one authenticated terminal
+page: `totalCount: 0`, `pageCount: 1`, and `issues: []`.
+
+Unavailable observations discard **all** partial results: `actor`, `repository`,
+`totalCount`, `pageCount`, and `issues` are `null`, not empty arrays or zero
+counts. Invalid input also has `scope: null`; an internal failure before scope
+is established can do so as well. Reasons are limited to `invalid-input`,
+`gh-unavailable`, `authentication-unavailable`, `transport-failed`,
+`response-invalid`, `provider-error`, `identity-invalid`, `pagination-invalid`,
+`limit-exceeded`, `timeout`, and `internal-error`. Classification uses process
+codes and validated structure, never error-message text.
+
+The adapter requests 100 issues per page, ordered by creation time ascending.
+Every page rechecks viewer and repository identity, total count, issue state,
+unique IDs/numbers, and cursor progress. Strict UTF-8, duplicate-free JSON,
+selected response shapes, safe integers, and timestamps are validated. Limits
+are 100 pages, 10,000 issues, 1 MiB for each subprocess stdout/stderr stream,
+8 MiB aggregate stdout, 10 seconds per request, and 60 seconds overall using a
+monotonic deadline. The synchronous subprocess has a 2 MiB combined buffering
+ceiling; each individual stream must still pass its 1 MiB bound. Opaque IDs
+are limited to 512 characters and cursors to 4,096 characters, without assuming
+a base64 encoding or lexical ordering. Timed-out children are killed; truncated
+output and any cap reached without validated termination are unavailable.
+There are no retries.
+
+`inspectGitHubQueue({repository, state}, {transport, clock})` is synchronous.
+Tests may supply a transport taking `{query, variables, timeout}` and returning
+the buffered `spawnSync` result shape, plus a clock with numeric-millisecond
+`wall()` and nondecreasing `monotonic()` readings. Defaults use the real clocks
+and native gh. `validateGitHubQueueObservation(value)` returns an empty array
+for valid observations or fixed validation-code strings; unknown keys and
+versions are rejected. The CLI validates before serialization.
+
+**Complete means validated pagination during an observation interval, not an
+atomic snapshot of queue truth.** Concurrent issue changes can escape detection
+even when all observed identities and counts agree. This is not signed evidence,
+Provider-Verified Completion, queue selection, or the whole v0.2 roadmap.
+Inspection does not update plans or receipts, reconcile remote evidence, or
+change Stop behavior. All seven campaign provider facts and their unavailable
+reasons remain unchanged; launch-verification requirements still apply.
 
 ### Explicit Checkpoint And Resume
 

@@ -19,6 +19,7 @@ import {
   summarizePlan,
   validatePlan,
 } from "./core.mjs";
+import { inspectGitHubQueue, validateGitHubQueueObservation } from "./github-queue.mjs";
 import {
   inspectHandoffFile,
   issueReviewAttempt,
@@ -133,6 +134,7 @@ async function validateRepository() {
     "src/core.mjs",
     "src/campaign.mjs",
     "src/cli.mjs",
+    "src/github-queue.mjs",
     "src/handoff.mjs",
     "src/hook-manifest.mjs",
     "src/hook-launcher.mjs",
@@ -332,9 +334,26 @@ async function main() {
   const [command = "help", argument, ...argumentsAfter] = process.argv.slice(2);
   const hasNoArguments = argument === undefined && argumentsAfter.length === 0;
   const usage =
-    "Usage: node src/cli.mjs <validate|doctor|install|status|checkpoint|resume|release|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
+    "Usage: node src/cli.mjs <validate|doctor|install|status|checkpoint|resume|release|queue inspect OWNER/REPO --state open|closed|all|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
   if (command === "help" && hasNoArguments) {
     process.stdout.write(usage);
+    return;
+  }
+  if (command === "queue") {
+    const input = argument === "inspect" && argumentsAfter.length === 3 && argumentsAfter[1] === "--state"
+      ? { repository: argumentsAfter[0], state: argumentsAfter[2] }
+      : null;
+    let observation = inspectGitHubQueue(input);
+    if (validateGitHubQueueObservation(observation).length > 0) {
+      const now = new Date().toISOString();
+      observation = {
+        schemaVersion: 1, kind: "github-queue-observation", status: "unavailable", reason: "internal-error",
+        scope: null, startedAt: now, finishedAt: now, consistency: "interval-observation", integrity: "unattested",
+        actor: null, repository: null, totalCount: null, pageCount: null, issues: null,
+      };
+    }
+    process.stdout.write(`${JSON.stringify(observation, null, 2)}\n`);
+    if (observation.status !== "complete") process.exitCode = 1;
     return;
   }
   if (command === "hook" && argument !== undefined && argumentsAfter.length === 0) {
