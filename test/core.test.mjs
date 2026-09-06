@@ -741,87 +741,349 @@ test("PostToolUse waits for a brief same-session lock overlap", async () => {
   assert.equal(records.at(-1).success, true);
 });
 
-test("two PostToolUse contenders serialize after one brief owner", async () => {
-  const pluginRoot = workspace();
-  const repositoryRoot = workspace();
-  const storageRoot = workspace();
-  const sessionId = "three-contender-session";
-  const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
-  const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
-  const planTool = {
-    tool_name: "Write",
-    tool_input: { file_path: planPath(repositoryRoot) },
-  };
-  handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse");
-  writePlan(repositoryRoot);
-  handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse");
+for (const schedule of ["successful-overlap", "bounded-live-rejection"]) {
+  test(`two PostToolUse contenders use an owned rendezvous (${schedule})`, async () => {
+    const pluginRoot = workspace();
+    const repositoryRoot = workspace();
+    const storageRoot = workspace();
+    const sessionId = `three-contender-${schedule}`;
+    const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
+    const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
+    const planTool = {
+      tool_name: "Write", tool_use_id: "setup-plan",
+      tool_input: { file_path: planPath(repositoryRoot) },
+    };
+    assert.deepEqual(handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse"), {});
+    writePlan(repositoryRoot);
+    assert.deepEqual(handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse"), {});
 
-  const lockDirectory = path.join(
-    storageRoot,
-    "supervised-worker",
-    "session-locks",
-    sha256(sessionId),
-  );
-  mkdirSync(lockDirectory, { recursive: true });
-  writeFileSync(path.join(lockDirectory, "brief-owner.json"), "{}\n");
-  const input = {
-    ...common,
-    hook_event_name: "PostToolUse",
-    tool_name: "read_file",
-    tool_input: { filePath: path.join(repositoryRoot, "README.md") },
-  };
-  const workerSource = `
-    const { parentPort, workerData } = require("node:worker_threads");
-    parentPort.postMessage({ type: "ready" });
-    parentPort.once("message", async () => {
-      const { performance } = await import("node:perf_hooks");
-      const { handleHook } = await import(workerData.coreUrl);
-      const started = performance.now();
-      const output = handleHook(workerData.input, "PostToolUse");
-      parentPort.postMessage({ type: "result", output, elapsed: performance.now() - started });
-      parentPort.close();
-    });
-  `;
-  const contenders = [0, 1].map(() =>
-    new Worker(workerSource, { eval: true, workerData: { coreUrl, input } }),
-  );
-  const exitPromises = contenders.map((worker) => once(worker, "exit"));
-  try {
-    await Promise.all(contenders.map(async (worker) => {
-      const [message] = await once(worker, "message");
-      assert.equal(message.type, "ready");
+    const lockDirectory = path.join(storageRoot, "supervised-worker", "session-locks", sha256(sessionId));
+    const canonicalLocks = [lockDirectory, path.join(repositoryRoot, ".supervised-worker", "locks", "lifecycle")];
+    const ledgerPath = path.join(repositoryRoot, ".supervised-worker", "runs", `${sha256(sessionId)}.jsonl`);
+    const records = () => readFileSync(ledgerPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const inputs = ["first", "second"].map((name) => ({
+      ...common, hook_event_name: "PostToolUse", tool_name: "read_file", tool_use_id: `${schedule}-${name}`,
+      tool_input: { filePath: path.join(repositoryRoot, "README.md") },
     }));
-    const resultPromises = contenders.map(async (worker) => {
-      const messagePromise = once(worker, "message");
-      worker.postMessage("go");
-      const [message] = await messagePromise;
-      return message;
+    const starts = inputs.map((input) => {
+      assert.deepEqual(handleHook({ ...input, hook_event_name: "PreToolUse" }, "PreToolUse"), {});
+      const start = records().at(-1);
+      assert.equal(start.event, "tool_started");
+      assert.equal(start.toolName, "read_file");
+      return start;
     });
-    setTimeout(() => rmSync(lockDirectory, { recursive: true, force: true }), 75);
-    const results = await Promise.all(resultPromises);
-    for (const result of results) {
-      assert.equal(result.type, "result");
-      assert.deepEqual(result.output, {});
-      assert.ok(result.elapsed >= 40, `contender did not observe the brief owner: ${result.elapsed}ms`);
-      assert.ok(result.elapsed < 500, `contender exceeded the overlap bound: ${result.elapsed}ms`);
+    assert.equal(new Set(starts.map((start) => start.invocationHash)).size, 2);
+    assert.equal(new Set(starts.map((start) => start.operationId)).size, 2);
+    const baseline = records();
+    const workerSource = `
+      const assert = require("node:assert/strict");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { syncBuiltinESMExports } = require("node:module");
+      const { performance } = require("node:perf_hooks");
+      const { parentPort, workerData } = require("node:worker_threads");
+      const gates = new Int32Array(workerData.gates);
+      const nativeWait = Atomics.wait;
+      const originalMkdir = fs.mkdirSync;
+      const originalWrite = fs.writeFileSync;
+      const originalRename = fs.renameSync;
+      const originalRmdir = fs.rmdirSync;
+      const originalKill = process.kill;
+      const attemptTimes = [], contentions = [], waits = [], observations = [];
+      const creations = [], publications = [], retirements = [], gateTimeouts = [];
+      const retiredPaths = new Set();
+      let removals = 0;
+      let monotonicTime = 0;
+      let waitingForSession = false;
+      Object.defineProperty(performance, "now", { value: () => monotonicTime });
+
+      function rendezvous(index) {
+        if (nativeWait(gates, index, 0, 20_000) === "timed-out") gateTimeouts.push(index);
+      }
+      function identity(filePath) {
+        const stats = fs.lstatSync(filePath, { bigint: true });
+        assert.equal(stats.isSymbolicLink(), false);
+        assert.notEqual(stats.dev, 0n);
+        assert.notEqual(stats.ino, 0n);
+        return { dev: String(stats.dev), ino: String(stats.ino) };
+      }
+      function snapshot(directory = workerData.lockDirectory) {
+        assert.equal(fs.lstatSync(directory).isDirectory(), true);
+        const entries = fs.readdirSync(directory);
+        assert.equal(entries.length, 1);
+        const ownerPath = path.join(directory, entries[0]);
+        const bytes = fs.readFileSync(ownerPath, "utf8");
+        const owner = JSON.parse(bytes);
+        assert.equal(owner.schemaVersion, 1);
+        assert.equal(entries[0], owner.token + ".json");
+        assert.equal(fs.lstatSync(ownerPath).nlink, 1);
+        return { directory: identity(directory), file: identity(ownerPath), owner, bytes };
+      }
+      fs.mkdirSync = (directory, ...args) => {
+        if (String(directory) !== workerData.lockDirectory) return originalMkdir(directory, ...args);
+        attemptTimes.push(monotonicTime);
+        let result;
+        try {
+          result = originalMkdir(directory, ...args);
+        } catch (error) {
+          if (error.code === "EEXIST") {
+            waitingForSession = true;
+            contentions.push({ at: monotonicTime, errorCode: error.code, snapshot: snapshot() });
+          }
+          throw error;
+        }
+        waitingForSession = false;
+        creations.push(identity(directory));
+        return result;
+      };
+      fs.writeFileSync = (filePath, ...args) => {
+        const result = originalWrite(filePath, ...args);
+        if (path.dirname(String(filePath)) === workerData.lockDirectory) {
+          const published = snapshot();
+          assert.equal(published.owner.processId, process.pid);
+          publications.push(published);
+          if (workerData.role === "owner") {
+            parentPort.postMessage({ type: "held", kind: "published", snapshot: published, creations: creations.length });
+            rendezvous(1);
+          }
+        }
+        return result;
+      };
+      fs.renameSync = (source, destination, ...args) => {
+        if (String(source) !== workerData.lockDirectory) return originalRename(source, destination, ...args);
+        const published = publications.at(-1);
+        assert.ok(published);
+        assert.equal(String(destination), workerData.lockDirectory + "." + published.owner.token + ".retired");
+        assert.deepEqual(snapshot(), published);
+        const result = originalRename(source, destination, ...args);
+        retirements.push(snapshot(String(destination)));
+        retiredPaths.add(String(destination));
+        return result;
+      };
+      fs.rmdirSync = (directory, ...args) => {
+        assert.notEqual(String(directory), workerData.lockDirectory);
+        const result = originalRmdir(directory, ...args);
+        if (retiredPaths.has(String(directory))) removals += 1;
+        return result;
+      };
+      process.kill = (processId, signal) => {
+        const observed = signal === 0 ? snapshot() : null;
+        const result = originalKill.call(process, processId, signal);
+        if (observed) observations.push({ at: monotonicTime, processId, signal, snapshot: observed });
+        return result;
+      };
+      Atomics.wait = (cell, index, expected, timeout) => {
+        if (waitingForSession) {
+          waits.push({ at: monotonicTime, requestedMs: timeout });
+          if (waits.length === 1) {
+            parentPort.postMessage({ type: "held", kind: "contended", snapshot: contentions[0].snapshot });
+            rendezvous(1);
+          }
+        }
+        monotonicTime += timeout;
+        return "timed-out";
+      };
+      syncBuiltinESMExports();
+      (async () => {
+        const { handleHook } = await import(workerData.coreUrl);
+        parentPort.postMessage({ type: "ready", processId: process.pid });
+        rendezvous(0);
+        const output = handleHook(workerData.input, workerData.input.hook_event_name);
+        parentPort.postMessage({ type: "result", output, attemptTimes, contentions, waits, observations,
+          creations, publications, retirements, removals, monotonicTime, gateTimeouts });
+        parentPort.close();
+      })();
+    `;
+    const participants = [];
+    function bounded(promise) {
+      let timer;
+      return Promise.race([promise, new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("owned-rendezvous watchdog expired")), 30_000);
+      })]).finally(() => clearTimeout(timer));
     }
-    await Promise.all(exitPromises);
-  } finally {
-    await Promise.all(contenders.map((worker) => worker.terminate()));
-  }
-  assert.equal(existsSync(lockDirectory), false);
-  const records = readFileSync(
-    path.join(repositoryRoot, ".supervised-worker", "runs", `${sha256(sessionId)}.jsonl`),
-    "utf8",
-  )
-    .trim()
-    .split("\n")
-    .map((line) => JSON.parse(line));
-  assert.equal(
-    records.filter((record) => record.event === "tool_completed" && record.toolName === "read_file").length,
-    2,
-  );
-});
+    function release(participant, index) {
+      Atomics.store(participant.gates, index, 1);
+      Atomics.notify(participant.gates, index);
+    }
+    function launch(role, input) {
+      const gates = new Int32Array(new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT));
+      const participant = { gates, messages: {}, errors: [], exited: false };
+      const signals = {};
+      for (const stage of ["ready", "held"]) {
+        participant[stage] = new Promise((resolve) => { signals[stage] = resolve; });
+      }
+      const worker = new Worker(workerSource, {
+        eval: true, workerData: { coreUrl, input, role, lockDirectory, gates: gates.buffer },
+      });
+      participant.worker = worker;
+      participant.done = new Promise((resolve) => {
+        worker.on("message", (message) => {
+          participant.messages[message.type] = message;
+          signals[message.type]?.(message);
+        });
+        worker.on("error", (error) => participant.errors.push(error.message));
+        worker.once("exit", (code) => {
+          participant.exited = true;
+          participant.exitCode = code;
+          for (const signal of Object.values(signals)) signal(null);
+          resolve();
+        });
+      });
+      participants.push(participant);
+      return participant;
+    }
+    async function completed(participant) {
+      await bounded(participant.done);
+      assert.deepEqual(participant.errors, []);
+      assert.equal(participant.exitCode, 0);
+      const result = participant.messages.result;
+      assert.ok(result, "every joined worker must report its hook and ownership observations");
+      assert.deepEqual(result.gateTimeouts, []);
+      return result;
+    }
+    function assertNoLocks() {
+      for (const directory of canonicalLocks) assert.equal(existsSync(directory), false, directory);
+    }
+    function assertCompletion(record, start) {
+      assert.equal(record.event, "tool_completed");
+      assert.equal(record.success, true);
+      for (const key of ["toolName", "operationId", "invocationHash", "session", "routeGeneration", "claimGeneration"]) {
+        assert.equal(record[key], start[key], key);
+      }
+    }
+
+    try {
+      assertNoLocks();
+      const owner = launch("owner", { ...common, hook_event_name: "SessionStart" });
+      const contenders = inputs.map((input) => launch("contender", input));
+      const ready = await bounded(Promise.all(participants.map((participant) => participant.ready)));
+      assert.ok(ready.every((message) => message?.type === "ready"));
+      release(owner, 0);
+      const published = await bounded(owner.held);
+      assert.equal(published?.kind, "published");
+      assert.equal(published.creations, 1);
+      const held = published.snapshot;
+      assert.equal(held.owner.processId, ready[0].processId);
+      function assertHeldOwner() {
+        assert.equal(owner.exited, false);
+        assert.equal(process.kill(held.owner.processId, 0), true);
+        const stats = lstatSync(lockDirectory, { bigint: true });
+        assert.deepEqual({ dev: String(stats.dev), ino: String(stats.ino) }, held.directory);
+        assert.deepEqual(readdirSync(lockDirectory), [`${held.owner.token}.json`]);
+        const ownerPath = path.join(lockDirectory, `${held.owner.token}.json`);
+        const ownerStats = lstatSync(ownerPath, { bigint: true });
+        assert.deepEqual({ dev: String(ownerStats.dev), ino: String(ownerStats.ino) }, held.file);
+        assert.equal(readFileSync(ownerPath, "utf8"), held.bytes);
+      }
+      assertHeldOwner();
+      for (const contender of contenders) release(contender, 0);
+      for (const contender of contenders) {
+        const observed = await bounded(contender.held);
+        assert.equal(observed?.kind, "contended");
+        assert.deepEqual(observed.snapshot, held);
+      }
+      assert.deepEqual(records(), baseline);
+
+      if (schedule === "bounded-live-rejection") {
+        release(contenders[1], 1);
+        const rejected = await completed(contenders[1]);
+        assertHeldOwner();
+        assert.deepEqual(rejected.creations, []);
+        assert.deepEqual(rejected.publications, []);
+        assert.ok(rejected.attemptTimes.length > 1);
+        assert.equal(rejected.contentions.length, rejected.attemptTimes.length);
+        assert.equal(rejected.waits.length, rejected.attemptTimes.length);
+        let elapsed = 0;
+        for (const [index, wait] of rejected.waits.entries()) {
+          assert.equal(wait.at, elapsed);
+          assert.equal(rejected.attemptTimes[index], elapsed);
+          assert.ok(rejected.attemptTimes[index] < 250, "no acquisition attempt is allowed at the deadline");
+          assert.equal(wait.requestedMs, Math.min(10, 250 - elapsed));
+          assert.deepEqual(rejected.contentions[index], { at: elapsed, errorCode: "EEXIST", snapshot: held });
+          elapsed += wait.requestedMs;
+        }
+        assert.equal(elapsed, 250);
+        assert.equal(rejected.monotonicTime, 250);
+        assert.deepEqual(rejected.observations, [{ at: 250, processId: held.owner.processId, signal: 0, snapshot: held }]);
+        assert.equal(typeof rejected.output.systemMessage, "string");
+        const message = rejected.output.systemMessage;
+        const diagnosticStart = message.indexOf('{"code":');
+        assert.ok(diagnosticStart >= 0, "the rejected delivery must expose its structured lifecycle diagnostic");
+        const diagnostic = JSON.parse(message.slice(diagnosticStart, message.lastIndexOf("}") + 1));
+        assert.deepEqual(Object.fromEntries([
+          "code", "scope", "operation", "phase", "syscall", "errorCode", "attempts", "token", "processId", "cause",
+        ].map((key) => [key, diagnostic[key]])), {
+          code: "LIFECYCLE_OWNER_LIVE", scope: "session", operation: "acquire", phase: "owner-observation",
+          syscall: "kill", errorCode: null, attempts: rejected.attemptTimes.length,
+          token: held.owner.token, processId: held.owner.processId, cause: "not-established",
+        });
+        assert.deepEqual(records(), baseline, "the rejected delivery must not record a primary event");
+      }
+
+      release(owner, 1);
+      const retiredOwner = await completed(owner);
+      assert.deepEqual(retiredOwner.attemptTimes, [0]);
+      assert.deepEqual(retiredOwner.publications, [held]);
+      assert.deepEqual(retiredOwner.retirements, [held]);
+      assert.equal(retiredOwner.removals, 1);
+      assertNoLocks();
+      for (const [index, contender] of contenders.entries()) {
+        if (schedule === "bounded-live-rejection" && index === 1) continue;
+        release(contender, 1);
+        const result = await completed(contender);
+        assert.deepEqual(result.output, {});
+        assert.deepEqual(result.attemptTimes, [0, 10]);
+        assert.deepEqual(result.waits, [{ at: 0, requestedMs: 10 }]);
+        assert.deepEqual(result.contentions, [{ at: 0, errorCode: "EEXIST", snapshot: held }]);
+        assert.equal(result.publications.length, 1);
+        assertNoLocks();
+      }
+    } finally {
+      for (const participant of participants) {
+        release(participant, 0);
+        release(participant, 1);
+      }
+      try {
+        await bounded(Promise.all(participants.map((participant) => participant.done)));
+        for (const participant of participants) {
+          assert.equal(participant.exited, true);
+          assert.equal(participant.exitCode, 0);
+          const result = participant.messages.result;
+          assert.ok(result, "missing retirement telemetry must preserve the fixture");
+          assert.deepEqual(result.creations, result.publications.map((published) => published.directory));
+          assert.deepEqual(result.retirements, result.publications);
+          assert.equal(result.removals, result.creations.length);
+          if (result.creations.length > 0) assert.doesNotMatch(JSON.stringify(result.output), /LIFECYCLE_/);
+        }
+        assertNoLocks();
+      } catch (error) {
+        for (const directory of [pluginRoot, repositoryRoot, storageRoot]) temporaryWorkspaces.delete(directory);
+        for (const participant of participants) participant.worker.unref();
+        throw new Error(`Owned retirement or worker exit is unconfirmed; preserving fixtures: ${pluginRoot}, ${repositoryRoot}, ${storageRoot}`, { cause: error });
+      }
+    }
+
+    assert.ok(participants.every((participant) => participant.exited));
+    assertNoLocks();
+    if (schedule === "bounded-live-rejection") {
+      const beforeRetry = records().slice(baseline.length);
+      assert.equal(beforeRetry.filter((record) => record.invocationHash === starts[1].invocationHash).length, 0);
+      assert.equal(beforeRetry.length, 1);
+      assertCompletion(beforeRetry[0], starts[0]);
+      assert.deepEqual(handleHook(inputs[1], "PostToolUse"), {});
+      assertNoLocks();
+    }
+    const finalRecords = records();
+    assert.deepEqual(finalRecords.slice(0, baseline.length), baseline);
+    const completions = finalRecords.slice(baseline.length);
+    assert.equal(completions.length, 2);
+    for (const start of starts) {
+      const matching = completions.filter((record) => record.invocationHash === start.invocationHash);
+      assert.equal(matching.length, 1);
+      assertCompletion(matching[0], start);
+    }
+  });
+}
 
 for (const lockScope of ["session", "repository"]) {
   test(`a contended Stop cannot release active ownership without the ${lockScope} lock`, () => {
