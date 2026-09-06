@@ -2103,8 +2103,9 @@ test("owner retirement during contention observation leaves the invocation unrec
   });
 });
 
+for (const directoryLinks of ["native", "entry-count"]) {
 for (const schedule of ["successful-overlap", "held-published-owner", "held-before-publication"]) {
-test(`Git campaign snapshots survive recovery before 16 serial hooks and two four-way batches (${schedule})`, { timeout: 90_000 }, async () => {
+test(`Git campaign snapshots survive recovery before 16 serial hooks and two four-way batches (${schedule}; directory-links: ${directoryLinks})`, { timeout: 90_000 }, async () => {
   await withRecoveryFixture(async (fixture) => {
     const git = (...args) => {
       const result = spawnSync("git", args, { cwd: fixture.cwd, env: childEnvironment(), encoding: "utf8", timeout: 20_000 });
@@ -2145,6 +2146,7 @@ test(`Git campaign snapshots survive recovery before 16 serial hooks and two fou
       assert.deepEqual(readEvidence(fixture, recovered), recoveryEvidence);
     };
     const records = () => readFileSync(fixture.ledgerPath, "utf8").trim().split("\n").map(JSON.parse);
+    const directoryIdentity = ({ dev, ino }) => ({ dev, ino });
     const assertNoLocks = () => {
       for (const scope of ["session", "repository"]) assert.equal(existsSync(fixture.canonical(scope)), false, scope);
     };
@@ -2173,6 +2175,7 @@ test(`Git campaign snapshots survive recovery before 16 serial hooks and two fou
         import { syncBuiltinESMExports } from "node:module";
         import { performance } from "node:perf_hooks";
         const options = JSON.parse(process.argv[1]);
+        const directoryIdentity = ({ dev, ino }) => ({ dev, ino });
         const nativeWait = Atomics.wait;
         const realNow = performance.now.bind(performance);
         const cell = new Int32Array(new SharedArrayBuffer(4));
@@ -2191,7 +2194,8 @@ test(`Git campaign snapshots survive recovery before 16 serial hooks and two fou
           assert.equal(stats.isSymbolicLink(), false);
           assert.notEqual(stats.dev, 0n);
           assert.notEqual(stats.ino, 0n);
-          return { dev: String(stats.dev), ino: String(stats.ino), nlink: String(stats.nlink),
+          return { dev: String(stats.dev), ino: String(stats.ino),
+            nlink: String(stats.isDirectory() && options.directoryLinks === "entry-count" ? 2 + original.readdir(filePath).length : stats.nlink),
             bytes: stats.isFile() ? fs.readFileSync(filePath).toString("base64") : null };
         }
         function snapshot(directory = options.locks.session) {
@@ -2251,7 +2255,19 @@ test(`Git campaign snapshots survive recovery before 16 serial hooks and two fou
           if (scope) {
             const published = snapshot(options.locks[scope]);
             assert.equal(publishedOwner(published).processId, process.pid);
-            assert.deepEqual(published.directory, ownership[scope].creations.at(-1));
+            const created = ownership[scope].creations.at(-1);
+            if (options.directoryLinks === "entry-count") {
+              assert.equal(created.nlink, "2");
+              assert.equal(published.directory.nlink, "3");
+              assert.equal(created.dev, published.directory.dev);
+              assert.equal(created.ino, published.directory.ino);
+            }
+            try {
+              assert.deepEqual(directoryIdentity(published.directory), directoryIdentity(created));
+            } catch (error) {
+              process.send({ type: "publication-failure", processId: process.pid, scope, created, published: published.directory });
+              throw error;
+            }
             ownership[scope].publications.push(published);
             if (scope === "session" && options.index === 0) {
               rendezvous("published", { snapshot: published, creations: ownership.session.creations.length });
@@ -2330,7 +2346,7 @@ test(`Git campaign snapshots survive recovery before 16 serial hooks and two fou
         const participant = { gate, messages: {}, exited: false };
         for (const stage of stages) participant[stage] = new Promise((resolve) => { signals[stage] = resolve; });
         Object.assign(participant, asyncNode(fixture.cwd, ["--input-type=module", "--eval", script, JSON.stringify({
-          event, schedule, index, gate, locks: { session: fixture.canonical("session"), repository: fixture.canonical("repository") },
+          event, schedule, directoryLinks, index, gate, locks: { session: fixture.canonical("session"), repository: fixture.canonical("repository") },
         })], payload(index), true));
         participant.child.on("message", (message) => {
           (participant.messages[message.type] ??= []).push(message);
@@ -2349,12 +2365,14 @@ test(`Git campaign snapshots survive recovery before 16 serial hooks and two fou
         assert.equal(participant.exited, true);
         assert.equal(participant.exitCode, 0);
         assert.equal(participant.signal, null);
+        assert.equal(participant.messages["publication-failure"], undefined,
+          "Original creation/publication comparison rejected witnessed stable dev/ino: " + JSON.stringify(participant.messages["publication-failure"]));
         assert.equal(participant.messages.result?.length, 1, "missing retirement telemetry must preserve the fixture");
         const result = participant.messages.result[0];
         assert.equal(result.processId, participant.child.pid);
         assert.deepEqual(result.gateTimeouts, []);
         for (const owned of Object.values(result.ownership)) {
-          assert.deepEqual(owned.creations, owned.publications.map((published) => published.directory));
+          assert.deepEqual(owned.creations.map(directoryIdentity), owned.publications.map((published) => directoryIdentity(published.directory)));
           assert.deepEqual(owned.retirements, owned.publications);
           assert.equal(owned.removals, owned.creations.length);
         }
@@ -2372,7 +2390,9 @@ test(`Git campaign snapshots survive recovery before 16 serial hooks and two fou
         assert.equal(process.kill(owner.child.pid, 0), true);
         assert.notEqual(state.directory.dev, "0");
         assert.notEqual(state.directory.ino, "0");
-        assert.deepEqual(lockState(fixture.canonical("session")), state);
+        const observed = lockState(fixture.canonical("session"));
+        if (directoryLinks === "entry-count") observed.directory.nlink = String(2 + observed.entries.length);
+        assert.deepEqual(observed, state);
       }
       function assertRejected(participant, result, output, held, owner) {
         assert.deepEqual(result.ownership.session.creations, []);
@@ -2469,7 +2489,7 @@ test(`Git campaign snapshots survive recovery before 16 serial hooks and two fou
           assert.equal(publication?.type, "published");
           assert.equal(publication.processId, owner.child.pid);
           assert.equal(publication.creations, 1);
-          assert.deepEqual(publication.snapshot.directory, held.directory);
+          assert.deepEqual(directoryIdentity(publication.snapshot.directory), directoryIdentity(held.directory));
           assert.equal(JSON.parse(Buffer.from(publication.snapshot.entries[0].bytes, "base64")).processId, owner.child.pid);
           assertHeld(owner, publication.snapshot);
           assert.deepEqual(preserved(), batchBefore);
@@ -2478,7 +2498,8 @@ test(`Git campaign snapshots survive recovery before 16 serial hooks and two fou
         const retiredOwner = await completed(owner);
         outputs[0] = retiredOwner.output;
         assert.deepEqual(retiredOwner.result.attemptTimes, [0]);
-        assert.deepEqual(retiredOwner.result.ownership.session.creations, [held.directory]);
+        if (heldStage === "created") assert.deepEqual(retiredOwner.result.ownership.session.creations, [held.directory]);
+        else assert.deepEqual(retiredOwner.result.ownership.session.creations.map(directoryIdentity), [directoryIdentity(held.directory)]);
         assert.deepEqual(retiredOwner.result.ownership.session.publications, [owner.messages.published[0].snapshot]);
         assert.deepEqual(retiredOwner.result.gateVisits, heldStage === "created" ? ["ready", "created", "published"] : ["ready", "published"]);
         assert.equal(owner.messages.published.length, 1);
@@ -2569,4 +2590,5 @@ test(`Git campaign snapshots survive recovery before 16 serial hooks and two fou
     assertRecoveryUnchanged();
   });
 });
+}
 }
