@@ -733,7 +733,90 @@ function finalizeLifecycle(primaryResult, primaryError, releases) {
   return primaryResult;
 }
 
-function withLifecycleCleanup(action, heldLocks) {
+function createLifecycleReleaseContext(describe, heldLocks = () => []) {
+  const bindings = new Map();
+  return (locks, roots = []) => {
+    const held = [...new Set([...heldLocks(), ...locks])].filter((lock) => lock !== null);
+    const pending = held.filter((lock) => !bindings.has(lock));
+    if (pending.length > 0) {
+      let context = null;
+      try {
+        const supplied = describe();
+        context = Object.freeze({
+          roots: Object.freeze([...new Set([
+            ...supplied.roots, ...roots,
+            ...held.filter((lock) => lock.scope === "repository").map((lock) => lock.storageRoot),
+          ].map((root) => realpathSync(path.resolve(root))))].sort()),
+          session: supplied.session === null ? null : Object.freeze({
+            ...supplied.session,
+            transcriptPath: path.resolve(supplied.input.transcript_path ?? supplied.input.transcriptPath),
+            sessionHash: sessionHash(supplied.input),
+          }),
+        });
+        if (context.roots.length === 0) context = null;
+      } catch {}
+      for (const lock of pending) {
+        let binding = null;
+        try {
+          if (context !== null) binding = Object.freeze({ context, snapshot: lifecycleReleaseSnapshot(lock, context) });
+        } catch {}
+        bindings.set(lock, binding);
+      }
+    }
+    return locks.map((lock) => bindings.get(lock) ?? null);
+  };
+}
+
+function lifecycleReleaseSnapshot(lock, context) {
+  const boundaries = new Map();
+  const directoryState = (root, directory) => recoveryPathStats(root, directory) === null
+    ? null : recoveryBoundary(root, directory);
+  const parents = (root, filePath) => {
+    assertSafeStatePath(root, filePath);
+    for (let directory = path.dirname(filePath); isContained(root, directory); directory = path.dirname(directory)) {
+      const key = `${root}\0${directory}`;
+      if (!boundaries.has(key)) boundaries.set(key, { root, directory, value: directoryState(root, directory) });
+      if (pathEquals(directory, root)) break;
+    }
+  };
+  const file = (root, filePath, required = false) => {
+    parents(root, filePath);
+    const snapshot = recoveryFile(root, filePath);
+    if (required && snapshot === null) rejectRecoveryIdentity();
+    return snapshot?.file ?? null;
+  };
+  parents(lock.storageRoot, lock.lockDirectory);
+  const repositories = context.roots.map((root) => ({
+    root: recoveryBoundary(root, root), attachment: file(root, attachmentPath(root)),
+  }));
+  let session = null;
+  if (context.session !== null) {
+    const anchor = context.session;
+    parents(anchor.storageRoot, anchor.transcriptPath);
+    session = {
+      sessionHash: anchor.sessionHash,
+      root: recoveryBoundary(anchor.storageRoot, anchor.storageRoot),
+      transcript: recoveryIdentity(recoveryPathStats(anchor.storageRoot, anchor.transcriptPath)),
+      workspace: file(anchor.storageRoot, path.join(anchor.storageRoot, "workspace.json"), true),
+      route: file(anchor.storageRoot, anchor.filePath),
+      marker: file(anchor.storageRoot, anchor.markerPath),
+    };
+    if (canonicalJson(session.transcript) !== canonicalJson(recoveryIdentity(
+      recoveryPathStats(anchor.storageRoot, anchor.transcriptPath),
+    ))) rejectRecoveryIdentity();
+  }
+  if (lock.scope === "session" && (session === null || !pathEquals(lock.storageRoot, context.session.storageRoot))) {
+    rejectRecoveryIdentity();
+  }
+  for (const boundary of boundaries.values()) {
+    if (canonicalJson(boundary.value) !== canonicalJson(directoryState(boundary.root, boundary.directory))) rejectRecoveryIdentity();
+  }
+  return canonicalJson({ repositories, session, boundaries: [...boundaries].map(([key, boundary]) => ({
+    pathHash: sha256(key), value: boundary.value,
+  })) });
+}
+
+function withLifecycleCleanup(action, heldLocks, releaseContext = null) {
   let result = null;
   let primaryError = null;
   try {
@@ -741,7 +824,12 @@ function withLifecycleCleanup(action, heldLocks) {
   } catch (error) {
     primaryError = error;
   }
-  const releases = heldLocks().map((lock) => releaseLifecycleLock(lock));
+  const locks = heldLocks();
+  let bindings = [];
+  try {
+    bindings = releaseContext?.(locks) ?? [];
+  } catch {}
+  const releases = locks.map((lock, index) => releaseLifecycleLock(lock, bindings[index] ?? null));
   return finalizeLifecycle(result, primaryError, releases);
 }
 
@@ -958,7 +1046,7 @@ function lifecycleLockOwnerIdentityMatches(lock, ownerPath = lock.ownerPath) {
   );
 }
 
-function releaseLifecycleLock(lock) {
+function releaseLifecycleLock(lock, binding = null) {
   if (lock === null) return { scope: null, status: "not-held", retired: false, diagnostics: [] };
   const outcome = { scope: lock.scope, status: "unconfirmed", retired: false, diagnostics: [] };
   let phase = "ownership-validation";
@@ -994,6 +1082,15 @@ function releaseLifecycleLock(lock) {
     while (true) {
       phase = "ownership-validation";
       syscall = "lstat";
+      if (attempts > 0) {
+        try {
+          if (binding === null || lifecycleReleaseSnapshot(lock, binding.context) !== binding.snapshot) {
+            return reject("LIFECYCLE_IDENTITY_REJECTED");
+          }
+        } catch (error) {
+          return reject("LIFECYCLE_IDENTITY_REJECTED", error);
+        }
+      }
       assertSafeStatePath(lock.storageRoot, lock.ownerPath);
       assertSafeStatePath(lock.storageRoot, retiredDirectory);
       const canonicalStats = lstatSync(lock.lockDirectory, { bigint: true, throwIfNoEntry: false });
@@ -1041,7 +1138,9 @@ function releaseLifecycleLock(lock) {
         outcome.retired = true;
         break;
       } catch (error) {
-        if (error?.code !== "EBUSY" || attempts >= MAX_LIFECYCLE_RELEASE_ATTEMPTS) throw error;
+        if (!(error?.code === "EBUSY" || (process.platform === "win32" && error?.code === "EPERM")) ||
+          attempts >= MAX_LIFECYCLE_RELEASE_ATTEMPTS) throw error;
+        if (binding === null) return reject("LIFECYCLE_IDENTITY_REJECTED");
         const remaining = deadline - performance.now();
         if (remaining <= 0) throw error;
         retirementError = error;
@@ -1096,7 +1195,8 @@ function releaseLifecycleLock(lock) {
     outcome.status = "released";
     return outcome;
   } catch (error) {
-    return reject(error instanceof SyntaxError ? "LIFECYCLE_OWNER_MALFORMED" : "LIFECYCLE_SYSCALL_FAILURE", error);
+    return reject(attempts > 0 && phase === "ownership-validation" ? "LIFECYCLE_IDENTITY_REJECTED" :
+      error instanceof SyntaxError ? "LIFECYCLE_OWNER_MALFORMED" : "LIFECYCLE_SYSCALL_FAILURE", error);
   } finally {
     if (ownerFdOpen) {
       phase = "descriptor-close";
@@ -1109,7 +1209,7 @@ function releaseLifecycleLock(lock) {
   }
 }
 
-function acquireRepositoryLocks(roots) {
+function acquireRepositoryLocks(roots, releaseContext = createLifecycleReleaseContext(() => ({ roots, session: null }))) {
   const canonicalRoots = new Map();
   for (const root of roots) {
     const canonicalRoot = realpathSync(path.resolve(root));
@@ -1130,7 +1230,8 @@ function acquireRepositoryLocks(roots) {
     }
     return locks;
   } catch (error) {
-    return finalizeLifecycle(null, error, locks.reverse().map((lock) => releaseLifecycleLock(lock)));
+    return withLifecycleCleanup(() => { throw error; }, () => [...locks].reverse(),
+      (held) => releaseContext(held, [...canonicalRoots.values()]));
   }
 }
 
@@ -1387,6 +1488,9 @@ export function recoverLifecycleLock(cwd, request) {
   let phase = "request-validation";
   let attempts = 0;
   let guards = [];
+  const releaseContext = createLifecycleReleaseContext(() => ({
+    roots: [context.root], input: context.input, session: context.session,
+  }), () => guards);
   try {
     if (validateLifecycle(request, "recoverRequest").length > 0) rejectRecoveryIdentity();
     context = recoveryContext(cwd, request, "recover");
@@ -1452,7 +1556,7 @@ export function recoverLifecycleLock(cwd, request) {
         phase = "guard-acquisition";
         if (context.scope === "session" || context.location === "retired") {
           windowsPathChecksMaySpawn = false;
-          guards = acquireRepositoryLocks([context.root]);
+          guards = acquireRepositoryLocks([context.root], releaseContext);
         }
         phase = "binding-validation";
         requireRepository();
@@ -1497,7 +1601,7 @@ export function recoverLifecycleLock(cwd, request) {
       }
       return result;
     };
-    result = withLifecycleCleanup(action, () => [...guards].reverse());
+    result = withLifecycleCleanup(action, () => [...guards].reverse(), releaseContext);
     return result;
   } catch (error) {
     result.status = "unconfirmed";
@@ -1506,7 +1610,7 @@ export function recoverLifecycleLock(cwd, request) {
   }
 }
 
-function acquireHookRepositoryLocks(input, eventName, targets, cwd) {
+function acquireHookRepositoryLocks(input, eventName, targets, cwd, releaseContext) {
   const routing = protectedTargetRouting(targets);
   if (routing.hasUnqualifiedTarget || routing.roots.length > 1) {
     throw new Error("protected edit must name one fully qualified repository");
@@ -1537,7 +1641,7 @@ function acquireHookRepositoryLocks(input, eventName, targets, cwd) {
   ) {
     roots.push(cwd);
   }
-  return acquireRepositoryLocks(roots);
+  return acquireRepositoryLocks(roots, releaseContext);
 }
 
 function readSessionMarker(context, input) {
@@ -2697,16 +2801,21 @@ function withSessionLifecycle(cwd, request, operation, action) {
   requireSessionRequest(request, operation);
   let sessionLock = null;
   let repositoryLocks = [];
+  let root = null;
+  let input = null;
+  let context = null;
+  const heldLocks = () => [...repositoryLocks].reverse().concat(sessionLock);
+  const releaseContext = createLifecycleReleaseContext(() => ({ roots: [root], input, session: context }), heldLocks);
   const guardedAction = () => {
     if (process.platform === "win32") resetWindowsPathChecks();
     if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd) ||
       !pathEquals(path.resolve(cwd), realpathSync(cwd))) {
       checkpointFailure(`${operation} requires a canonical local repository cwd`);
     }
-    const root = realpathSync(cwd);
-    const input = { ...request, cwd: root };
+    root = realpathSync(cwd);
+    input = { ...request, cwd: root };
     preflightSessionLocatorLocality(input);
-    const context = sessionLocatorContext(input);
+    context = sessionLocatorContext(input);
     if (Object.hasOwn(request, "transcript_path")) {
       if (context === null || !pathEquals(context.storageRoot, realpathSync(context.storageRoot))) {
         checkpointFailure(`${operation} requires a valid canonical transcript anchor`);
@@ -2721,7 +2830,7 @@ function withSessionLifecycle(cwd, request, operation, action) {
       checkpointFailure(`${operation} session routing conflicts with the process cwd`);
     }
     windowsPathChecksMaySpawn = false;
-    repositoryLocks = acquireRepositoryLocks([root]);
+    repositoryLocks = acquireRepositoryLocks([root], releaseContext);
     const requireGuards = () => {
       for (const lock of [sessionLock, ...repositoryLocks].filter((value) => value !== null)) {
         if (!lifecycleLockIdentityMatches(lock) || !lifecycleLockOwnerIdentityMatches(lock)) {
@@ -2735,7 +2844,7 @@ function withSessionLifecycle(cwd, request, operation, action) {
     return action(root, input, routing, requireGuards);
   };
   try {
-    return withLifecycleCleanup(guardedAction, () => [...repositoryLocks].reverse().concat(sessionLock));
+    return withLifecycleCleanup(guardedAction, heldLocks, releaseContext);
   } catch (error) {
     if (error instanceof LifecycleError || error?.checkpointReason) throw error;
     throw new Error(`${operation} could not confirm its local lifecycle state; inspect status, ledger integrity, and ownership before retrying`, { cause: error });
@@ -3433,6 +3542,10 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
   let sessionLock = null;
   let repositoryLocks = [];
   let routedAttachmentObserved = false;
+  const heldLocks = () => [...repositoryLocks].reverse().concat(sessionLock);
+  const releaseContext = createLifecycleReleaseContext(() => ({
+    roots: [effectiveCwd], input, session: sessionContext,
+  }), heldLocks);
   const action = () => {
     const preparedTargets = prepareToolTargets(input);
     for (const target of preparedTargets) {
@@ -3448,7 +3561,7 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
     }
     sessionLock = acquireSessionLock(input, sessionContext);
     windowsPathChecksMaySpawn = false;
-    repositoryLocks = acquireHookRepositoryLocks(input, eventName, preparedTargets, cwd);
+    repositoryLocks = acquireHookRepositoryLocks(input, eventName, preparedTargets, cwd, releaseContext);
     effectiveCwd = resolveHookCwd(input, preparedTargets, cwd);
     const inspectedTargets = completeToolTargetInspection(preparedTargets, effectiveCwd);
     const attachment = attachedRecord(effectiveCwd, input);
@@ -3475,7 +3588,7 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
     return output;
   };
   try {
-    return withLifecycleCleanup(action, () => [...repositoryLocks].reverse().concat(sessionLock));
+    return withLifecycleCleanup(action, heldLocks, releaseContext);
   } catch (error) {
     const lifecycleError = error instanceof LifecycleError ? error : null;
     const primaryOutput = lifecycleError?.primaryResult;
@@ -3519,7 +3632,8 @@ export function releaseAttachment(cwd) {
   const intended = readAttachmentSnapshot(cwd);
   if (intended === null) return { released: false, message: "No attachment found." };
   windowsPathChecksMaySpawn = false;
-  const locks = acquireRepositoryLocks([resolvedCwd]);
+  const releaseContext = createLifecycleReleaseContext(() => ({ roots: [resolvedCwd], session: null }));
+  const locks = acquireRepositoryLocks([resolvedCwd], releaseContext);
   return withLifecycleCleanup(() => {
     requireAttachmentSnapshot(cwd, intended);
     let attachment = null;
@@ -3537,7 +3651,7 @@ export function releaseAttachment(cwd) {
     }
     removeAttachmentSnapshot(cwd, intended);
     return { released: true, message: "Released the stale session attachment." };
-  }, () => [...locks].reverse());
+  }, () => [...locks].reverse(), releaseContext);
 }
 
 function runLedgerUnavailable(reason) {

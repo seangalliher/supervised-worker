@@ -21,13 +21,14 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
 
-import { canonicalPlanHash, inspectLifecycleLock, recoverLifecycleLock, sha256, validateLifecycle } from "../src/core.mjs";
+import { canonicalPlanHash, checkpointSession, inspectLifecycleLock, recoverLifecycleLock, sha256, validateLifecycle } from "../src/core.mjs";
 
 const launcherPath = fileURLToPath(new URL("../src/hook-launcher.mjs", import.meta.url));
 const cliPath = fileURLToPath(new URL("../src/cli.mjs", import.meta.url));
 const coreUrl = new URL("../src/core.mjs", import.meta.url).href;
 const faultingHookScript = `
   import assert from "node:assert/strict";
+  import { createHash } from "node:crypto";
   import fs from "node:fs";
   import path from "node:path";
   import { syncBuiltinESMExports } from "node:module";
@@ -35,9 +36,22 @@ const faultingHookScript = `
 
   const input = JSON.parse(process.argv[1]);
   const fault = process.argv[2] ?? "persistent";
+  const options = JSON.parse(process.argv[4] ?? "{}");
+  const scope = options.scope ?? "repository";
+  const transcriptPath = input.transcript_path ?? input.transcriptPath;
+  const storageRoot = transcriptPath ? path.dirname(path.dirname(path.dirname(transcriptPath))) : null;
+  const sessionHash = createHash("sha256").update(input.session_id ?? input.sessionId).digest("hex");
+  const repositoryDirectory = path.join(input.cwd, ".supervised-worker", "locks", "lifecycle");
+  const sessionDirectory = storageRoot === null ? null : path.join(storageRoot, "supervised-worker", "session-locks", sessionHash);
+  const attachmentFile = path.join(input.cwd, ".supervised-worker", "attachment.json");
+  const routeFile = storageRoot === null ? null : path.join(storageRoot, "supervised-worker", "session-roots", sessionHash, "route.json");
+  const markerFile = storageRoot === null ? null : path.join(storageRoot, "supervised-worker", "session-bindings", sessionHash + ".json");
+  const workspaceFile = storageRoot === null ? null : path.join(storageRoot, "workspace.json");
   let monotonicTime = 0;
   Object.defineProperty(performance, "now", { value: () => monotonicTime });
-  const lockDirectory = path.join(input.cwd, ".supervised-worker", "locks", "lifecycle");
+  const lockDirectory = scope === "repository" ? repositoryDirectory : sessionDirectory;
+  const lockRoot = scope === "repository" ? input.cwd : storageRoot;
+  assert.ok(lockDirectory && lockRoot, "the selected scope must have a fixture anchor");
   const displacedDirectory = path.join(path.dirname(input.cwd), "displaced-lock");
   const replacementToken = "11111111-1111-4111-8111-111111111111";
   const retirementAttempts = [];
@@ -46,17 +60,43 @@ const faultingHookScript = `
   const ownerDescriptorsAtRename = [];
   const reopenedOwners = [];
   const waits = [];
+  const otherWaits = [];
+  const allRetirements = [];
+  const protectedPaths = [];
   const descriptors = new Map();
   const originalRenameSync = fs.renameSync;
   const originalOpenSync = fs.openSync;
   const originalCloseSync = fs.closeSync;
-  const originalWait = Atomics.wait;
+  const originalReadFileSync = fs.readFileSync;
+  const originalReadSync = fs.readSync;
+  const originalMkdirSync = fs.mkdirSync;
+  const originalRmSync = fs.rmSync;
   let retiredDirectory = null;
   let originalOwnerPath = null;
   let initialState = null;
   let protectedState = null;
   let mutationFired = false;
   let injectionCount = 0;
+  let otherInjectionCount = 0;
+  let acquisitionFailures = 0;
+  let actionFaults = 0;
+  let bindingFailures = 0;
+  let transcriptReads = 0;
+  let deadlineFired = false;
+  let lastFaultScope = null;
+
+  function fail(code, syscall) {
+    throw Object.assign(new Error("private injected retirement failure details"), { code, syscall });
+  }
+
+  function readFixtureBytes(filePath) {
+    const descriptor = originalOpenSync(filePath, "r");
+    try {
+      return originalReadFileSync(descriptor);
+    } finally {
+      originalCloseSync(descriptor);
+    }
+  }
 
   function identity(filePath) {
     const stats = fs.lstatSync(filePath, { bigint: true });
@@ -77,14 +117,46 @@ const faultingHookScript = `
     };
   }
 
+  function boundFile(filePath, contents = true) {
+    if (!filePath || !fs.existsSync(filePath)) return null;
+    return {
+      identity: identity(filePath),
+      bytes: contents && fs.lstatSync(filePath).isFile() ? readFixtureBytes(filePath).toString("base64") : null,
+    };
+  }
+
+  function bindingState() {
+    return {
+      repository: identity(input.cwd),
+      state: boundFile(path.join(input.cwd, ".supervised-worker"), false),
+      attachment: boundFile(attachmentFile),
+      storage: storageRoot === null ? null : identity(storageRoot),
+      workspace: boundFile(workspaceFile), route: boundFile(routeFile), marker: boundFile(markerFile),
+      transcript: boundFile(transcriptPath, false),
+      parents: storageRoot === null ? [] : [
+        path.join(storageRoot, "supervised-worker"), path.dirname(routeFile), path.dirname(path.dirname(routeFile)),
+        path.dirname(markerFile), path.dirname(transcriptPath), path.dirname(path.dirname(transcriptPath)),
+      ].map((directory) => boundFile(directory, false)),
+    };
+  }
+
   function releaseState() {
     return {
-      root: identity(input.cwd),
+      root: identity(lockRoot),
       parent: identity(path.dirname(lockDirectory)),
       canonical: snapshot(lockDirectory),
       retired: snapshot(retiredDirectory),
       displaced: snapshot(displacedDirectory),
+      binding: bindingState(),
+      protectedPaths: protectedPaths.map(([filePath, contents]) => ({ filePath, state: boundFile(filePath, contents) })),
     };
+  }
+
+  function replaceDirectory(directory, displaced = path.join(path.dirname(input.cwd), "displaced-" + fault)) {
+    originalRenameSync(directory, displaced);
+    fs.mkdirSync(directory);
+    for (const name of fs.readdirSync(displaced)) originalRenameSync(path.join(displaced, name), path.join(directory, name));
+    protectedPaths.push([directory, false], [displaced, false]);
   }
 
   function replaceBetweenAttempts() {
@@ -125,23 +197,73 @@ const faultingHookScript = `
         break;
       }
       case "root":
-        originalRenameSync(input.cwd, displacedDirectory);
-        fs.mkdirSync(input.cwd);
-        originalRenameSync(path.join(displacedDirectory, ".supervised-worker"), path.join(input.cwd, ".supervised-worker"));
+        replaceDirectory(lockRoot, displacedDirectory);
         break;
       case "occupied-destination":
         fs.mkdirSync(retiredDirectory);
         fs.writeFileSync(path.join(retiredDirectory, originalEntry.name), bytes, { flag: "wx" });
         break;
-      default:
-        return;
+      case "repository-root":
+        replaceDirectory(input.cwd);
+        break;
+      case "state-parent":
+        replaceDirectory(path.join(input.cwd, ".supervised-worker"));
+        break;
+      case "route-parent":
+        replaceDirectory(path.dirname(routeFile));
+        break;
+      case "marker-parent":
+        replaceDirectory(path.dirname(markerFile));
+        break;
+      case "transcript-parent":
+        replaceDirectory(path.dirname(transcriptPath));
+        break;
+      case "transcript-append":
+        fs.appendFileSync(transcriptPath, "PRIVATE_NEW_TRANSCRIPT_CONTENT");
+        break;
+      default: {
+        const slots = { attachment: attachmentFile, route: routeFile, marker: markerFile, workspace: workspaceFile, transcript: transcriptPath };
+        const changes = {
+          "attachment-generation": [attachmentFile, { routeGeneration: replacementToken }],
+          "claim-generation": [attachmentFile, { claimGeneration: replacementToken }],
+          "attachment-status": [attachmentFile, { status: "provisional" }],
+          "route-generation": [routeFile, { generation: replacementToken }],
+          "route-status": [routeFile, { status: "released" }],
+          "route-repository": [routeFile, { repositoryRoot: path.dirname(input.cwd) }],
+          "marker-content": [markerFile, { firstBoundAt: "2020-01-01T00:00:00.000Z" }],
+          "workspace-content": [workspaceFile, { changed: true }],
+        };
+        const [slot, operation] = fault.split("-");
+        const filePath = slots[slot];
+        if (changes[fault]) {
+          const [target, values] = changes[fault];
+          fs.writeFileSync(target, JSON.stringify({ ...JSON.parse(originalReadFileSync(target)), ...values }));
+          protectedPaths.push([target, true]);
+        } else if (filePath && ["copy", "missing", "appeared"].includes(operation)) {
+          if (operation === "appeared") {
+            assert.equal(fs.existsSync(filePath), false, "appearance requires an absent baseline slot");
+            fs.mkdirSync(path.dirname(filePath), { recursive: true });
+            fs.writeFileSync(filePath, "{}", { flag: "wx" });
+          } else {
+            const originalBytes = readFixtureBytes(filePath);
+            originalRenameSync(filePath, filePath + ".displaced");
+            protectedPaths.push([filePath + ".displaced", slot !== "transcript"]);
+            if (operation === "copy") fs.writeFileSync(filePath, originalBytes, { flag: "wx" });
+          }
+          protectedPaths.push([filePath, slot !== "transcript"]);
+        } else return;
+      }
     }
     mutationFired = true;
     protectedState = releaseState();
   }
 
-  fs.openSync = (filePath, ...options) => {
-    const descriptor = originalOpenSync(filePath, ...options);
+  fs.openSync = (filePath, ...args) => {
+    if (options.bindingUnavailable && String(filePath) === workspaceFile) {
+      bindingFailures += 1;
+      fail("EPERM", "open");
+    }
+    const descriptor = originalOpenSync(filePath, ...args);
     descriptors.set(descriptor, String(filePath));
     if (injectionCount > 0 && String(filePath) === originalOwnerPath) {
       const stats = fs.fstatSync(descriptor, { bigint: true });
@@ -154,7 +276,52 @@ const faultingHookScript = `
     descriptors.delete(descriptor);
     return result;
   };
-  fs.renameSync = (source, destination, ...options) => {
+  fs.readFileSync = (filePath, ...args) => {
+    if (String(filePath) === transcriptPath) {
+      transcriptReads += 1;
+      assert.fail("lifecycle handling must never read transcript contents");
+    }
+    return originalReadFileSync(filePath, ...args);
+  };
+  fs.readSync = (descriptor, ...args) => {
+    if (transcriptPath && descriptors.get(descriptor) === transcriptPath) {
+      transcriptReads += 1;
+      assert.fail("lifecycle handling must never read transcript contents");
+    }
+    if (options.mutateDuringBinding && injectionCount > 0 && !mutationFired && descriptors.get(descriptor) === workspaceFile) {
+      replaceBetweenAttempts();
+    }
+    if (options.expireDuringBinding && injectionCount > 0 && !deadlineFired && descriptors.get(descriptor) === workspaceFile) {
+      deadlineFired = true;
+      monotonicTime += 100;
+    }
+    return originalReadSync(descriptor, ...args);
+  };
+  fs.mkdirSync = (directory, ...args) => {
+    if (options.failAcquisitionRoot && String(directory) === path.join(options.failAcquisitionRoot, ".supervised-worker", "locks", "lifecycle")) {
+      acquisitionFailures += 1;
+      fail("EIO", "mkdir");
+    }
+    return originalMkdirSync(directory, ...args);
+  };
+  fs.rmSync = (filePath, ...args) => {
+    if (fault === "remove-permission" && retiredDirectory !== null && path.dirname(String(filePath)) === retiredDirectory) {
+      injectionCount += 1;
+      fail("EPERM", "rm");
+    }
+    return originalRmSync(filePath, ...args);
+  };
+  fs.renameSync = (source, destination, ...args) => {
+    if (options.failRouteStatus && actionFaults === 0 && String(destination) === routeFile &&
+      JSON.parse(originalReadFileSync(source)).status === options.failRouteStatus) {
+      actionFaults += 1;
+      fail("EIO", "rename");
+    }
+    let observed = null;
+    if (String(destination).startsWith(String(source) + ".") && String(destination).endsWith(".retired")) {
+      observed = { scope: String(source) === sessionDirectory ? "session" : "repository", source: String(source), code: null };
+      allRetirements.push(observed);
+    }
     if (
       String(source) === lockDirectory &&
       String(destination).startsWith(lockDirectory + ".") &&
@@ -162,9 +329,11 @@ const faultingHookScript = `
     ) {
       attemptTimes.push(performance.now());
       retiredDirectory = String(destination);
-      const succeeds = fault === "transient" && retirementAttempts.length > 0;
-      const code = succeeds ? null : fault === "permission" ? "EPERM" :
-        fault === "unknown" ? "PRIVATE_UNKNOWN_CODE" : "EBUSY";
+      const succeeds = fault === "remove-permission" ||
+        (["transient", "transcript-append"].includes(fault) && retirementAttempts.length > 0);
+      const code = succeeds ? null : options.codes?.[retirementAttempts.length] ?? options.code ?? (fault === "permission" ? "EPERM" :
+        fault === "unknown" ? "PRIVATE_UNKNOWN_CODE" : "EBUSY");
+      observed.code = code;
       retirementAttempts.push({
         syscall: "rename",
         code,
@@ -184,10 +353,11 @@ const faultingHookScript = `
       }
       attemptSnapshots.push(snapshot(lockDirectory));
       ownerDescriptorsAtRename.push([...descriptors.values()].filter((filePath) => filePath === originalOwnerPath));
-      if (succeeds) return originalRenameSync(source, destination, ...options);
+      if (succeeds) return originalRenameSync(source, destination, ...args);
       injectionCount += 1;
+      lastFaultScope = scope;
       if (fault === "retired-only" || fault === "retired-replacement") {
-        originalRenameSync(source, destination, ...options);
+        originalRenameSync(source, destination, ...args);
         if (fault === "retired-replacement") {
           const entry = initialState.canonical.entries[0];
           const owner = JSON.parse(Buffer.from(entry.bytes, "base64").toString("utf8"));
@@ -198,32 +368,59 @@ const faultingHookScript = `
         mutationFired = true;
         protectedState = releaseState();
       }
-      const error = new Error("private injected retirement failure details");
-      error.code = code;
-      error.syscall = "rename";
-      throw error;
+      fail(code, "rename");
     }
-    return originalRenameSync(source, destination, ...options);
+    if (observed?.scope === "session" && options.alsoFaultSession) {
+      otherInjectionCount += 1;
+      lastFaultScope = "session";
+      observed.code = options.code ?? "EBUSY";
+      fail(observed.code, "rename");
+    }
+    return originalRenameSync(source, destination, ...args);
   };
   Atomics.wait = (cell, index, expected, timeout) => {
-    if (injectionCount > 0) {
-      waits.push({ requestedMs: timeout, elapsedMs: performance.now() - attemptTimes[0] });
-      if (!mutationFired) replaceBetweenAttempts();
-      monotonicTime += fault === "deadline" ? 125 : timeout;
-      return "timed-out";
+    if (injectionCount > 0 || otherInjectionCount > 0) {
+      const selected = lastFaultScope === scope;
+      const observations = selected ? waits : otherWaits;
+      observations.push({ requestedMs: timeout, elapsedMs: performance.now() - attemptTimes[0] });
+      if (selected && !mutationFired && !options.mutateDuringBinding) replaceBetweenAttempts();
+      monotonicTime += selected ? options.waitAdvances?.[waits.length - 1] ?? (fault === "deadline" ? 125 : timeout) : timeout;
+    } else {
+      monotonicTime += timeout;
     }
-    return originalWait(cell, index, expected, timeout);
+    return "timed-out";
   };
   if (fault === "persistent-frozen" || fault === "deadline") Date.now = () => 1_700_000_000_000;
   syncBuiltinESMExports();
 
-  const { handleHook } = await import(${JSON.stringify(coreUrl)});
+  const core = await import(${JSON.stringify(coreUrl)});
   const wallBefore = Date.now();
-  const output = handleHook(input, process.argv[3] ?? "PostToolUse");
+  let output;
+  let actionCalls = 0;
+  try {
+    actionCalls += 1;
+    if (options.operation === "checkpoint") output = core.checkpointSession(input.cwd, options.request);
+    else if (options.operation === "resume") output = core.resumeSession(input.cwd, options.request);
+    else if (options.operation === "release") output = core.releaseAttachment(input.cwd);
+    else if (options.operation === "recover") output = core.recoverLifecycleLock(input.cwd, options.request);
+    else output = core.handleHook(input, process.argv[3] ?? "PostToolUse");
+  } catch (error) {
+    output = core.lifecycleFailureDetails(error) ?? { status: "primary-error", reason: error.checkpointReason ?? "PRIMARY_OPERATION_FAILED" };
+  }
   const retirementElapsedMs = performance.now() - attemptTimes[0];
   const openDescriptors = [...descriptors.values()];
   process.stdout.write(JSON.stringify({
     output,
+    scope,
+    actionCalls,
+    actionFaults,
+    acquisitionFailures,
+    bindingFailures,
+    transcriptReads,
+    deadlineFired,
+    allRetirements,
+    otherInjectionCount,
+    otherWaits,
     retirementAttempts,
     attemptTimes: attemptTimes.map((time) => time - attemptTimes[0]),
     attemptSnapshots,
@@ -317,21 +514,36 @@ function withActiveHookFixture(action) {
   }
 }
 
-function runRetirementScenario(fixture, fault) {
+function runRetirementScenario(fixture, fault, scope = "repository", options = {}) {
+  const eventName = options.eventName ?? "PostToolUse";
+  const input = {
+    ...(fixture.session ?? { cwd: fixture.cwd, ...fixture.anchor }), ...fixture.readTool,
+    hook_event_name: eventName, ...options.input,
+  };
+  const attachmentBefore = fileState(fixture.attachmentPath);
   const child = runChild(fixture.base, [
     "--input-type=module",
     "--eval",
     faultingHookScript,
-    JSON.stringify({ ...fixture.session, ...fixture.readTool, hook_event_name: "PostToolUse" }),
+    JSON.stringify(input),
     fault,
+    eventName,
+    JSON.stringify({ ...options, scope }),
   ]);
   const release = JSON.parse(child.stdout);
   assert.ok(release.injectionCount > 0, "the selected retirement failure must fire");
   assert.equal(release.processId, child.pid);
+  assert.equal(release.scope, scope);
+  assert.equal(release.actionCalls, 1);
+  assert.equal(release.transcriptReads, 0);
   assert.deepEqual(release.openDescriptors, [], "every opened descriptor must be closed");
-  assert.deepEqual(readFileSync(fixture.attachmentPath), fixture.attachmentBefore);
-  assert.deepEqual(readdirSync(path.join(fixture.storage, "supervised-worker", "session-locks")), [],
-    "repository release failure must not skip session lock cleanup");
+  if (options.preserveAttachment !== false) assert.deepEqual(fileState(fixture.attachmentPath), attachmentBefore);
+  if (!options.alsoFaultSession) {
+    const otherLock = scope === "repository"
+      ? path.join(fixture.storage, "supervised-worker", "session-locks", sha256(input.session_id ?? input.sessionId))
+      : path.join(fixture.cwd, ".supervised-worker", "locks", "lifecycle");
+    assert.equal(existsSync(otherLock), false, "failure must not skip the other scope's normal cleanup");
+  }
   assert.doesNotMatch(JSON.stringify(release.output), /private injected|PRIVATE_UNKNOWN_CODE/);
   return release;
 }
@@ -483,15 +695,17 @@ test("an expired monotonic release budget prevents a second rename after a delay
 });
 
 for (const [fault, errorCode] of [["permission", "EPERM"], ["unknown", "UNKNOWN"]]) {
-  test(`retirement ${errorCode} is reported without retrying or changing the owner`, () => {
+  const windowsRetry = fault === "permission" && process.platform === "win32";
+  test(`retirement ${errorCode} ${windowsRetry ? "uses the Windows owned-release retry window" : "is reported without retrying"} without changing the owner`, () => {
     withActiveHookFixture((fixture) => {
       const release = runRetirementScenario(fixture, fault);
-      assert.equal(release.retirementAttempts.length, 1);
-      assert.deepEqual(release.waits, []);
+      const attempts = windowsRetry ? 3 : 1;
+      assert.equal(release.retirementAttempts.length, attempts);
+      assert.equal(release.waits.length, windowsRetry ? 2 : 0);
       assert.deepEqual(release.finalState, release.initialState);
       assert.match(release.output.additionalContext, /LIFECYCLE_SYSCALL_FAILURE/);
       assert.match(release.output.additionalContext, new RegExp('"errorCode":"' + errorCode + '"'));
-      assert.match(release.output.additionalContext, /"attempts":1/);
+      assert.match(release.output.additionalContext, new RegExp('"attempts":' + attempts));
     });
   });
 }
@@ -571,6 +785,442 @@ for (const fault of ["occupied-destination", "retired-only", "retired-replacemen
     });
   });
 }
+
+function retirementMessage(release) {
+  return release.output.additionalContext ?? release.output.permissionDecisionReason ?? release.output.reason ?? JSON.stringify(release.output);
+}
+
+for (const scope of ["repository", "session"]) {
+  const retryCode = process.platform === "win32" ? "EPERM" : "EBUSY";
+  for (const code of ["EBUSY", ...(process.platform === "win32" ? ["EPERM"] : [])]) {
+    for (const fault of ["transient", "persistent-frozen", "deadline"]) {
+      test(`${scope} ${code} ${fault} retirement obeys the original monotonic window`, () => {
+        withActiveHookFixture((fixture) => {
+          const release = runRetirementScenario(fixture, fault, scope, { code });
+          const attempts = fault === "transient" ? 2 : fault === "deadline" ? 1 : 3;
+          assert.equal(release.retirementAttempts.length, attempts);
+          assert.equal(release.injectionCount, fault === "transient" ? 1 : attempts);
+          assert.equal(release.waits.length, fault === "persistent-frozen" ? 2 : 1);
+          assert.ok(release.attemptTimes.every((time) => time < 100));
+          for (const wait of release.waits) {
+            assert.ok(wait.requestedMs > 0 && wait.requestedMs <= 25);
+            assert.ok(wait.elapsedMs + wait.requestedMs <= 100);
+          }
+          for (const descriptors of release.ownerDescriptorsAtRename) assert.equal(descriptors.length, process.platform === "win32" ? 0 : 1);
+          if (fault === "transient") {
+            assert.deepEqual(release.output, {});
+            assert.equal(release.finalState.canonical, null);
+            assert.equal(release.finalState.retired, null);
+            assert.deepEqual(release.attemptSnapshots, [release.initialState.canonical, release.initialState.canonical]);
+          } else {
+            assert.deepEqual(release.wallTimes, [1_700_000_000_000, 1_700_000_000_000]);
+            assert.deepEqual(release.finalState, release.initialState);
+            assert.match(retirementMessage(release), /LIFECYCLE_SYSCALL_FAILURE/);
+            assert.match(retirementMessage(release), new RegExp('"scope":"' + scope + '"'));
+            assert.match(retirementMessage(release), new RegExp('"errorCode":"' + code + '"'));
+            assert.match(retirementMessage(release), new RegExp('"attempts":' + attempts));
+            if (fault === "deadline") assert.ok(release.retirementElapsedMs >= 100);
+          }
+          if (process.platform === "win32" && attempts > 1) {
+            assert.ok(release.reopenedOwners.length > 0);
+            const { dev, ino } = release.initialState.canonical.entries[0].identity;
+            for (const identity of release.reopenedOwners) assert.deepEqual(identity, { dev, ino });
+          }
+        });
+      });
+    }
+  }
+
+  for (const code of ["EACCES", "PRIVATE_UNKNOWN_CODE", ...(process.platform === "win32" ? [] : ["EPERM"])]) {
+    test(`${scope} noneligible ${code} retirement fails once without waiting`, () => {
+      withActiveHookFixture((fixture) => {
+        const release = runRetirementScenario(fixture, "persistent", scope, { code });
+        assert.equal(release.retirementAttempts.length, 1);
+        assert.deepEqual(release.waits, []);
+        assert.deepEqual(release.finalState, release.initialState);
+        assert.match(retirementMessage(release), new RegExp('"errorCode":"' + (code === "PRIVATE_UNKNOWN_CODE" ? "UNKNOWN" : code) + '"'));
+      });
+    });
+  }
+
+  for (const delayed of [false, true]) {
+    test(`${scope} mixed Windows EPERM and EBUSY share the ${delayed ? "deadline" : "attempt"} budget`, { skip: process.platform !== "win32" }, () => {
+      withActiveHookFixture((fixture) => {
+        const release = runRetirementScenario(fixture, "persistent-frozen", scope, {
+          codes: ["EPERM", "EBUSY", "EPERM"], ...(delayed ? { waitAdvances: [75, 25] } : {}),
+        });
+        assert.deepEqual(release.attemptTimes, delayed ? [0, 75] : [0, 25, 50]);
+        assert.deepEqual(release.retirementAttempts.map((attempt) => attempt.code), delayed ? ["EPERM", "EBUSY"] : ["EPERM", "EBUSY", "EPERM"]);
+        assert.equal(release.injectionCount, delayed ? 2 : 3);
+        assert.equal(release.waits.length, 2);
+        assert.deepEqual(release.wallTimes, [1_700_000_000_000, 1_700_000_000_000]);
+        assert.match(retirementMessage(release), new RegExp('"attempts":' + (delayed ? 2 : 3)));
+        assert.match(retirementMessage(release), new RegExp('"errorCode":"' + (delayed ? "EBUSY" : "EPERM") + '"'));
+        assert.deepEqual(release.finalState, release.initialState);
+      });
+    });
+  }
+
+  test(`${scope} rechecks the deadline after external binding validation`, () => {
+    withActiveHookFixture((fixture) => {
+      const release = runRetirementScenario(fixture, "persistent-frozen", scope, { code: retryCode, expireDuringBinding: true });
+      assert.equal(release.deadlineFired, true, "the retry must read the workspace binding before the injected deadline");
+      assert.equal(release.retirementAttempts.length, 1);
+      assert.equal(release.waits.length, 1);
+      assert.ok(release.retirementElapsedMs >= 100);
+      assert.match(retirementMessage(release), /LIFECYCLE_SYSCALL_FAILURE/);
+      assert.deepEqual(release.finalState, release.initialState);
+    });
+  });
+
+  for (const fault of [
+    "copied-owner", "record-token", "record-pid", "token-filename", "extra-entry", "directory", "parent", "root",
+    "occupied-destination", "retired-only", "retired-replacement", "repository-root", "state-parent",
+    "attachment-copy", "attachment-generation", "claim-generation", "attachment-status", "attachment-missing",
+    "route-copy", "route-generation", "route-status", "route-repository", "route-missing", "route-parent",
+    "marker-copy", "marker-content", "marker-missing", "marker-parent",
+    "workspace-copy", "workspace-content", "workspace-missing", "transcript-copy", "transcript-missing", "transcript-parent",
+  ]) {
+    test(`${scope} ${retryCode} rejects ${fault} drift without adopting replacement state`, () => {
+      withActiveHookFixture((fixture) => {
+        const release = runRetirementScenario(fixture, fault, scope, { code: retryCode, preserveAttachment: false });
+        assert.equal(release.mutationFired, true);
+        assert.equal(release.injectionCount, 1);
+        assert.equal(release.retirementAttempts.length, 1);
+        assert.deepEqual(release.finalState, release.protectedState);
+        assert.match(retirementMessage(release), /LIFECYCLE_IDENTITY_REJECTED/);
+        assert.match(retirementMessage(release), new RegExp('"scope":"' + scope + '"'));
+        const before = release.initialState;
+        const after = release.protectedState;
+        assert.notDeepEqual(after, before);
+        const [slot, operation] = fault.split("-");
+        if (operation === "copy") {
+          assert.equal(after.binding[slot].bytes, before.binding[slot].bytes);
+          assert.notEqual(after.binding[slot].identity.ino, before.binding[slot].identity.ino);
+        } else if (operation === "missing") {
+          assert.notEqual(before.binding[slot], null);
+          assert.equal(after.binding[slot], null);
+        } else if (["generation", "status", "content"].includes(operation)) {
+          const key = slot === "claim" ? "attachment" : slot;
+          assert.deepEqual(after.binding[key].identity, before.binding[key].identity);
+          assert.notEqual(after.binding[key].bytes, before.binding[key].bytes);
+        } else if (fault === "repository-root") {
+          assert.notEqual(after.binding.repository.ino, before.binding.repository.ino);
+          assert.deepEqual(after.canonical, before.canonical, "the selected lock itself must remain unchanged");
+        } else if (fault === "copied-owner") {
+          assert.equal(after.canonical.entries[0].bytes, before.canonical.entries[0].bytes);
+          assert.notEqual(after.canonical.entries[0].identity.ino, before.canonical.entries[0].identity.ino);
+        }
+      });
+    });
+  }
+
+  test(`${scope} owner drift during binding validation prevents another rename`, () => {
+    withActiveHookFixture((fixture) => {
+      const release = runRetirementScenario(fixture, "record-pid", scope, { code: retryCode, mutateDuringBinding: true });
+      assert.equal(release.mutationFired, true, "the owner must change inside the retry binding read");
+      assert.equal(release.retirementAttempts.length, 1);
+      assert.deepEqual(release.finalState, release.protectedState);
+      assert.match(retirementMessage(release), /LIFECYCLE_IDENTITY_REJECTED/);
+    });
+  });
+
+  test(`${scope} transcript growth does not become a transcript-content binding`, () => {
+    withActiveHookFixture((fixture) => {
+      const release = runRetirementScenario(fixture, "transcript-append", scope, { code: retryCode });
+      assert.equal(release.mutationFired, true);
+      assert.equal(release.retirementAttempts.length, 2);
+      assert.equal(release.injectionCount, 1);
+      assert.deepEqual(release.output, {});
+      assert.deepEqual(release.protectedState.binding.transcript, release.initialState.binding.transcript);
+      assert.match(readFileSync(fixture.session.transcript_path, "utf8"), /PRIVATE_NEW_TRANSCRIPT_CONTENT/);
+    });
+  });
+
+  test(`${scope} non-rename EPERM does not enter retirement retries`, () => {
+    withActiveHookFixture((fixture) => {
+      const release = runRetirementScenario(fixture, "remove-permission", scope);
+      assert.equal(release.injectionCount, 1);
+      assert.equal(release.retirementAttempts.length, 1);
+      assert.equal(release.retirementAttempts[0].code, null);
+      assert.deepEqual(release.waits, []);
+      assert.equal(release.finalState.canonical, null);
+      assert.deepEqual(release.finalState.retired, release.initialState.canonical);
+      assert.match(retirementMessage(release), /"syscall":"rm","errorCode":"EPERM","attempts":1/);
+    });
+  });
+
+  test(`${scope} unavailable retry binding still permits the other lock's first cleanup`, () => {
+    withActiveHookFixture((fixture) => {
+      const release = runRetirementScenario(fixture, "persistent", scope, { code: retryCode, bindingUnavailable: true });
+      assert.ok(release.bindingFailures >= 2, "both held locks must attempt their post-action binding capture");
+      assert.equal(release.retirementAttempts.length, 1);
+      assert.deepEqual(release.waits, []);
+      assert.match(retirementMessage(release), /LIFECYCLE_IDENTITY_REJECTED/);
+      const other = release.allRetirements.filter((attempt) => attempt.scope !== scope);
+      assert.equal(other.length, 1);
+      assert.equal(other[0].code, null);
+    });
+  });
+
+  for (const slot of ["attachment", "route", "marker"]) {
+    test(`${scope} rejects appearance of a post-action absent ${slot} slot`, async () => {
+      await withRecoveryFixture(async (fixture) => {
+        const plan = { schemaVersion: 1, mode: "active", goal: "Absent binding", items: [], completion: null };
+        mkdirSync(path.dirname(fixture.planPath), { recursive: true });
+        writeFileSync(fixture.planPath, JSON.stringify(plan));
+        const request = { ...fixture.anchor, planHash: canonicalPlanHash(plan), attachmentHash: sha256("absent") };
+        const release = runRetirementScenario(fixture, `${slot}-appeared`, scope, {
+          code: retryCode, operation: "checkpoint", request, preserveAttachment: false,
+        });
+        assert.equal(release.mutationFired, true);
+        assert.equal(release.initialState.binding[slot], null);
+        assert.notEqual(release.protectedState.binding[slot], null);
+        assert.equal(release.retirementAttempts.length, 1);
+        assert.deepEqual(release.finalState, release.protectedState);
+        assert.equal(release.output.primaryError.code, "PRIMARY_OPERATION_FAILED");
+        assert.ok(release.output.lifecycleDiagnostics.some((entry) => entry.scope === scope && entry.code === "LIFECYCLE_IDENTITY_REJECTED"));
+      });
+    });
+  }
+
+  for (const mutation of ["claim", "promotion", "detach"]) {
+    test(`${scope} ${retryCode} cleanup binds the hook's settled ${mutation} exactly once`, async () => {
+      await withRecoveryFixture(async (fixture) => {
+        const tool = { tool_name: "Write", tool_use_id: "post-action-plan", tool_input: { file_path: fixture.planPath } };
+        if (mutation === "promotion") {
+          assert.deepEqual(fixture.invoke("PreToolUse", tool), {});
+          writeFileSync(fixture.planPath, JSON.stringify({ schemaVersion: 1, mode: "active", goal: "Promotion", items: [], completion: null }));
+        } else if (mutation === "detach") {
+          attachFixture(fixture);
+          const plan = JSON.parse(readFileSync(fixture.planPath));
+          writeFileSync(fixture.planPath, JSON.stringify({ ...plan, mode: "inactive" }));
+        }
+        const before = fileState(fixture.attachmentPath);
+        const release = runRetirementScenario(fixture, "transient", scope, {
+          code: retryCode, eventName: mutation === "claim" ? "PreToolUse" : mutation === "promotion" ? "PostToolUse" : "Stop",
+          input: tool, preserveAttachment: false,
+        });
+        assert.equal(release.retirementAttempts.length, 2);
+        assert.equal(release.injectionCount, 1);
+        assert.deepEqual(release.output, {});
+        const attachment = existsSync(fixture.attachmentPath) ? JSON.parse(readFileSync(fixture.attachmentPath)) : null;
+        assert.equal(attachment?.status ?? null, mutation === "claim" ? "provisional" : mutation === "promotion" ? "active" : null);
+        assert.equal(JSON.parse(readFileSync(fixture.routePath)).status, mutation === "claim" ? "provisional" : mutation === "promotion" ? "active" : "released");
+        assert.notDeepEqual(fileState(fixture.attachmentPath), before);
+        assert.equal(release.initialState.binding.attachment?.bytes ?? null, fileState(fixture.attachmentPath)?.bytes ?? null);
+        const records = readFileSync(fixture.ledgerPath, "utf8").trim().split("\n").map(JSON.parse);
+        const event = mutation === "claim" ? "tool_started" : mutation === "promotion" ? "tool_completed" : "plan_inactive";
+        assert.equal(records.filter((record) => record.event === event).length, 1);
+      });
+    });
+  }
+
+  for (const operation of ["checkpoint", "resume"]) {
+    for (const interrupted of [false, true]) {
+      test(`${scope} ${retryCode} cleanup accepts ${interrupted ? "partially failed" : "successful"} ${operation} bindings without replay`, async () => {
+        await withRecoveryFixture(async (fixture) => {
+          attachFixture(fixture);
+          const planBefore = fileState(fixture.planPath);
+          let request = { ...fixture.anchor, planHash: canonicalPlanHash(JSON.parse(readFileSync(fixture.planPath))), attachmentHash: sha256(readFileSync(fixture.attachmentPath)) };
+          if (operation === "resume") {
+            const checkpoint = checkpointSession(fixture.cwd, request);
+            assert.equal(checkpoint.status, "checkpointed");
+            const successor = "retirement-successor";
+            const transcript = path.join(path.dirname(fixture.anchor.transcript_path), `${successor}.jsonl`);
+            writeFileSync(transcript, "PRIVATE_SUCCESSOR_TRANSCRIPT");
+            request = { session_id: successor, transcript_path: transcript, planHash: request.planHash, checkpointHash: checkpoint.checkpointHash };
+          }
+          const before = fileState(fixture.attachmentPath);
+          const release = runRetirementScenario(fixture, "transient", scope, {
+            code: retryCode, operation, request, preserveAttachment: false,
+            input: { session_id: request.session_id, transcript_path: request.transcript_path },
+            ...(interrupted ? { failRouteStatus: operation === "checkpoint" ? "released" : "active" } : {}),
+          });
+          assert.equal(release.actionFaults, interrupted ? 1 : 0);
+          assert.equal(release.retirementAttempts.length, 2);
+          assert.equal(release.injectionCount, 1);
+          assert.equal(release.output.status, interrupted ? "primary-error" : operation === "checkpoint" ? "checkpointed" : "resumed");
+          assert.deepEqual(fileState(fixture.planPath), planBefore);
+          const attachment = JSON.parse(readFileSync(fixture.attachmentPath));
+          assert.equal(attachment.status, operation === "checkpoint" ? "checkpointed" : "active");
+          assert.notEqual(release.initialState.binding.attachment.bytes, before.bytes);
+          assert.equal(release.initialState.binding.attachment.bytes, fileState(fixture.attachmentPath).bytes);
+          const route = path.join(fixture.storage, "supervised-worker", "session-roots", sha256(request.session_id), "route.json");
+          assert.equal(JSON.parse(readFileSync(route)).status, operation === "checkpoint" ? interrupted ? "active" : "released" : interrupted ? "provisional" : "active");
+          const ledger = path.join(fixture.cwd, ".supervised-worker", "runs", `${sha256(request.session_id)}.jsonl`);
+          const records = existsSync(ledger) ? readFileSync(ledger, "utf8").trim().split("\n").map(JSON.parse) : [];
+          assert.equal(records.filter((record) => record.event === (operation === "checkpoint" ? "checkpoint_persisted" : "checkpoint_resumed")).length,
+            operation === "resume" && interrupted ? 0 : 1);
+        });
+      });
+    }
+  }
+
+  test(`${scope} partial repository acquisition shares the anchored cleanup provider`, () => {
+    withActiveHookFixture((fixture) => {
+      const secondRoot = path.join(fixture.base, "zz-target");
+      mkdirSync(secondRoot);
+      const ledger = path.join(fixture.cwd, ".supervised-worker", "runs", `${sha256(fixture.session.session_id)}.jsonl`);
+      const before = fileState(ledger);
+      const release = runRetirementScenario(fixture, "transient", scope, {
+        code: retryCode, failAcquisitionRoot: secondRoot, eventName: "PreToolUse",
+        input: { tool_name: "Write", tool_input: { file_path: path.join(secondRoot, ".supervised-worker", "plan.json") } },
+      });
+      assert.equal(release.acquisitionFailures, 1);
+      assert.equal(release.retirementAttempts.length, 2);
+      assert.equal(release.output.permissionDecision, "deny");
+      assert.match(retirementMessage(release), /"operation":"acquire"/);
+      assert.match(retirementMessage(release), /"errorCode":"EIO"/);
+      assert.doesNotMatch(retirementMessage(release), /"operation":"release"/);
+      assert.deepEqual(fileState(ledger), before);
+      assert.equal(existsSync(path.join(secondRoot, ".supervised-worker", "locks", "lifecycle")), false);
+    });
+  });
+
+  test(`${scope} conflicting guarded roots retain their settled binding without recovery semantics`, () => {
+    withActiveHookFixture((fixture) => {
+      const secondRoot = path.join(fixture.base, "zz-conflict");
+      mkdirSync(secondRoot);
+      const release = runRetirementScenario(fixture, "transient", scope, {
+        code: retryCode, eventName: "PreToolUse",
+        input: { tool_name: "Write", tool_input: { file_path: path.join(secondRoot, ".supervised-worker", "plan.json") } },
+      });
+      assert.equal(release.retirementAttempts.length, 2);
+      assert.equal(release.output.permissionDecision, "deny");
+      assert.match(retirementMessage(release), /different repository/);
+      assert.doesNotMatch(retirementMessage(release), /LIFECYCLE_/);
+      assert.equal(existsSync(path.join(secondRoot, ".supervised-worker", "attachment.json")), false);
+      assert.equal(existsSync(path.join(secondRoot, ".supervised-worker", "locks", "lifecycle")), false);
+    });
+  });
+
+  for (const host of ["vscode", "cli"]) {
+    test(`${scope} exhausted Windows EPERM preserves the recorded ${host} Stop block`, { skip: process.platform !== "win32" }, () => {
+      withActiveHookFixture((fixture) => {
+        const release = runRetirementScenario(fixture, "permission", scope, {
+          eventName: "Stop", ...(host === "cli" ? { input: { session_id: undefined, hook_event_name: undefined, sessionId: fixture.session.session_id } } : {}),
+        });
+        assert.equal(release.retirementAttempts.length, 3);
+        assert.equal(release.output.decision, "block");
+        assert.match(release.output.reason, /"errorCode":"EPERM","attempts":3/);
+        const hash = sha256(fixture.session.session_id);
+        assert.equal(JSON.parse(readFileSync(path.join(fixture.cwd, ".supervised-worker", "runtime", `${hash}.json`))).sameProgressBlocks, 1);
+        const records = readFileSync(path.join(fixture.cwd, ".supervised-worker", "runs", `${hash}.jsonl`), "utf8").trim().split("\n").map(JSON.parse);
+        assert.equal(records.filter((record) => record.event === "stop_blocked").length, 1);
+        if (host === "vscode") assert.equal(release.output.hookSpecificOutput.decision, "block");
+        else assert.equal(Object.hasOwn(release.output, "hookSpecificOutput"), false);
+      });
+    });
+  }
+
+  test(`${scope} actual Windows EPERM exhaustion is explicitly recovered without replay or fence loss`, { skip: process.platform !== "win32" }, async () => {
+    await withRecoveryFixture(async (fixture) => {
+      attachFixture(fixture);
+      const release = runRetirementScenario(fixture, "permission", scope);
+      assert.equal(release.injectionCount, 3);
+      assert.equal(release.retirementAttempts.length, 3);
+      assert.throws(() => process.kill(release.processId, 0), { code: "ESRCH" });
+      const canonical = fixture.canonical(scope);
+      const owner = JSON.parse(readFileSync(path.join(canonical, readdirSync(canonical)[0])));
+      assert.equal(owner.processId, release.processId);
+      const target = { scope, location: "canonical", token: owner.token, directory: canonical, canonical,
+        recovered: `${canonical}.${owner.token}.recovered`, before: lockState(canonical), processId: release.processId };
+      const before = preservedCampaign(fixture);
+      const request = inspectedRequest(fixture, target);
+      const result = recoverLifecycleLock(fixture.cwd, request);
+      assert.equal(result.status, "recovered", JSON.stringify(result));
+      assert.deepEqual(lockState(target.recovered), target.before);
+      assert.deepEqual(preservedCampaign(fixture), before);
+      assert.deepEqual(readEvidence(fixture, result).intent.expected, request.expected);
+      const evidenceBefore = Object.fromEntries(readdirSync(fixture.evidenceDirectory).map((name) => [name, fileState(path.join(fixture.evidenceDirectory, name))]));
+      const again = recoverLifecycleLock(fixture.cwd, { ...request, intentHash: result.intentHash });
+      assert.equal(again.status, "already-recovered", JSON.stringify(again));
+      assert.equal(again.outcomeHash, result.outcomeHash);
+      assert.deepEqual(preservedCampaign(fixture), before);
+      assert.deepEqual(fixture.invoke("PreToolUse", { tool_name: "read_file", tool_use_id: "after-eperm-recovery", tool_input: { filePath: fixture.planPath } }), {});
+      assert.equal(existsSync(canonical), false);
+      assert.deepEqual(lockState(target.recovered), target.before);
+      assert.deepEqual(Object.fromEntries(readdirSync(fixture.evidenceDirectory).map((name) => [name, fileState(path.join(fixture.evidenceDirectory, name))])), evidenceBefore);
+      for (const name of ["attachmentPath", "routePath", "markerPath", "planPath"]) assert.deepEqual(fileState(fixture[name]), before[name]);
+      const priorLedger = Buffer.from(before.ledgerPath.bytes, "base64");
+      const currentLedger = readFileSync(fixture.ledgerPath);
+      assert.deepEqual(currentLedger.subarray(0, priorLedger.length), priorLedger);
+      const added = currentLedger.subarray(priorLedger.length).toString("utf8").trim().split("\n").map(JSON.parse);
+      assert.equal(added.length, 1);
+      assert.equal(added[0].event, "tool_started");
+      readEvidence(fixture, result);
+    });
+  });
+}
+
+for (const partialAcquisition of [false, true]) {
+  test(`${partialAcquisition ? "partial acquisition" : "hook"} cleanup never refreshes the session baseline after repository drift`, () => {
+    withActiveHookFixture((fixture) => {
+      const options = { code: process.platform === "win32" ? "EPERM" : "EBUSY", alsoFaultSession: true, preserveAttachment: false };
+      if (partialAcquisition) {
+        const secondRoot = path.join(fixture.base, "zz-target");
+        mkdirSync(secondRoot);
+        Object.assign(options, { failAcquisitionRoot: secondRoot, eventName: "PreToolUse",
+          input: { tool_name: "Write", tool_input: { file_path: path.join(secondRoot, ".supervised-worker", "plan.json") } } });
+      }
+      const release = runRetirementScenario(fixture, "attachment-copy", "repository", options);
+      assert.equal(release.acquisitionFailures, partialAcquisition ? 1 : 0);
+      assert.equal(release.mutationFired, true);
+      assert.equal(release.retirementAttempts.length, 1);
+      assert.equal(release.otherInjectionCount, 1);
+      assert.equal(release.otherWaits.length, 1);
+      assert.equal(release.allRetirements.filter((attempt) => attempt.scope === "session").length, 1);
+      assert.deepEqual(release.finalState, release.protectedState);
+      assert.ok((retirementMessage(release).match(/LIFECYCLE_IDENTITY_REJECTED/g) ?? []).length >= 2);
+    });
+  });
+}
+
+test("repository-only release retries against its post-action absent attachment", () => {
+  withActiveHookFixture((fixture) => {
+    const release = runRetirementScenario(fixture, "transient", "repository", {
+      code: process.platform === "win32" ? "EPERM" : "EBUSY", operation: "release", preserveAttachment: false,
+    });
+    assert.equal(release.retirementAttempts.length, 2);
+    assert.equal(release.output.released, true);
+    assert.equal(release.initialState.binding.attachment, null);
+    assert.equal(existsSync(fixture.attachmentPath), false);
+  });
+});
+
+test("an unanchored hook claim supplies a repository-only post-action binding", async () => {
+  await withRecoveryFixture(async (fixture) => {
+    const release = runRetirementScenario(fixture, "transient", "repository", {
+      code: process.platform === "win32" ? "EPERM" : "EBUSY", eventName: "PreToolUse", preserveAttachment: false,
+      input: { transcript_path: null, tool_name: "Write", tool_input: { file_path: fixture.planPath } },
+    });
+    assert.equal(release.retirementAttempts.length, 2);
+    assert.deepEqual(release.output, {});
+    const attachment = JSON.parse(readFileSync(fixture.attachmentPath));
+    assert.equal(attachment.status, "provisional");
+    assert.equal(attachment.routeGeneration, null);
+    assert.equal(existsSync(fixture.routePath), false);
+    assert.equal(release.allRetirements.some((attempt) => attempt.scope === "session"), false);
+  });
+});
+
+test("explicit fixture recovery supplies an anchored post-action repository guard binding", async () => {
+  await withRecoveryFixture(async (fixture) => {
+    attachFixture(fixture);
+    const target = seedDeadOwner(fixture, "session");
+    const request = inspectedRequest(fixture, target);
+    const before = preservedCampaign(fixture);
+    const release = runRetirementScenario(fixture, "transient", "repository", {
+      code: process.platform === "win32" ? "EPERM" : "EBUSY", operation: "recover", request,
+    });
+    assert.equal(release.retirementAttempts.length, 2);
+    assert.equal(release.output.status, "recovered", JSON.stringify(release.output));
+    assert.deepEqual(lockState(target.recovered), target.before);
+    assert.deepEqual(preservedCampaign(fixture), before);
+    readEvidence(fixture, release.output);
+  });
+});
 
 function childEnvironment() {
   const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };

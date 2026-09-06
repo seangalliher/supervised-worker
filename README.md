@@ -284,9 +284,11 @@ inspection. Locality checks share a 1.5-second budget and allow at most three
 distinct drive letters per operation.
 
 Session and repository lifecycle locks are never reclaimed automatically.
-Owned release retries only a verified `EBUSY` retirement failure, at most three
-attempts within a 100 ms monotonic retry budget. Exhausted or ambiguous cleanup
-is reported with a typed lifecycle code, even if the preceding operation already
+Owned release retries a verified `EBUSY` or Windows-only `EPERM` retirement
+failure, at most three attempts within a 100 ms monotonic retry budget, with
+polls capped at 25 ms. Each retry revalidates the owner, directory identities,
+and frozen post-action repository and session bindings. Exhausted or ambiguous
+cleanup is reported with a typed lifecycle code, even if the preceding operation already
 changed state. A denied read-only tool is described as an invocation, not a plan
 write. Do not replay side effects on the assumption that cleanup failure rolled
 them back.
