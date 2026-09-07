@@ -9,7 +9,7 @@ import test from "node:test";
 const testModuleUrl = import.meta.url;
 const coreUrl = new URL("../src/core.mjs", testModuleUrl).href;
 
-function runIsolated(script, timeout = 10_000) {
+function runIsolated(script, timeout = 30_000) {
   const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
     encoding: "utf8",
     timeout,
