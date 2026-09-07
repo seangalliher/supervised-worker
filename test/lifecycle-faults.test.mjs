@@ -164,6 +164,7 @@ const journalHookChildProgram = String.raw`
   import fs from "node:fs";
   import path from "node:path";
   import { syncBuiltinESMExports } from "node:module";
+  import { performance } from "node:perf_hooks";
 
   const options = JSON.parse(process.argv[1]);
   const core = await import(options.coreUrl);
@@ -174,8 +175,19 @@ const journalHookChildProgram = String.raw`
   const originalRename = fs.renameSync;
   const publications = [];
   let contentionReported = false;
+  let contentionReleased = false;
   let held = false;
   const emit = (message) => fs.writeSync(1, JSON.stringify(message) + "\n");
+  if (options.holdContention) {
+    let monotonicTime = 0;
+    const originalWait = Atomics.wait;
+    Object.defineProperty(performance, "now", { value: () => monotonicTime });
+    Atomics.wait = (cell, index, expected, timeout) => {
+      const result = originalWait(cell, index, expected, timeout);
+      monotonicTime += Math.max(1, Number(timeout) || 0);
+      return result;
+    };
+  }
 
   fs.mkdirSync = (directory, ...args) => {
     try {
@@ -183,7 +195,17 @@ const journalHookChildProgram = String.raw`
     } catch (error) {
       if (!contentionReported && error.code === "EEXIST" && path.resolve(String(directory)) === journalDirectory) {
         contentionReported = true;
-        emit({ type: "contended", scope: "journal" });
+        const entries = fs.readdirSync(journalDirectory);
+        assert.equal(entries.length, 1);
+        const owner = JSON.parse(fs.readFileSync(path.join(journalDirectory, entries[0]), "utf8"));
+        emit({ type: "contended", scope: "journal", owner });
+        if (options.holdContention) {
+          const release = Buffer.alloc(1);
+          assert.equal(fs.readSync(0, release, 0, 1, null), 1, "contender requires a parent pipe byte");
+          assert.equal(release[0], 0x67);
+          assert.equal(fs.existsSync(journalDirectory), false, "first owner must finish cleanup before contender release");
+          contentionReleased = true;
+        }
       }
       throw error;
     }
@@ -215,17 +237,17 @@ const journalHookChildProgram = String.raw`
     : options.eventName === "helper"
     ? core.observeHandoffValidation(options.input.cwd, options.input.filePath, options.input.request)
     : core.handleHook(options.input, options.eventName);
-  emit({ type: "result", output, publications, held });
+  emit({ type: "result", output, publications, held, contentionReleased });
 `;
 
 function journalHookChildrenSetup() {
   return `
     const { spawn } = await import("node:child_process");
     const children = [];
-    const startHookChild = (hookInput, eventName, holdEvent = null) => {
+    const startHookChild = (hookInput, eventName, holdEvent = null, holdContention = false) => {
       const child = spawn(process.execPath, ["--input-type=module", "--eval",
         ${JSON.stringify(journalHookChildProgram)},
-        JSON.stringify({ coreUrl: ${JSON.stringify(coreUrl)}, input: hookInput, eventName, holdEvent })],
+        JSON.stringify({ coreUrl: ${JSON.stringify(coreUrl)}, input: hookInput, eventName, holdEvent, holdContention })],
         { cwd: repositoryRoot, stdio: ["pipe", "pipe", "pipe"] });
       const messages = [];
       const waiters = [];
@@ -293,6 +315,7 @@ function journalHookChildrenSetup() {
           assert.equal(results.length, 1, "each child must acknowledge exactly one hook decision");
           if (expectedOutput !== null) assert.deepEqual(results[0].output, expectedOutput);
           assert.equal(results[0].held, holdEvent !== null, "requested publication boundary must be reached");
+          assert.equal(results[0].contentionReleased, holdContention, "requested contender boundary must be released");
           return results[0];
         },
       };
@@ -339,11 +362,13 @@ function journalHookChildrenSetup() {
       const first = startHookChild(firstInput, firstEvent, heldEvent);
       const boundary = await first.waitFor("held");
       assert.equal(boundary.record.event, heldEvent);
-      const second = startHookChild(secondInput, secondEvent);
+      const second = startHookChild(secondInput, secondEvent, null, true);
       const contention = await second.waitFor("contended");
       assert.equal(contention.scope, "journal", "the contender must reach the actual journal mkdir EEXIST");
+      assert.equal(contention.owner.processId, first.child.pid, "contention must observe the first child owner");
       first.release();
       const firstResult = await first.finish();
+      second.release();
       const secondResult = await second.finish();
       assert.deepEqual(firstResult.publications, [boundary.record]);
       return [firstResult, secondResult];
