@@ -17,8 +17,11 @@ import {
   lifecycleFailureDetails,
   MAX_CHECKPOINT_REQUEST_BYTES,
   MAX_LIFECYCLE_REQUEST_BYTES,
+  MAX_OBSERVATION_REQUEST_BYTES,
+  observeHandoffValidation,
   recoverLifecycleLock,
   releaseAttachment,
+  requestDeniedToolRetry,
   resumeSession,
   summarizePlan,
   validatePlan,
@@ -59,6 +62,7 @@ function readStdin(maximumBytes = MAX_STDIN_BYTES) {
 
 function hookInputFailure(eventName, message) {
   if (eventName === "PreToolUse") {
+    message += " Denial journaling is unconfirmed; no retry permit is available.";
     return {
       permissionDecision: "deny",
       permissionDecisionReason: message,
@@ -339,7 +343,7 @@ async function main() {
   const [command = "help", argument, ...argumentsAfter] = process.argv.slice(2);
   const hasNoArguments = argument === undefined && argumentsAfter.length === 0;
   const usage =
-    "Usage: node src/cli.mjs <validate|doctor|install|status|checkpoint|resume|release|lifecycle inspect|lifecycle recover|queue inspect OWNER/REPO --state open|closed|all|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
+    "Usage: node src/cli.mjs <validate|doctor|install|status|checkpoint|resume|release|observation retry-denied|lifecycle inspect|lifecycle recover|queue inspect OWNER/REPO --state open|closed|all|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
   if (command === "help" && hasNoArguments) {
     process.stdout.write(usage);
     return;
@@ -402,6 +406,23 @@ async function main() {
       return;
     }
     process.stdout.write(`${JSON.stringify(handleHook(input, argument, input.cwd))}\n`);
+    return;
+  }
+  if (command === "observation" && argument === "retry-denied" && argumentsAfter.length === 0) {
+    let request;
+    try {
+      request = parseWorkflowJson(await readStdin(MAX_OBSERVATION_REQUEST_BYTES));
+    } catch {
+      process.stdout.write(`${JSON.stringify({
+        status: "denied", permit: null,
+        reason: "retry-denied requires bounded, duplicate-key-free JSON stdin.",
+      })}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    const result = requestDeniedToolRetry(process.cwd(), request);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    if (result.status !== "reserved") process.exitCode = 1;
     return;
   }
   if (["checkpoint", "resume"].includes(command) && hasNoArguments) {
@@ -492,7 +513,9 @@ async function main() {
   }
   if (command === "status" && hasNoArguments) {
     try {
-      process.stdout.write(`${JSON.stringify(summarizePlan(process.cwd()), null, 2)}\n`);
+      const report = summarizePlan(process.cwd());
+      process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      if (report.valid === false) process.exitCode = 1;
     } catch {
       process.stdout.write(
         `${JSON.stringify({ active: false, valid: false, error: "Local state could not be verified." }, null, 2)}\n`,
@@ -516,6 +539,16 @@ async function main() {
     let report;
     if (argument === "validate" && argumentsAfter.length === 1) {
       report = inspectHandoffFile(process.cwd(), argumentsAfter[0]);
+    } else if (argument === "validate" && argumentsAfter.length === 2 && argumentsAfter[1] === "--observe") {
+      try {
+        const request = parseWorkflowJson(await readStdin(MAX_OBSERVATION_REQUEST_BYTES));
+        report = observeHandoffValidation(process.cwd(), argumentsAfter[0], request);
+      } catch {
+        report = {
+          ok: false, status: "denied", outcome: "not-evaluated",
+          errors: ["Observed handoff validation requires bounded, duplicate-key-free JSON stdin."],
+        };
+      }
     } else if (argument === "pre-review" && argumentsAfter.length === 2) {
       report = verifyBuildHandoff(process.cwd(), ...argumentsAfter);
     } else if (argument === "issue-review" && argumentsAfter.length === 2) {
@@ -526,7 +559,7 @@ async function main() {
       report = {
         ok: false,
         errors: [
-          "Usage: handoff validate <artifact> | handoff pre-review <contract> <build-report> | handoff issue-review <contract> <build-report> | handoff verify <contract> <build-report> <review-report>",
+          "Usage: handoff validate <artifact> [--observe] | handoff pre-review <contract> <build-report> | handoff issue-review <contract> <build-report> | handoff verify <contract> <build-report> <review-report>",
         ],
       };
     }
@@ -551,6 +584,7 @@ async function main() {
     let plan;
     try {
       plan = summarizePlan(process.cwd());
+      if (plan.valid === false) errors.push("Local state could not be verified.");
     } catch {
       const error = "Local state could not be verified.";
       plan = { active: false, valid: false, error };

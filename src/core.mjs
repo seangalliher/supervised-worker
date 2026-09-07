@@ -22,6 +22,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { parseWorkflowJson, WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
+import { captureHandoffValidation } from "./handoff.mjs";
 
 export const STATE_DIRECTORY = ".supervised-worker";
 export const PLAN_FILE = "plan.json";
@@ -31,6 +32,7 @@ export const MAX_TOOL_TARGETS = 256;
 export const MAX_CHECKPOINT_BYTES = 262_144;
 export const MAX_CHECKPOINT_REQUEST_BYTES = 8_192;
 export const MAX_LIFECYCLE_REQUEST_BYTES = 8_192;
+export const MAX_OBSERVATION_REQUEST_BYTES = 8_192;
 const MAX_LIFECYCLE_EVIDENCE_BYTES = 32_768;
 let lifecycleSchema = null;
 const MAX_CHECKPOINT_ITEMS = 4_096;
@@ -112,6 +114,13 @@ const RUN_LEDGER_MAX_TOTAL_BYTES = 16_777_216;
 const RUN_LEDGER_MAX_RECORD_BYTES = 16_384;
 const RUN_LEDGER_FILE_PATTERN = /^[0-9a-f]{64}\.jsonl$/;
 const RUN_LEDGER_COMMON_KEYS = new Set(["schemaVersion", "at", "event", "session"]);
+const HANDOFF_HELPER_ID = "handoff.validate.v1";
+const HANDOFF_HELPER_FIELDS = [
+  "helperId", "operationId", "parentOperationId", "observationId", "invocationHash",
+  "retryRoot", "attempt", "namespaceHash", "parametersHash", "inputHash", "implementationHash",
+  "planHash", "planBytesHash", "attachmentHash", "ownershipHash", "routeGeneration", "claimGeneration",
+  "outcome", "delivery",
+];
 const RUN_LEDGER_EVENT_FIELDS = new Map([
   ["plan_inactive", { required: [], optional: [] }],
   ["completion_verified", { required: ["planHash"], optional: [] }],
@@ -122,12 +131,27 @@ const RUN_LEDGER_EVENT_FIELDS = new Map([
   }],
   ["tool_started", {
     required: ["toolName", "operationId", "invocationHash", "routeGeneration", "claimGeneration"],
+    optional: ["requestHash"],
+  }],
+  ["tool_denied", {
+    required: ["toolName", "operationId", "observationId", "invocationHash", "requestHash", "planHash", "attachmentHash", "ownershipHash", "routeGeneration", "claimGeneration", "retryOf", "outcome"],
+    optional: [],
+  }],
+  ["denied_retry_reserved", {
+    required: ["sourceOperationId", "reservationId", "requestHash", "planHash", "attachmentHash", "ownershipHash", "routeGeneration", "claimGeneration", "attempt"],
+    optional: [],
+  }],
+  ["denied_retry_consumed", {
+    required: ["sourceOperationId", "reservationId", "requestHash", "planHash", "attachmentHash", "ownershipHash", "routeGeneration", "claimGeneration", "attempt", "operationId", "invocationHash"],
     optional: [],
   }],
   ["tool_completed", {
     required: ["toolName", "success"],
     optional: ["observationId", "operationId", "invocationHash", "routeGeneration", "claimGeneration"],
   }],
+  ["helper_attempt_reserved", { required: HANDOFF_HELPER_FIELDS, optional: [] }],
+  ["helper_circuit_open", { required: HANDOFF_HELPER_FIELDS, optional: [] }],
+  ["helper_result", { required: [...HANDOFF_HELPER_FIELDS, "resultHash"], optional: [] }],
   ["checkpoint_persisted", {
     required: ["checkpointHash", "planHash", "attachmentHash", "routeGeneration", "claimGeneration"],
     optional: [],
@@ -745,7 +769,7 @@ function createLifecycleReleaseContext(describe, heldLocks = () => []) {
         context = Object.freeze({
           roots: Object.freeze([...new Set([
             ...supplied.roots, ...roots,
-            ...held.filter((lock) => lock.scope === "repository").map((lock) => lock.storageRoot),
+            ...held.filter((lock) => ["repository", "journal"].includes(lock.scope)).map((lock) => lock.storageRoot),
           ].map((root) => realpathSync(path.resolve(root))))].sort()),
           session: supplied.session === null ? null : Object.freeze({
             ...supplied.session,
@@ -1235,6 +1259,74 @@ function acquireRepositoryLocks(roots, releaseContext = createLifecycleReleaseCo
   }
 }
 
+function acquireJournalLocks(roots, releaseContext = createLifecycleReleaseContext(() => ({ roots, session: null }))) {
+  const canonicalRoots = new Map();
+  for (const root of roots) {
+    const canonicalRoot = realpathSync(path.resolve(root));
+    if (!isFullyQualifiedRepositoryCwd(canonicalRoot) || !isLocalRepositoryPath(canonicalRoot)) {
+      throw new Error("journal lock requires a canonical local root");
+    }
+    canonicalRoots.set(pathIdentity(canonicalRoot), canonicalRoot);
+  }
+  const locks = [];
+  try {
+    for (const identity of [...canonicalRoots.keys()].sort()) {
+      const root = canonicalRoots.get(identity);
+      locks.push(acquireLifecycleLock(root, path.join(stateDirectory(root), "locks", "journal"), "journal"));
+    }
+    return locks;
+  } catch (error) {
+    return withLifecycleCleanup(() => { throw error; }, () => [...locks].reverse(),
+      (held) => releaseContext(held, [...canonicalRoots.values()]));
+  }
+}
+
+function createJournalGuard(journalLocks, outerLocks = []) {
+  const roots = journalLocks.map((lock) => ({
+    root: lock.storageRoot,
+    boundary: canonicalJson(recoveryBoundary(lock.storageRoot, lock.storageRoot)),
+  }));
+  const locks = [...outerLocks, ...journalLocks].filter((lock) => lock !== null);
+  return (cwd) => {
+    const root = realpathSync(path.resolve(cwd));
+    if (!roots.some((entry) => pathEquals(entry.root, root))) {
+      throw new Error("journal access requires its explicit held repository journal guard");
+    }
+    for (const entry of roots) {
+      if (canonicalJson(recoveryBoundary(entry.root, entry.root)) !== entry.boundary) {
+        throw new Error("journal repository identity changed while guarded");
+      }
+    }
+    for (const lock of locks) {
+      assertSafeStatePath(lock.storageRoot, lock.ownerPath);
+      if (!lifecycleLockIdentityMatches(lock) || !lifecycleLockOwnerIdentityMatches(lock)) {
+        throw new LifecycleError([lifecycleDiagnostic("LIFECYCLE_IDENTITY_REJECTED", lock.scope, "guard", "ownership-validation", {
+          token: lock.token, processId: process.pid,
+        })]);
+      }
+    }
+  };
+}
+
+function withJournalRead(cwd, action) {
+  if (process.platform === "win32") resetWindowsPathChecks();
+  if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd)) {
+    throw new Error("journal observation requires a local repository root");
+  }
+  const root = realpathSync(path.resolve(cwd));
+  assertSafeStatePath(root, stateDirectory(root));
+  if (!existsSync(stateDirectory(root))) return action(null);
+  windowsPathChecksMaySpawn = false;
+  let locks = [];
+  const releaseContext = createLifecycleReleaseContext(() => ({ roots: [root], session: null }));
+  return withLifecycleCleanup(() => {
+    locks = acquireJournalLocks([root], releaseContext);
+    const journalGuard = createJournalGuard(locks);
+    journalGuard(root);
+    return action(journalGuard);
+  }, () => [...locks].reverse(), releaseContext);
+}
+
 function lifecycleShapeMatches(shape, value) {
   if (shape.$ref) return lifecycleShapeMatches(lifecycleSchema.$defs[shape.$ref.slice("#/$defs/".length)], value);
   if (shape.anyOf && !shape.anyOf.some((branch) => lifecycleShapeMatches(branch, value))) return false;
@@ -1337,10 +1429,10 @@ function recoveryContext(cwd, request, operation) {
     recoveryIdentity(recoveryPathStats(session.storageRoot, request.transcript_path));
     if (recoveryFile(session.storageRoot, path.join(session.storageRoot, "workspace.json")) === null) rejectRecoveryIdentity();
   }
-  const storageRoot = scope === "repository" ? root : session.storageRoot;
-  const canonicalDirectory = scope === "repository"
-    ? path.join(stateDirectory(root), "locks", "lifecycle")
-    : path.join(storageRoot, "supervised-worker", "session-locks", sessionHash(input));
+  const storageRoot = scope === "session" ? session.storageRoot : root;
+  const canonicalDirectory = scope === "session"
+    ? path.join(storageRoot, "supervised-worker", "session-locks", sessionHash(input))
+    : path.join(stateDirectory(root), "locks", scope === "journal" ? "journal" : "lifecycle");
   const sourceDirectory = location === "canonical" ? canonicalDirectory : `${canonicalDirectory}.${token}.retired`;
   return { root, storageRoot, canonicalDirectory, sourceDirectory, scope, location, token, input, session, operation };
 }
@@ -1459,6 +1551,10 @@ export function inspectLifecycleLock(cwd, request) {
   const result = { schemaVersion: 1, kind: "lifecycle-inspection", status: "unconfirmed", expected: null, diagnostics: [] };
   let context = null;
   let phase = "request-validation";
+  let guards = [];
+  const releaseContext = createLifecycleReleaseContext(() => ({
+    roots: [context.root], input: context.input, session: context.session,
+  }), () => guards);
   try {
     if (validateLifecycle(request, "inspectRequest").length > 0) rejectRecoveryIdentity();
     context = recoveryContext(cwd, request, "inspect");
@@ -1467,16 +1563,29 @@ export function inspectLifecycleLock(cwd, request) {
       result.status = "absent";
       return result;
     }
-    const expected = recoverySnapshot(context);
-    const observation = recoveryLiveness(context, expected);
-    if (canonicalJson(recoverySnapshot(context)) !== canonicalJson(expected)) rejectRecoveryIdentity();
-    result.diagnostics = [observation];
-    if (observation.code !== "LIFECYCLE_OWNER_UNKNOWN") {
-      result.status = "inspected";
-      result.expected = expected;
-    }
-    return result;
+    return withLifecycleCleanup(() => {
+      if (context.scope === "journal") {
+        phase = "guard-acquisition";
+        windowsPathChecksMaySpawn = false;
+        guards = acquireRepositoryLocks([context.root], releaseContext);
+      }
+      phase = "binding-validation";
+      const expected = recoverySnapshot(context);
+      const observation = recoveryLiveness(context, expected);
+      if (canonicalJson(recoverySnapshot(context)) !== canonicalJson(expected)) rejectRecoveryIdentity();
+      for (const guard of guards) {
+        if (!lifecycleLockIdentityMatches(guard) || !lifecycleLockOwnerIdentityMatches(guard)) rejectRecoveryIdentity();
+      }
+      result.diagnostics = [observation];
+      if (observation.code !== "LIFECYCLE_OWNER_UNKNOWN") {
+        result.status = "inspected";
+        result.expected = expected;
+      }
+      return result;
+    }, () => [...guards].reverse(), releaseContext);
   } catch (error) {
+    result.status = "unconfirmed";
+    result.expected = null;
     result.diagnostics = recoveryDiagnostics(error, context?.scope ?? null, "inspect", phase);
     return result;
   }
@@ -1554,7 +1663,7 @@ export function recoverLifecycleLock(cwd, request) {
     const action = () => {
       try {
         phase = "guard-acquisition";
-        if (context.scope === "session" || context.location === "retired") {
+        if (["session", "journal"].includes(context.scope) || context.location === "retired") {
           windowsPathChecksMaySpawn = false;
           guards = acquireRepositoryLocks([context.root], releaseContext);
         }
@@ -1615,7 +1724,7 @@ function acquireHookRepositoryLocks(input, eventName, targets, cwd, releaseConte
   if (routing.hasUnqualifiedTarget || routing.roots.length > 1) {
     throw new Error("protected edit must name one fully qualified repository");
   }
-  const result = readSessionLocator(input);
+  const result = readSessionLocator(input, false, true);
   const candidateRoot = routing.roots[0] ?? result.locator?.repositoryRoot ?? cwd;
   const inputCwd = input?.cwd ?? cwd;
   const roots = result.exists ? [result.locator.repositoryRoot] : [];
@@ -1642,6 +1751,41 @@ function acquireHookRepositoryLocks(input, eventName, targets, cwd, releaseConte
     roots.push(cwd);
   }
   return acquireRepositoryLocks(roots, releaseContext);
+}
+
+function routineHookObservation(input, eventName, targets, cwd) {
+  if (!["PreToolUse", "PostToolUse", "PostToolUseFailure", "PreCompact", "SessionStart"].includes(eventName)) return null;
+  const protectedRouting = protectedTargetRouting(targets);
+  if (protectedRouting.hasUnqualifiedTarget || protectedRouting.roots.length > 0) return null;
+  const routing = readSessionLocator(input, false, true);
+  if (routing.context !== null && routing.exists && readSessionMarker(routing.context, input) === null) return null;
+  const candidateRoot = routing.exists && routing.locator.status !== "released"
+    ? routing.locator.repositoryRoot : cwd;
+  const root = realpathSync(path.resolve(candidateRoot));
+  const inspectedTargets = completeToolTargetInspection(targets, root);
+  if (inspectedTargets.unsafe || toolTouchesState(inspectedTargets, root) ||
+    toolTouchesGitMetadata(inspectedTargets, root) || toolTouchesWorkflowConfig(inspectedTargets, root)) return null;
+  const snapshot = readAttachmentSnapshot(root);
+  const attachment = attachedRecord(root, input, undefined, snapshot);
+  if (attachment === null) return null;
+  if (routing.exists) {
+    if (routing.locator.status === "released" || routing.locator.status !== attachment.status ||
+      routing.locator.generation !== attachment.routeGeneration ||
+      !pathEquals(routing.locator.repositoryRoot, root)) return null;
+  } else if (attachment.routeGeneration !== null) return null;
+  const inputCwd = input?.cwd ?? cwd;
+  if (routing.context === null && !pathEquals(root, inputCwd) && !pathsShareFilesystemIdentity(root, inputCwd)) return null;
+  const owner = recoveryAttachment(root);
+  const binding = canonicalJson({
+    repository: recoveryBoundary(root, root), attachment: owner,
+    routing: recoveryRouting({ root, session: routing.context, input }, owner),
+    targets: inspectedTargets.targets.map((target) => ({
+      lexical: target.lexical, canonical: target.canonical, unsafe: target.unsafe,
+      ancestors: [...(target.ancestorIdentities ?? [])].sort(),
+    })),
+  });
+  requireAttachmentSnapshot(root, snapshot);
+  return { root, snapshot, binding };
 }
 
 function readSessionMarker(context, input) {
@@ -1684,13 +1828,13 @@ function ensureSessionMarker(context, input) {
   }
 }
 
-function readSessionLocator(input, repairMarker = true) {
+function readSessionLocator(input, repairMarker = true, inspectMissingMarker = false) {
   const context = sessionLocatorContext(input);
   if (context === null) return { context: null, exists: false, locator: null };
   const marker = readSessionMarker(context, input);
   assertSafeStatePath(context.storageRoot, context.directoryPath);
   assertSafeStatePath(context.storageRoot, context.filePath);
-  if (existsSync(context.filePath) && marker === null) {
+  if (existsSync(context.filePath) && marker === null && !inspectMissingMarker) {
     if (repairMarker) ensureSessionMarker(context, input);
     throw new Error("session repository binding marker is missing");
   }
@@ -1736,7 +1880,8 @@ function preflightSessionLocatorLocality(input) {
   }
 }
 
-function bindSessionLocator(input, cwd) {
+function bindSessionLocator(input, cwd, journalGuard) {
+  journalGuard(cwd);
   const context = sessionLocatorContext(input);
   if (context === null) {
     const inputCwd = input?.cwd ?? cwd;
@@ -1772,6 +1917,7 @@ function bindSessionLocator(input, cwd) {
     const existing = readSessionLocator(input).locator;
     if (!existing) throw new Error("session repository locator disappeared during claim");
     if (existing.status === "released") {
+      journalGuard(existing.repositoryRoot);
       const snapshot = readAttachmentSnapshot(existing.repositoryRoot);
       if (attachedRecord(existing.repositoryRoot, input, existing.generation, snapshot)) {
         removeAttachmentSnapshot(existing.repositoryRoot, snapshot);
@@ -1795,7 +1941,8 @@ function bindSessionLocator(input, cwd) {
   }
 }
 
-function updateSessionLocatorStatus(input, expectedCwd, generation, status, durable = false) {
+function updateSessionLocatorStatus(input, expectedCwd, generation, status, journalGuard, durable = false) {
+  journalGuard(expectedCwd);
   const result = readSessionLocator(input);
   if (result.context === null) return;
   if (
@@ -1817,23 +1964,26 @@ function updateSessionLocatorStatus(input, expectedCwd, generation, status, dura
     status,
     updatedAt: new Date().toISOString(),
   };
+  journalGuard(expectedCwd);
   if (durable) {
     durableWriteBytes(result.context.storageRoot, result.context.filePath,
-      Buffer.from(`${JSON.stringify(updated, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES);
+      Buffer.from(`${JSON.stringify(updated, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES, false, null,
+      () => journalGuard(expectedCwd));
   } else atomicWriteJson(result.context.storageRoot, result.context.filePath, updated);
 }
 
-function bestEffortReleaseSessionLocator(input, expectedCwd, generation) {
+function bestEffortReleaseSessionLocator(input, expectedCwd, generation, journalGuard) {
   try {
-    updateSessionLocatorStatus(input, expectedCwd, generation, "released");
+    updateSessionLocatorStatus(input, expectedCwd, generation, "released", journalGuard);
   } catch {
     // A stale locator has no authority without the matching repository attachment.
   }
 }
 
-function attachedSessionRoot(input) {
-  const result = readSessionLocator(input);
+function attachedSessionRoot(input, journalGuard) {
+  const result = readSessionLocator(input, false);
   if (!result.exists) return null;
+  journalGuard(result.locator.repositoryRoot);
   const snapshot = readAttachmentSnapshot(result.locator.repositoryRoot);
   const attachment = attachedRecord(
     result.locator.repositoryRoot,
@@ -1856,6 +2006,7 @@ function attachedSessionRoot(input) {
       result.locator.repositoryRoot,
       result.locator.generation,
       "active",
+      journalGuard,
     );
   }
   if (result.locator.status === "active" && attachment.status !== "active") {
@@ -2051,7 +2202,7 @@ function pathsShareFilesystemIdentity(left, right) {
     leftRoot.selfIdentity === rightRoot.selfIdentity;
 }
 
-function resolveHookCwd(input, targets, fallbackCwd) {
+function resolveHookCwd(input, targets, fallbackCwd, journalGuard) {
   const { roots: targetRoots, hasUnqualifiedTarget } = protectedTargetRouting(targets);
   if (hasUnqualifiedTarget) {
     throw new Error("protected edit target is not fully qualified");
@@ -2062,7 +2213,7 @@ function resolveHookCwd(input, targets, fallbackCwd) {
   if (targetRoots.length === 1) {
     return targetRoots[0];
   }
-  return attachedSessionRoot(input) ?? fallbackCwd;
+  return attachedSessionRoot(input, journalGuard) ?? fallbackCwd;
 }
 
 function pathWithin(candidatePath, rootPath) {
@@ -2330,8 +2481,10 @@ function toolTouchesWorkflowConfig(inspectedTargets, cwd) {
   );
 }
 
-function promoteAttachment(cwd, input, routeGeneration) {
-  const attachment = attachedRecord(cwd, input, routeGeneration);
+function promoteAttachment(cwd, input, routeGeneration, journalGuard) {
+  journalGuard(cwd);
+  const snapshot = readAttachmentSnapshot(cwd);
+  const attachment = attachedRecord(cwd, input, routeGeneration, snapshot);
   if (attachment === null) throw new Error("session attachment cannot be promoted");
   if (attachment.status === "active") return attachment;
   const promoted = {
@@ -2339,25 +2492,28 @@ function promoteAttachment(cwd, input, routeGeneration) {
     status: "active",
     updatedAt: new Date().toISOString(),
   };
+  journalGuard(cwd);
+  requireAttachmentSnapshot(cwd, snapshot);
   atomicWriteJson(cwd, attachmentPath(cwd), promoted);
   return promoted;
 }
 
-function promoteSessionClaim(cwd, input, routeGeneration) {
-  promoteAttachment(cwd, input, routeGeneration);
+function promoteSessionClaim(cwd, input, routeGeneration, journalGuard) {
+  promoteAttachment(cwd, input, routeGeneration, journalGuard);
   if (routeGeneration !== null) {
-    updateSessionLocatorStatus(input, cwd, routeGeneration, "active");
+    updateSessionLocatorStatus(input, cwd, routeGeneration, "active", journalGuard);
   }
 }
 
-function claimSession(cwd, input, promote = false) {
+function claimSession(cwd, input, promote = false, journalGuard) {
+  journalGuard(cwd);
   const hash = sessionHash(input);
   if (hash === null) return { claimed: false, conflict: false };
   const filePath = attachmentPath(cwd);
   if (readAttachment(cwd)?.status === "checkpointed") {
     return { claimed: false, conflict: true, checkpointed: true };
   }
-  const locatorClaim = bindSessionLocator(input, cwd);
+  const locatorClaim = bindSessionLocator(input, cwd, journalGuard);
   if (locatorClaim.conflict) {
     return { claimed: false, conflict: true, routingConflict: true };
   }
@@ -2366,7 +2522,7 @@ function claimSession(cwd, input, promote = false) {
     ensureSafeDirectory(cwd, path.dirname(filePath));
   } catch (error) {
     if (locatorClaim.created) {
-      bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation);
+      bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation, journalGuard);
     }
     throw error;
   }
@@ -2382,6 +2538,7 @@ function claimSession(cwd, input, promote = false) {
   };
   let attachmentCreated = false;
   try {
+    journalGuard(cwd);
     writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, {
       encoding: "utf8",
       mode: 0o600,
@@ -2391,7 +2548,7 @@ function claimSession(cwd, input, promote = false) {
   } catch (error) {
     if (error?.code !== "EEXIST") {
       if (locatorClaim.created) {
-        bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation);
+        bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation, journalGuard);
       }
       throw error;
     }
@@ -2414,18 +2571,21 @@ function claimSession(cwd, input, promote = false) {
       };
       let migrationWritten = false;
       try {
+        journalGuard(cwd);
+        requireAttachmentSnapshot(cwd, existingSnapshot);
         atomicWriteJson(cwd, filePath, migrated);
         migrationWritten = true;
-        updateSessionLocatorStatus(input, cwd, record.routeGeneration, migrated.status);
-        if (promote) promoteSessionClaim(cwd, input, record.routeGeneration);
+        updateSessionLocatorStatus(input, cwd, record.routeGeneration, migrated.status, journalGuard);
+        if (promote) promoteSessionClaim(cwd, input, record.routeGeneration, journalGuard);
       } catch (migrationError) {
         try {
           if (migrationWritten) {
+            journalGuard(cwd);
             atomicWriteJson(cwd, filePath, JSON.parse(existingSnapshot.bytes.toString("utf8")));
           }
         } finally {
           if (locatorClaim.created) {
-            bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation);
+            bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation, journalGuard);
           }
         }
         throw migrationError;
@@ -2437,18 +2597,21 @@ function claimSession(cwd, input, promote = false) {
       existing.routeGeneration !== record.routeGeneration
     ) {
       if (locatorClaim.created) {
-        bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation);
+        bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation, journalGuard);
       }
       return { claimed: false, conflict: true };
     }
   }
   try {
-    if (promote) promoteSessionClaim(cwd, input, record.routeGeneration);
+    if (promote) promoteSessionClaim(cwd, input, record.routeGeneration, journalGuard);
     return { claimed: true, conflict: false };
   } catch (error) {
-    if (attachmentCreated) removeStateFile(cwd, filePath);
+    if (attachmentCreated) {
+      journalGuard(cwd);
+      removeStateFile(cwd, filePath);
+    }
     if (locatorClaim.created) {
-      bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation);
+      bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation, journalGuard);
     }
     throw error;
   }
@@ -2459,7 +2622,8 @@ function removeStateFile(cwd, filePath) {
   rmSync(filePath, { force: true });
 }
 
-function detachSession(cwd, input, snapshot = readAttachmentSnapshot(cwd)) {
+function detachSession(cwd, input, snapshot = readAttachmentSnapshot(cwd), journalGuard) {
+  journalGuard(cwd);
   const attachment = attachedRecord(cwd, input, undefined, snapshot);
   if (attachment === null) return false;
   requireAttachmentSnapshot(cwd, snapshot);
@@ -2469,29 +2633,17 @@ function detachSession(cwd, input, snapshot = readAttachmentSnapshot(cwd)) {
       cwd,
       attachment.routeGeneration,
       "released",
+      journalGuard,
     );
   }
+  journalGuard(cwd);
   removeAttachmentSnapshot(cwd, snapshot);
   return true;
 }
 
-function appendLedger(cwd, input, event, detail = {}) {
+function appendLedger(cwd, input, event, detail = {}, journalGuard) {
   try {
-    const directory = path.join(stateDirectory(cwd), "runs");
-    ensureSafeDirectory(cwd, directory);
-    const record = {
-      schemaVersion: 1,
-      at: new Date().toISOString(),
-      event,
-      session: sessionHash(input) ?? sha256("unknown-session"),
-      ...detail,
-    };
-    const filePath = path.join(directory, `${record.session}.jsonl`);
-    assertSafeStatePath(cwd, filePath);
-    appendFileSync(filePath, `${JSON.stringify(record)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
+    appendJournalRecord(cwd, sessionHash(input) ?? sha256("unknown-session"), event, detail, journalGuard);
     return true;
   } catch {
     return false;
@@ -2593,28 +2745,66 @@ function parseRunLedgerBytes(bytes, expectedSession) {
   return records;
 }
 
-function readSessionLedger(cwd, hash, flush = false) {
+function readSessionLedger(cwd, hash, journalGuard, flush = false) {
+  journalGuard(cwd);
   const filePath = path.join(stateDirectory(cwd), "runs", `${hash}.jsonl`);
   assertSafeStatePath(cwd, filePath);
   if (!existsSync(filePath)) return { bytes: Buffer.alloc(0), records: [], exists: false };
   const snapshot = readBoundedStateBytes(cwd, filePath, RUN_LEDGER_MAX_FILE_BYTES, flush);
+  journalGuard(cwd);
   return { ...snapshot, records: parseRunLedgerBytes(snapshot.bytes, hash), exists: true };
 }
 
-function appendDurableLedger(cwd, input, event, detail, beforePublish = null) {
-  const hash = sessionHash(input);
-  if (hash === null) throw new Error("durable ledger requires a session identity");
-  const snapshot = readSessionLedger(cwd, hash);
+function requireJournalAdmission(cwd, hash, bytes, journalGuard) {
+  journalGuard(cwd);
+  const directory = path.join(stateDirectory(cwd), "runs");
+  assertSafeStatePath(cwd, directory);
+  const names = existsSync(directory) ? readdirSync(directory).sort() : [];
+  if (names.some((name) => !RUN_LEDGER_FILE_PATTERN.test(name))) throw runLedgerFailure("run-ledger-invalid");
+  const fileName = `${hash}.jsonl`;
+  if (names.length + (names.includes(fileName) ? 0 : 1) > RUN_LEDGER_MAX_FILES) {
+    throw runLedgerFailure("run-ledger-limit-exceeded");
+  }
+  let aggregateBytes = bytes.length;
+  for (const name of names) {
+    if (name === fileName) continue;
+    journalGuard(cwd);
+    const snapshot = readBoundedStateBytes(cwd, path.join(directory, name), RUN_LEDGER_MAX_FILE_BYTES);
+    aggregateBytes += snapshot.bytes.length;
+    if (aggregateBytes > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
+  }
+  if (aggregateBytes > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
+}
+
+function appendJournalRecord(cwd, hash, event, detail, journalGuard, beforePublish = null) {
+  const snapshot = readSessionLedger(cwd, hash, journalGuard);
   const record = { schemaVersion: 1, at: new Date().toISOString(), event, session: hash, ...detail };
   requireRunLedgerRecord(record, hash);
   const suffix = Buffer.from(`${JSON.stringify(record)}\n`);
   const bytes = Buffer.concat([snapshot.bytes, suffix]);
   parseRunLedgerBytes(bytes, hash);
+  requireJournalAdmission(cwd, hash, bytes, journalGuard);
   durableWriteBytes(
     cwd, path.join(stateDirectory(cwd), "runs", `${hash}.jsonl`),
-    bytes, RUN_LEDGER_MAX_FILE_BYTES, false, suffix, beforePublish,
+    bytes, RUN_LEDGER_MAX_FILE_BYTES, false, suffix, () => {
+      const current = readSessionLedger(cwd, hash, journalGuard);
+      if (current.exists !== snapshot.exists || !current.bytes.equals(snapshot.bytes) ||
+        (snapshot.exists && !sameRunLedgerStats(snapshot.stats, current.stats))) {
+        throw runLedgerFailure("run-ledger-changed-during-read");
+      }
+      if (beforePublish !== null) beforePublish();
+      journalGuard(cwd);
+    },
   );
+  journalGuard(cwd);
+  if (beforePublish !== null) beforePublish();
   return record;
+}
+
+function appendDurableLedger(cwd, input, event, detail, journalGuard, beforePublish = null) {
+  const hash = sessionHash(input);
+  if (hash === null) throw new Error("durable ledger requires a session identity");
+  return appendJournalRecord(cwd, hash, event, detail, journalGuard, beforePublish);
 }
 
 function boundedToolName(input) {
@@ -2637,36 +2827,199 @@ function sameClaim(record, attachment) {
     record.claimGeneration === attachment.claimGeneration && record.routeGeneration === attachment.routeGeneration;
 }
 
-function recordToolStart(cwd, input) {
-  const snapshot = readAttachmentSnapshot(cwd);
-  const attachment = attachedRecord(cwd, input, undefined, snapshot);
-  if (attachment === null) return;
-  appendDurableLedger(cwd, input, "tool_started", {
-    toolName: boundedToolName(input),
-    operationId: randomUUID(),
-    invocationHash: invocationHash(input),
-    routeGeneration: attachment.routeGeneration,
-    claimGeneration: attachment.claimGeneration,
-  }, () => requireAttachmentSnapshot(cwd, snapshot));
+function normalizedToolRequestHash(input) {
+  try {
+    const names = [input?.tool_name, input?.toolName].filter((name) => name !== undefined);
+    if (names.length === 0 || names.some((name) =>
+      typeof name !== "string" || !/^[A-Za-z][A-Za-z0-9_.:/-]{0,127}$/.test(name) ||
+      name.toLowerCase() !== names[0].toLowerCase())) return null;
+    const argumentsValues = [input?.tool_input, input?.toolArgs, input?.toolInput]
+      .filter((value) => value !== undefined);
+    if (argumentsValues.length === 0) return null;
+    const argumentsJson = argumentsValues.map((value) => canonicalJson(parseWorkflowJson(
+      Buffer.from(JSON.stringify(value, (_key, item) => {
+        if (["undefined", "function", "symbol", "bigint"].includes(typeof item) ||
+          (typeof item === "number" && !Number.isFinite(item))) throw new Error("invalid tool arguments");
+        return item;
+      })),
+    )));
+    if (argumentsJson.some((value) => value !== argumentsJson[0])) return null;
+    return sha256(`supervised-worker-tool-request-v1\0${canonicalJson({
+      toolName: names[0].toLowerCase(), arguments: parseWorkflowJson(Buffer.from(argumentsJson[0])),
+    })}`);
+  } catch {
+    return null;
+  }
 }
 
-function recordToolCompletion(cwd, input, success) {
+function toolOwnershipHash(cwd, input, snapshot) {
+  const attachment = attachedRecord(cwd, input, undefined, snapshot);
+  if (attachment === null) throw new Error("tool observation requires current ownership");
+  const routing = readSessionLocator(input, false);
+  if (routing.exists ? routing.locator.status !== attachment.status ||
+    routing.locator.generation !== attachment.routeGeneration ||
+    !pathEquals(routing.locator.repositoryRoot, cwd) : attachment.routeGeneration !== null) {
+    throw new Error("tool observation routing does not match its attachment");
+  }
+  return sha256(`supervised-worker-tool-ownership-v1\0${canonicalJson({
+    repository: recoveryBoundary(cwd, cwd), routing, attachmentHash: snapshot.hash,
+  })}`);
+}
+
+function captureToolAttempt(cwd, input, journalGuard) {
+  journalGuard(cwd);
+  const snapshot = readAttachmentSnapshot(cwd);
+  const attachment = attachedRecord(cwd, input, undefined, snapshot);
+  if (attachment === null) return null;
+  const ownershipHash = toolOwnershipHash(cwd, input, snapshot);
+  const requireOwner = () => {
+    journalGuard(cwd);
+    requireAttachmentSnapshot(cwd, snapshot);
+    if (toolOwnershipHash(cwd, input, snapshot) !== ownershipHash) {
+      throw new Error("tool observation ownership changed");
+    }
+  };
+  let planHash = null;
+  if (attachment.status === "active") {
+    try {
+      planHash = canonicalPlanHash(requireActivePlan(cwd, null));
+    } catch {
+      planHash = null;
+    }
+  }
+  requireOwner();
+  return {
+    snapshot, attachment, ownershipHash, planHash, requireOwner,
+    toolName: boundedToolName(input), operationId: randomUUID(),
+    invocationHash: invocationHash(input), requestHash: normalizedToolRequestHash(input),
+  };
+}
+
+function requireDeniedSource(records, sourceOperationId) {
+  const denials = records.filter((record) => record.event === "tool_denied" && record.operationId === sourceOperationId);
+  const source = denials[0];
+  if (denials.length !== 1 || source.retryOf !== null || !digest(source.invocationHash) ||
+    !digest(source.requestHash) || !digest(source.planHash)) {
+    throw new Error("denied retry requires a unique hook-recorded denial");
+  }
+  const roots = records.filter((record) => record.event === "tool_denied" &&
+    record.requestHash === source.requestHash && record.retryOf === null);
+  const starts = records.filter((record) => record.event === "tool_started" &&
+    (record.operationId === source.operationId || record.invocationHash === source.invocationHash));
+  if (roots.length !== 1 || starts.length > 1 || starts.some((record) =>
+    record.operationId !== source.operationId || record.invocationHash !== source.invocationHash ||
+    record.requestHash !== source.requestHash || record.session !== source.session ||
+    record.routeGeneration !== source.routeGeneration || record.claimGeneration !== source.claimGeneration) ||
+    records.some((record) => record.event === "tool_completed" &&
+      (record.operationId === source.operationId || record.invocationHash === source.invocationHash)) ||
+    records.some((record) => record.event === "tool_denied" &&
+      (record.retryOf === source.operationId ||
+        (record.invocationHash === source.invocationHash && record.operationId !== source.operationId)))) {
+    throw new Error("denied retry evidence is ambiguous or its circuit is open");
+  }
+  return source;
+}
+
+function recordToolDenial(cwd, input, attempt, journalGuard) {
+  if (attempt === null) throw new Error("denial ownership was not confirmed");
+  attempt.requireOwner();
+  const records = readSessionLedger(cwd, attempt.attachment.sessionHash, journalGuard).records;
+  const roots = attempt.requestHash === null ? [] : records.filter((record) =>
+    record.event === "tool_denied" && record.requestHash === attempt.requestHash && record.retryOf === null);
+  return appendDurableLedger(cwd, input, "tool_denied", {
+    toolName: attempt.toolName, operationId: attempt.operationId, observationId: randomUUID(),
+    invocationHash: attempt.invocationHash, requestHash: attempt.requestHash,
+    planHash: attempt.planHash, attachmentHash: attempt.snapshot.hash, ownershipHash: attempt.ownershipHash,
+    routeGeneration: attempt.attachment.routeGeneration, claimGeneration: attempt.attachment.claimGeneration,
+    retryOf: roots.length === 1 ? roots[0].operationId : null, outcome: "not-executed",
+  }, journalGuard, () => {
+    attempt.requireOwner();
+    if (attempt.planHash !== null) requireActivePlan(cwd, attempt.planHash);
+  });
+}
+
+function deniedToolOutput(cwd, input, attempt, reason, journalGuard) {
+  let detail;
+  try {
+    const denial = recordToolDenial(cwd, input, attempt, journalGuard);
+    detail = `The tool did not execute; its denial was durably recorded as operation ${denial.operationId}. No automatic retry is authorized.`;
+  } catch {
+    detail = "The tool did not execute. Denial journaling is unconfirmed; no retry permit is available.";
+  }
+  return preToolDecision(input, "deny", `${reason} ${detail}`);
+}
+
+function recordToolStart(cwd, input, journalGuard, attempt) {
+  if (attempt === null) return;
+  attempt.requireOwner();
+  const records = readSessionLedger(cwd, attempt.attachment.sessionHash, journalGuard).records;
+  if (attempt.requestHash === null && records.some((record) => record.event === "tool_denied" &&
+    record.toolName.toLowerCase() === attempt.toolName.toLowerCase())) {
+    throw new Error("denied retry requires unambiguous complete tool arguments");
+  }
+  const denials = attempt.requestHash === null ? [] : records.filter((record) =>
+    record.event === "tool_denied" && record.requestHash === attempt.requestHash);
+  const requireAdmission = () => {
+    attempt.requireOwner();
+    if (denials.length > 0) requireActivePlan(cwd, attempt.planHash);
+  };
+  if (denials.length > 0) {
+    const roots = denials.filter((record) => record.retryOf === null);
+    if (roots.length !== 1) throw new Error("denied retry root is ambiguous");
+    const source = requireDeniedSource(records, roots[0].operationId);
+    const reservations = records.filter((record) => record.event === "denied_retry_reserved" &&
+      (record.sourceOperationId === source.operationId || record.requestHash === source.requestHash));
+    const reservation = reservations[0];
+    if (reservations.length !== 1 || !digest(attempt.invocationHash) ||
+      !sameClaim(source, attempt.attachment) || source.planHash !== attempt.planHash ||
+      source.attachmentHash !== attempt.snapshot.hash || source.ownershipHash !== attempt.ownershipHash ||
+      reservation.sourceOperationId !== source.operationId || !sameClaim(reservation, attempt.attachment) ||
+      ["requestHash", "planHash", "attachmentHash", "ownershipHash"].some((key) => reservation[key] !== source[key]) ||
+      records.some((record) => record.event === "denied_retry_consumed" &&
+        (record.sourceOperationId === source.operationId || record.reservationId === reservation.reservationId ||
+          record.requestHash === source.requestHash)) ||
+      records.some((record) => record.invocationHash === attempt.invocationHash)) {
+      throw new Error("denied retry has no unspent matching reservation");
+    }
+    requireAdmission();
+    appendDurableLedger(cwd, input, "denied_retry_consumed", {
+      sourceOperationId: source.operationId, reservationId: reservation.reservationId,
+      requestHash: source.requestHash, planHash: source.planHash,
+      attachmentHash: source.attachmentHash, ownershipHash: source.ownershipHash,
+      routeGeneration: source.routeGeneration, claimGeneration: source.claimGeneration, attempt: 1,
+      operationId: attempt.operationId, invocationHash: attempt.invocationHash,
+    }, journalGuard, requireAdmission);
+  }
+  appendDurableLedger(cwd, input, "tool_started", {
+    toolName: attempt.toolName, operationId: attempt.operationId,
+    invocationHash: attempt.invocationHash, requestHash: attempt.requestHash,
+    routeGeneration: attempt.attachment.routeGeneration, claimGeneration: attempt.attachment.claimGeneration,
+  }, journalGuard, requireAdmission);
+}
+
+function recordToolCompletion(cwd, input, success, journalGuard) {
   const attachmentSnapshot = readAttachmentSnapshot(cwd);
   const attachment = attachedRecord(cwd, input, undefined, attachmentSnapshot);
   if (attachment === null) return true;
   try {
-    const snapshot = readSessionLedger(cwd, attachment.sessionHash);
+    const snapshot = readSessionLedger(cwd, attachment.sessionHash, journalGuard);
     const hintHash = invocationHash(input);
     const starts = hintHash === null ? [] : snapshot.records.filter((record) =>
       record.event === "tool_started" && record.invocationHash === hintHash);
-    const operationId = starts.length === 1 && sameClaim(starts[0], attachment) ? starts[0].operationId : null;
+    const operationId = starts.length === 1 && sameClaim(starts[0], attachment) &&
+      !snapshot.records.some((record) => record.event === "tool_denied" && record.operationId === starts[0].operationId)
+      ? starts[0].operationId : null;
     if (operationId !== null && snapshot.records.some((record) =>
       record.event === "tool_completed" && record.operationId === operationId &&
-      record.invocationHash === hintHash && sameClaim(record, attachment))) return true;
+      record.invocationHash === hintHash && sameClaim(record, attachment))) {
+      journalGuard(cwd);
+      requireAttachmentSnapshot(cwd, attachmentSnapshot);
+      return true;
+    }
     appendDurableLedger(cwd, input, "tool_completed", {
       toolName: boundedToolName(input), success, observationId: randomUUID(), operationId,
       invocationHash: hintHash, routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration,
-    }, () => requireAttachmentSnapshot(cwd, attachmentSnapshot));
+    }, journalGuard, () => requireAttachmentSnapshot(cwd, attachmentSnapshot));
     return true;
   } catch {
     return false;
@@ -2781,15 +3134,40 @@ function checkpointFailure(reason) {
 }
 
 function requireSessionRequest(request, operation) {
-  const binding = operation === "checkpoint" ? "attachmentHash" : "checkpointHash";
+  if (operation === "observe-handoff") {
+    const required = ["session_id", "tool_use_id", "retryOf"];
+    const allowed = [...required, "transcript_path"];
+    try {
+      if (!request || typeof request !== "object" || Array.isArray(request) ||
+        Object.keys(request).some((key) => !allowed.includes(key)) ||
+        !required.every((key) => Object.hasOwn(request, key)) ||
+        Buffer.byteLength(JSON.stringify(request)) > MAX_OBSERVATION_REQUEST_BYTES ||
+        !nonEmptyString(request.session_id) || Buffer.byteLength(request.session_id) > 256 ||
+        /[\x00-\x1f\x7f]/.test(request.session_id) || sessionHash(request) === null ||
+        invocationHash(request) === null || !generation(request.retryOf) ||
+        (Object.hasOwn(request, "transcript_path") &&
+          (typeof request.transcript_path !== "string" || Buffer.byteLength(request.transcript_path) > 4_096))) {
+        throw new Error();
+      }
+    } catch {
+      checkpointFailure("observe-handoff request is invalid or exceeds the bounded JSON limit");
+    }
+    return;
+  }
+  const deniedRetry = operation === "retry-denied";
+  const binding = operation === "checkpoint" || deniedRetry ? "attachmentHash" : "checkpointHash";
+  const required = ["session_id", "planHash", binding, ...(deniedRetry ? ["sourceOperationId"] : [])];
+  const allowed = [...required, "transcript_path"];
   try {
-    if (Buffer.byteLength(JSON.stringify(request)) > MAX_CHECKPOINT_REQUEST_BYTES) throw new Error();
+    if (Buffer.byteLength(JSON.stringify(request)) >
+      (deniedRetry ? MAX_OBSERVATION_REQUEST_BYTES : MAX_CHECKPOINT_REQUEST_BYTES)) throw new Error();
     if (!request || typeof request !== "object" || Array.isArray(request) ||
-      Object.keys(request).some((key) => !["session_id", "transcript_path", "planHash", binding].includes(key)) ||
-      !["session_id", "planHash", binding].every((key) => Object.hasOwn(request, key)) ||
+      Object.keys(request).some((key) => !allowed.includes(key)) ||
+      !required.every((key) => Object.hasOwn(request, key)) ||
       !nonEmptyString(request.session_id) || Buffer.byteLength(request.session_id) > 256 ||
       /[\x00-\x1f\x7f]/.test(request.session_id) || sessionHash(request) === null ||
       !digest(request.planHash) || !(digest(request[binding]) || (operation === "resume" && request[binding] === null)) ||
+      (deniedRetry && !uuid(request.sourceOperationId)) ||
       (Object.hasOwn(request, "transcript_path") &&
         (typeof request.transcript_path !== "string" || Buffer.byteLength(request.transcript_path) > 4_096))) throw new Error();
   } catch {
@@ -2801,10 +3179,12 @@ function withSessionLifecycle(cwd, request, operation, action) {
   requireSessionRequest(request, operation);
   let sessionLock = null;
   let repositoryLocks = [];
+  let journalLocks = [];
   let root = null;
   let input = null;
   let context = null;
-  const heldLocks = () => [...repositoryLocks].reverse().concat(sessionLock);
+  let preserveJournal = false;
+  const heldLocks = () => (preserveJournal ? [] : [...journalLocks].reverse()).concat([...repositoryLocks].reverse(), sessionLock);
   const releaseContext = createLifecycleReleaseContext(() => ({ roots: [root], input, session: context }), heldLocks);
   const guardedAction = () => {
     if (process.platform === "win32") resetWindowsPathChecks();
@@ -2813,6 +3193,7 @@ function withSessionLifecycle(cwd, request, operation, action) {
       checkpointFailure(`${operation} requires a canonical local repository cwd`);
     }
     root = realpathSync(cwd);
+    const rootBoundary = canonicalJson(recoveryBoundary(root, root));
     input = { ...request, cwd: root };
     preflightSessionLocatorLocality(input);
     context = sessionLocatorContext(input);
@@ -2830,24 +3211,179 @@ function withSessionLifecycle(cwd, request, operation, action) {
       checkpointFailure(`${operation} session routing conflicts with the process cwd`);
     }
     windowsPathChecksMaySpawn = false;
-    repositoryLocks = acquireRepositoryLocks([root], releaseContext);
+    repositoryLocks = ["observe-handoff", "retry-denied"].includes(operation) ? [] : acquireRepositoryLocks([root], releaseContext);
+    journalLocks = acquireJournalLocks([root], releaseContext);
+    const journalGuard = createJournalGuard(journalLocks, [sessionLock, ...repositoryLocks]);
     const requireGuards = () => {
-      for (const lock of [sessionLock, ...repositoryLocks].filter((value) => value !== null)) {
-        if (!lifecycleLockIdentityMatches(lock) || !lifecycleLockOwnerIdentityMatches(lock)) {
-          throw new LifecycleError([lifecycleDiagnostic("LIFECYCLE_IDENTITY_REJECTED", lock.scope, "guard", "ownership-validation", {
-            token: lock.token, processId: process.pid,
-          })]);
-        }
+      journalGuard(root);
+      if (canonicalJson(recoveryBoundary(root, root)) !== rootBoundary) {
+        checkpointFailure(`${operation} repository identity changed while acquiring guards`);
       }
     };
     requireGuards();
-    return action(root, input, routing, requireGuards);
+    const currentRouting = readSessionLocator(input, false);
+    if (canonicalJson(currentRouting) !== canonicalJson(routing)) {
+      checkpointFailure(`${operation} session routing changed while acquiring guards`);
+    }
+    return action(root, input, currentRouting, requireGuards, journalGuard, () => {
+      preserveJournal = true;
+      for (const lock of journalLocks) closeSync(lock.ownerFd);
+    });
   };
   try {
     return withLifecycleCleanup(guardedAction, heldLocks, releaseContext);
   } catch (error) {
     if (error instanceof LifecycleError || error?.checkpointReason) throw error;
     throw new Error(`${operation} could not confirm its local lifecycle state; inspect status, ledger integrity, and ownership before retrying`, { cause: error });
+  }
+}
+
+export function requestDeniedToolRetry(cwd, request) {
+  try {
+    return withSessionLifecycle(cwd, request, "retry-denied", (root, input, _routing, requireGuards, journalGuard) => {
+      const snapshot = readAttachmentSnapshot(root);
+      const attachment = attachedRecord(root, input, undefined, snapshot);
+      if (attachment?.status !== "active" || snapshot.hash !== request.attachmentHash) {
+        throw new Error("denied retry requires the actual active attachment");
+      }
+      const records = readSessionLedger(root, attachment.sessionHash, journalGuard).records;
+      const source = requireDeniedSource(records, request.sourceOperationId);
+      const requireBinding = () => {
+        requireGuards();
+        requireAttachmentSnapshot(root, snapshot);
+        if (!sameClaim(source, attachment) || source.planHash !== request.planHash ||
+          source.attachmentHash !== snapshot.hash || source.ownershipHash !== toolOwnershipHash(root, input, snapshot)) {
+          throw new Error("denied retry ownership no longer matches its denial");
+        }
+        requireActivePlan(root, request.planHash);
+      };
+      requireBinding();
+      if (records.some((record) => ["denied_retry_reserved", "denied_retry_consumed"].includes(record.event) &&
+        (record.sourceOperationId === source.operationId || record.requestHash === source.requestHash))) {
+        throw new Error("denied retry was already reserved or consumed");
+      }
+      const reservation = appendDurableLedger(root, input, "denied_retry_reserved", {
+        sourceOperationId: source.operationId, reservationId: randomUUID(),
+        requestHash: source.requestHash, planHash: source.planHash,
+        attachmentHash: source.attachmentHash, ownershipHash: source.ownershipHash,
+        routeGeneration: source.routeGeneration, claimGeneration: source.claimGeneration, attempt: 1,
+      }, journalGuard, requireBinding);
+      return {
+        status: "reserved", sourceOperationId: source.operationId,
+        reservationId: reservation.reservationId, requestHash: source.requestHash,
+      };
+    });
+  } catch {
+    return {
+      status: "denied", permit: null,
+      reason: "Denial evidence, unchanged ownership, or lifecycle cleanup could not be durably confirmed. No retry permit is available.",
+    };
+  }
+}
+
+export function observeHandoffValidation(cwd, filePath, request) {
+  let attempt = null;
+  let outcome = "not-evaluated";
+  try {
+    if (typeof filePath !== "string" || filePath.length === 0 || Buffer.byteLength(filePath) > 4_096 ||
+      /[\x00-\x1f\x7f]/.test(filePath)) throw new Error("helper artifact parameter is invalid");
+    return withSessionLifecycle(cwd, request, "observe-handoff", (root, input, _routing, requireGuards, journalGuard, preserveJournal) => {
+      const attachmentSnapshot = readAttachmentSnapshot(root);
+      const attachment = attachedRecord(root, input, undefined, attachmentSnapshot);
+      if (attachment?.status !== "active") throw new Error("helper requires the current active owner");
+      const records = readSessionLedger(root, attachment.sessionHash, journalGuard).records;
+      const hint = invocationHash(input);
+      const parents = records.filter((record) => record.event === "tool_started" && record.invocationHash === hint);
+      const parent = parents[0];
+      if (parents.length !== 1 || !sameClaim(parent, attachment) || !digest(parent.requestHash) ||
+        records.some((record) => ["tool_completed", "tool_denied"].includes(record.event) &&
+          (record.operationId === parent.operationId || record.invocationHash === hint)) ||
+        records.some((record) => record.event === "helper_attempt_reserved" && record.parentOperationId === parent.operationId)) {
+        throw new Error("helper requires a unique, current, uncompleted hook start");
+      }
+      const captured = captureHandoffValidation(root, filePath);
+      if (records.some((record) => record.event === "helper_circuit_open" &&
+        record.namespaceHash === captured.namespaceHash)) throw new Error("helper retry circuit is open");
+      const planHash = canonicalPlanHash(requireActivePlan(root, null));
+      const planBytesHash = sha256(readBoundedStateBytes(root, planPath(root), MAX_PLAN_BYTES).bytes);
+      const ownershipHash = toolOwnershipHash(root, input, attachmentSnapshot);
+      const roots = records.filter((record) => record.event === "helper_attempt_reserved" &&
+        record.namespaceHash === captured.namespaceHash && record.attempt === 0);
+      let source = null;
+      if (request.retryOf === null) {
+        if (roots.length !== 0 || records.some((record) => record.helperId === HANDOFF_HELPER_ID &&
+          record.namespaceHash === captured.namespaceHash)) throw new Error("helper retry group already exists");
+      } else {
+        source = roots[0];
+        if (roots.length !== 1 || source.operationId !== request.retryOf || source.retryRoot !== source.operationId ||
+          !sameClaim(source, attachment) || source.parentOperationId === parent.operationId ||
+          source.invocationHash === hint || source.planHash !== planHash || source.planBytesHash !== planBytesHash ||
+          source.attachmentHash !== attachmentSnapshot.hash || source.ownershipHash !== ownershipHash ||
+          ["parametersHash", "inputHash", "implementationHash"].some((key) => source[key] !== captured[key]) ||
+          records.some((record) => record.event === "helper_attempt_reserved" &&
+            record.namespaceHash === captured.namespaceHash && record.attempt !== 0) ||
+          records.filter((record) => record.event === "helper_result" && record.operationId === source.operationId).length > 1) {
+          throw new Error("helper retry evidence changed, is ambiguous, or its circuit is open");
+        }
+      }
+      const requireBinding = () => {
+        requireGuards();
+        requireAttachmentSnapshot(root, attachmentSnapshot);
+        requireActivePlan(root, planHash);
+        if (sha256(readBoundedStateBytes(root, planPath(root), MAX_PLAN_BYTES).bytes) !== planBytesHash ||
+          toolOwnershipHash(root, input, attachmentSnapshot) !== ownershipHash) {
+          throw new Error("helper authorization changed before publication");
+        }
+        captured.requireUnchanged();
+      };
+      requireBinding();
+      const operationId = randomUUID();
+      attempt = {
+        helperId: HANDOFF_HELPER_ID, operationId, parentOperationId: parent.operationId,
+        observationId: randomUUID(), invocationHash: hint,
+        retryRoot: source?.operationId ?? operationId, attempt: source === null ? 0 : 1,
+        namespaceHash: captured.namespaceHash, parametersHash: captured.parametersHash,
+        inputHash: captured.inputHash, implementationHash: captured.implementationHash,
+        planHash, planBytesHash, attachmentHash: attachmentSnapshot.hash, ownershipHash,
+        routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration,
+        outcome: "evaluation-pending", delivery: "unconfirmed",
+      };
+      outcome = "reservation-unconfirmed";
+      try {
+        appendDurableLedger(root, input, "helper_attempt_reserved", attempt, journalGuard, requireBinding);
+      } catch (error) {
+        try {
+          appendDurableLedger(root, input, "helper_circuit_open", {
+            ...attempt, observationId: randomUUID(), outcome: "reservation-unconfirmed",
+          }, journalGuard, requireBinding);
+        } catch {
+          preserveJournal();
+        }
+        throw error;
+      }
+      outcome = "evaluation-interrupted";
+      const result = captured.evaluate();
+      outcome = "completion-unconfirmed";
+      const resultOutcome = result.ok ? "validation-passed" : "validation-failed";
+      appendDurableLedger(root, input, "helper_result", {
+        ...attempt, observationId: randomUUID(), outcome: resultOutcome,
+        resultHash: sha256(`supervised-worker-handoff-result-v1\0${canonicalJson(result)}`),
+      }, journalGuard, requireBinding);
+      outcome = "delivery-unconfirmed";
+      return {
+        ok: result.ok, status: "evaluated", operationId, parentOperationId: parent.operationId,
+        retryRoot: attempt.retryRoot, attempt: attempt.attempt, outcome: resultOutcome,
+        delivery: "unconfirmed", result,
+      };
+    });
+  } catch {
+    return {
+      ok: false, status: attempt === null ? "denied" : "unconfirmed",
+      operationId: attempt?.operationId ?? null, parentOperationId: attempt?.parentOperationId ?? null,
+      retryRoot: attempt?.retryRoot ?? null, attempt: attempt?.attempt ?? null, outcome,
+      delivery: "unconfirmed",
+      errors: ["Observed validation could not confirm its inputs, reservation, result publication, or ownership. The parent tool remains independent; Worker inspection is required before further attempts."],
+    };
   }
 }
 
@@ -2864,7 +3400,7 @@ function requireActivePlan(cwd, expectedHash) {
   if (validatePlan(plan).length > 0 || plan.mode !== "active" || plan.completion !== null) {
     checkpointFailure("checkpoint/resume requires a valid active plan with completion null");
   }
-  if (canonicalPlanHash(plan) !== expectedHash) checkpointFailure("checkpoint/resume plan hash is stale");
+  if (expectedHash !== null && canonicalPlanHash(plan) !== expectedHash) checkpointFailure("checkpoint/resume plan hash is stale");
   if (plan.items.length > MAX_CHECKPOINT_ITEMS) checkpointFailure("checkpoint context item limit exceeded; no items were truncated");
   return plan;
 }
@@ -2904,11 +3440,26 @@ function inspectOperations(records, inherited = null) {
     const matchingTerminals = terminals.filter((terminal) => terminal.operationId === start.operationId &&
       terminal.invocationHash === start.invocationHash && terminal.session === start.session &&
       terminal.claimGeneration === start.claimGeneration && terminal.routeGeneration === start.routeGeneration);
-    if (matchingStarts.length === 1 && matchingTerminals.length === 1) continue;
+    const matchingDenials = records.filter((record) => record.event === "tool_denied" &&
+      record.operationId === start.operationId && record.invocationHash === start.invocationHash &&
+      record.session === start.session && record.claimGeneration === start.claimGeneration &&
+      record.routeGeneration === start.routeGeneration && digest(start.requestHash) && record.requestHash === start.requestHash);
+    if (matchingStarts.length === 1 &&
+      ((matchingTerminals.length === 1 && matchingDenials.length === 0) ||
+        (matchingTerminals.length === 0 && matchingDenials.length === 1))) continue;
     orphans.set(start.operationId, {
       operationId: start.operationId, sessionHash: start.session,
       routeGeneration: start.routeGeneration, claimGeneration: start.claimGeneration,
       invocationHash: start.invocationHash, toolName: start.toolName, observationStatus: "outcome-unknown",
+    });
+  }
+  for (const child of records.filter((record) => record.event === "helper_attempt_reserved")) {
+    if (seenOperations.has(child.operationId)) checkpointFailure("ledger contains duplicate operation identities");
+    seenOperations.add(child.operationId);
+    orphans.set(child.operationId, {
+      operationId: child.operationId, sessionHash: child.session,
+      routeGeneration: child.routeGeneration, claimGeneration: child.claimGeneration,
+      invocationHash: child.invocationHash, toolName: HANDOFF_HELPER_ID, observationStatus: "outcome-unknown",
     });
   }
   if (orphans.size > MAX_CHECKPOINT_ORPHANS) checkpointFailure("checkpoint orphan limit exceeded; no operations were truncated");
@@ -2942,10 +3493,10 @@ function readCheckpointReceipt(cwd, hash) {
   return value;
 }
 
-function requireCheckpointLedger(cwd, receipt, hash, flush = true) {
+function requireCheckpointLedger(cwd, receipt, hash, journalGuard, flush = true) {
   let snapshot;
   try {
-    snapshot = readSessionLedger(cwd, receipt.sessionHash, flush);
+    snapshot = readSessionLedger(cwd, receipt.sessionHash, journalGuard, flush);
   } catch {
     checkpointFailure("checkpoint source ledger is corrupt, partial, unsafe, or exceeds its bound");
   }
@@ -2982,7 +3533,7 @@ function checkpointResult(cwd, hash, receipt) {
 }
 
 export function checkpointSession(cwd, request) {
-  return withSessionLifecycle(cwd, request, "checkpoint", (root, input, routing, requireGuards) => {
+  return withSessionLifecycle(cwd, request, "checkpoint", (root, input, routing, requireGuards, journalGuard) => {
     const plan = requireActivePlan(root, request.planHash);
     const snapshot = readAttachmentSnapshot(root);
     if (snapshot === null) checkpointFailure("checkpoint requires the current owning attachment");
@@ -2993,11 +3544,11 @@ export function checkpointSession(cwd, request) {
       if (receipt.attachmentHash !== request.attachmentHash || receipt.planHash !== request.planHash ||
         receipt.sessionHash !== attachment.sessionHash || receipt.routeGeneration !== attachment.routeGeneration ||
         receipt.claimGeneration !== attachment.claimGeneration) checkpointFailure("checkpoint retry does not match the source binding");
-      requireCheckpointLedger(root, receipt, attachment.checkpointHash);
+      requireCheckpointLedger(root, receipt, attachment.checkpointHash, journalGuard);
       requireSourceRoute(attachment, input, routing, true);
       requireGuards();
       requireAttachmentSnapshot(root, snapshot);
-      if (attachment.routeGeneration !== null) updateSessionLocatorStatus(input, root, attachment.routeGeneration, "released", true);
+      if (attachment.routeGeneration !== null) updateSessionLocatorStatus(input, root, attachment.routeGeneration, "released", journalGuard, true);
       return checkpointResult(root, attachment.checkpointHash, receipt);
     }
     if (attachment.status !== "active" || snapshot.hash !== request.attachmentHash) {
@@ -3006,14 +3557,14 @@ export function checkpointSession(cwd, request) {
     requireSourceRoute(attachment, input, routing);
     let ledger;
     try {
-      ledger = readSessionLedger(root, attachment.sessionHash, true);
+      ledger = readSessionLedger(root, attachment.sessionHash, journalGuard, true);
     } catch {
       checkpointFailure("checkpoint source ledger is corrupt, partial, unsafe, or exceeds its bound");
     }
     let inherited = null;
     if (attachment.checkpointHash !== null) {
       const previous = readCheckpointReceipt(root, attachment.checkpointHash);
-      requireCheckpointLedger(root, previous, attachment.checkpointHash);
+      requireCheckpointLedger(root, previous, attachment.checkpointHash, journalGuard);
       inherited = previous.context.operations;
     }
     const receipt = {
@@ -3037,8 +3588,8 @@ export function checkpointSession(cwd, request) {
     appendDurableLedger(root, input, "checkpoint_persisted", {
       checkpointHash: hash, planHash: receipt.planHash, attachmentHash: snapshot.hash,
       routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration,
-    }, requireSource);
-    requireCheckpointLedger(root, receipt, hash);
+    }, journalGuard, requireSource);
+    requireCheckpointLedger(root, receipt, hash, journalGuard);
     requireAttachmentSnapshot(root, snapshot);
     const tombstone = {
       schemaVersion: 3, sessionHash: attachment.sessionHash, status: "checkpointed",
@@ -3047,12 +3598,13 @@ export function checkpointSession(cwd, request) {
     };
     durableWriteBytes(root, attachmentPath(root), Buffer.from(`${JSON.stringify(tombstone, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES, false, null, requireSource);
     requireGuards();
-    if (attachment.routeGeneration !== null) updateSessionLocatorStatus(input, root, attachment.routeGeneration, "released", true);
+    if (attachment.routeGeneration !== null) updateSessionLocatorStatus(input, root, attachment.routeGeneration, "released", journalGuard, true);
     return checkpointResult(root, hash, receipt);
   });
 }
 
-function restoreStopSnapshot(cwd, input, state) {
+function restoreStopSnapshot(cwd, input, state, journalGuard) {
+  journalGuard(cwd);
   const filePath = runtimeStatePath(cwd, input);
   assertSafeStatePath(cwd, filePath);
   if (state === null) {
@@ -3067,15 +3619,15 @@ function restoreStopSnapshot(cwd, input, state) {
   durableWriteBytes(cwd, filePath, Buffer.from(`${JSON.stringify(state, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES);
 }
 
-function ownerlessContext(cwd, plan) {
-  const ledger = summarizeRunLedger(cwd);
+function ownerlessContext(cwd, plan, journalGuard) {
+  const ledger = summarizeRunLedgerHeld(cwd, journalGuard);
   let operations;
   if (ledger.status !== "available") {
     operations = unavailableOperations(ledger.reason === "run-ledger-absent" ? "ledger-absent" : "ledger-invalid");
   } else {
     const directory = path.join(stateDirectory(cwd), "runs");
-    const records = readdirSync(directory).sort().flatMap((name) => readSessionLedger(cwd, name.slice(0, 64), true).records);
-    if (summarizeRunLedger(cwd).hash !== ledger.hash) checkpointFailure("ownerless recovery ledger changed while observing it");
+    const records = readdirSync(directory).sort().flatMap((name) => readSessionLedger(cwd, name.slice(0, 64), journalGuard, true).records);
+    if (summarizeRunLedgerHeld(cwd, journalGuard).hash !== ledger.hash) checkpointFailure("ownerless recovery ledger changed while observing it");
     operations = inspectOperations(records);
   }
   const states = new Map();
@@ -3096,7 +3648,7 @@ function ownerlessContext(cwd, plan) {
 }
 
 export function resumeSession(cwd, request) {
-  return withSessionLifecycle(cwd, request, "resume", (root, input, routing, requireGuards) => {
+  return withSessionLifecycle(cwd, request, "resume", (root, input, routing, requireGuards, journalGuard) => {
     const plan = requireActivePlan(root, request.planHash);
     const snapshot = readAttachmentSnapshot(root);
     const existing = snapshot === null ? null : attachmentFromSnapshot(snapshot);
@@ -3104,7 +3656,7 @@ export function resumeSession(cwd, request) {
     let context;
     if (request.checkpointHash === null) {
       if (existing !== null) checkpointFailure("ownerless recovery requires no attachment or checkpoint tombstone; never release an owner automatically");
-      context = ownerlessContext(root, plan);
+      context = ownerlessContext(root, plan, journalGuard);
     } else {
       receipt = readCheckpointReceipt(root, request.checkpointHash);
       if (receipt.planHash !== request.planHash) checkpointFailure("resume plan hash does not match the checkpoint");
@@ -3114,7 +3666,7 @@ export function resumeSession(cwd, request) {
         checkpointFailure("resume checkpoint counts and item references do not match the unchanged plan");
       }
       if (receipt.sessionHash === sessionHash(input)) checkpointFailure("resume requires a fresh session distinct from the source");
-      requireCheckpointLedger(root, receipt, request.checkpointHash);
+      requireCheckpointLedger(root, receipt, request.checkpointHash, journalGuard);
       if (existing === null || existing.checkpointHash !== request.checkpointHash) checkpointFailure("resume requires the matching checkpoint tombstone or its exact successor");
       if (existing.status === "checkpointed") {
         if (existing.sessionHash !== receipt.sessionHash || existing.claimGeneration !== receipt.claimGeneration ||
@@ -3134,8 +3686,8 @@ export function resumeSession(cwd, request) {
       if (routing.exists && !["released", "provisional"].includes(routing.locator.status)) {
         checkpointFailure("resume requires a fresh, interrupted provisional, or explicitly released successor session route");
       }
-      restoreStopSnapshot(root, input, context.stopState);
-      const route = bindSessionLocator(input, root);
+      restoreStopSnapshot(root, input, context.stopState, journalGuard);
+      const route = bindSessionLocator(input, root, journalGuard);
       if (route.conflict) checkpointFailure("resume successor routing conflicts with current ownership");
       if (routing.context !== null) readBoundedStateBytes(routing.context.storageRoot, routing.context.filePath, MAX_SESSION_LOCATOR_BYTES, true);
       if (snapshot === null) {
@@ -3160,8 +3712,8 @@ export function resumeSession(cwd, request) {
     if (successorSnapshot === null || canonicalJson(attachmentFromSnapshot(successorSnapshot)) !== canonicalJson(successor)) {
       checkpointFailure("successor ownership changed before route confirmation");
     }
-    if (successor.routeGeneration !== null) updateSessionLocatorStatus(input, root, successor.routeGeneration, "active", true);
-    const resumed = readSessionLedger(root, successor.sessionHash).records.filter((record) =>
+    if (successor.routeGeneration !== null) updateSessionLocatorStatus(input, root, successor.routeGeneration, "active", journalGuard, true);
+    const resumed = readSessionLedger(root, successor.sessionHash, journalGuard).records.filter((record) =>
       record.event === "checkpoint_resumed" && record.checkpointHash === request.checkpointHash &&
       record.planHash === request.planHash && sameClaim(record, successor));
     if (resumed.length > 1) checkpointFailure("successor ledger has ambiguous resume observations");
@@ -3170,7 +3722,7 @@ export function resumeSession(cwd, request) {
       sourceSessionHash: receipt?.sessionHash ?? successor.sessionHash,
       routeGeneration: successor.routeGeneration, claimGeneration: successor.claimGeneration,
       observationStatus: context.operations.status, observationReason: context.operations.reason,
-    }, () => {
+    }, journalGuard, () => {
       requireGuards();
       requireAttachmentSnapshot(root, successorSnapshot);
     });
@@ -3201,7 +3753,8 @@ function validRuntimeState(value) {
   );
 }
 
-function releaseStop(cwd, input, event, detail, output) {
+function releaseStop(cwd, input, event, detail, output, journalGuard) {
+  journalGuard(cwd);
   const intendedAttachment = readAttachmentSnapshot(cwd);
   try {
     removeStateFile(cwd, runtimeStatePath(cwd, input));
@@ -3209,22 +3762,23 @@ function releaseStop(cwd, input, event, detail, output) {
     // Runtime counters are recoverable; ownership cleanup remains authoritative.
   }
   try {
-    if (!detachSession(cwd, input, intendedAttachment)) {
+    if (!detachSession(cwd, input, intendedAttachment, journalGuard)) {
       throw new Error("expected attachment disappeared during Stop cleanup");
     }
-    appendLedger(cwd, input, event, detail);
+    appendLedger(cwd, input, event, detail, journalGuard);
     return output;
   } catch {
-    appendLedger(cwd, input, "ownership_cleanup_failed", { attemptedEvent: event });
+    appendLedger(cwd, input, "ownership_cleanup_failed", { attemptedEvent: event }, journalGuard);
     const reason =
       "Supervised Worker allowed Stop, but ownership cleanup failed. The durable claim may remain attached; do not rely on this run as queue completion or release.";
     return allowStopOutput(input, reason);
   }
 }
 
-function handleStop(input, cwd) {
+function handleStop(input, cwd, journalGuard) {
   const attachment = attachedRecord(cwd, input);
   if (attachment === null) return {};
+  journalGuard(cwd);
   const planResult = loadPlan(cwd);
   if (attachment.status === "provisional") {
     if (!planResult.exists) {
@@ -3236,15 +3790,16 @@ function handleStop(input, cwd) {
         "provisional_claim_released",
         {},
         allowStopOutput(input, reason),
+        journalGuard,
       );
     }
-    promoteSessionClaim(cwd, input, attachment.routeGeneration);
+    promoteSessionClaim(cwd, input, attachment.routeGeneration, journalGuard);
   }
   if (!planResult.exists) {
-    return releaseStop(cwd, input, "plan_inactive", {}, {});
+    return releaseStop(cwd, input, "plan_inactive", {}, {}, journalGuard);
   }
   if (planResult.errors.length === 0 && planResult.plan?.mode === "inactive") {
-    return releaseStop(cwd, input, "plan_inactive", {}, {});
+    return releaseStop(cwd, input, "plan_inactive", {}, {}, journalGuard);
   }
   if (planResult.errors.length === 0 && isComplete(planResult.plan)) {
     return releaseStop(
@@ -3253,6 +3808,7 @@ function handleStop(input, cwd) {
       "completion_verified",
       { planHash: canonicalPlanHash(planResult.plan) },
       {},
+      journalGuard,
     );
   }
 
@@ -3296,6 +3852,7 @@ function handleStop(input, cwd) {
       "completion_unverified_release",
       { progressHash, reason: "invalid_runtime_state" },
       allowStopOutput(input, reason),
+      journalGuard,
     );
   }
   if (stateWasInvalid) {
@@ -3323,16 +3880,18 @@ function handleStop(input, cwd) {
       "completion_unverified_release",
       { progressHash, reason: "bounded_stop_limit" },
       allowStopOutput(input, reason),
+      journalGuard,
     );
   }
   state.sameProgressBlocks += 1;
   state.totalBlocks += 1;
+  journalGuard(cwd);
   atomicWriteJson(cwd, filePath, state);
   appendLedger(cwd, input, "stop_blocked", {
     progressHash,
     sameProgressBlocks: state.sameProgressBlocks,
     totalBlocks: state.totalBlocks,
-  });
+  }, journalGuard);
   const reason =
     state.sameProgressBlocks >= MAX_SAME_PROGRESS_BLOCKS
       ? `${stopReason(planResult)} This is the final bounded continuation before an unchanged Stop is released. If no measurable progress is possible, the final response must state that queue completion remains unverified.`
@@ -3340,7 +3899,7 @@ function handleStop(input, cwd) {
   return blockOutput(input, "Stop", reason);
 }
 
-function handleHookUnsafe(input, eventName, cwd, inspectedTargets) {
+function handleHookUnsafe(input, eventName, cwd, inspectedTargets, journalGuard) {
   switch (eventName) {
     case "SessionStart": {
       if (!isAttached(cwd, input)) return {};
@@ -3363,7 +3922,7 @@ function handleHookUnsafe(input, eventName, cwd, inspectedTargets) {
       return contextOutput(
         input,
         "SessionStart",
-        `A durable Supervised Worker plan is active at .supervised-worker/plan.json. Counts: ${JSON.stringify(counts)}. Checkpoint observations: ${JSON.stringify(checkpointStatus(cwd))}. Read the plan and inspect outcome-unknown operations before continuing; never replay them automatically or infer completion from this summary.`,
+        `A durable Supervised Worker plan is active at .supervised-worker/plan.json. Counts: ${JSON.stringify(counts)}. Checkpoint observations: ${JSON.stringify(checkpointStatus(cwd, journalGuard))}. Read the plan and inspect outcome-unknown operations before continuing; never replay them automatically or infer completion from this summary.`,
       );
     }
     case "PreToolUse": {
@@ -3409,7 +3968,7 @@ function handleHookUnsafe(input, eventName, cwd, inspectedTargets) {
         }
         return {};
       }
-      const claim = claimSession(cwd, input);
+      const claim = claimSession(cwd, input, false, journalGuard);
       if (claim.conflict) {
         return preToolDecision(
           input,
@@ -3437,15 +3996,15 @@ function handleHookUnsafe(input, eventName, cwd, inspectedTargets) {
           let completionPersisted = true;
           if (isAttached(cwd, input)) {
             const intendedAttachment = readAttachmentSnapshot(cwd);
-            completionPersisted = recordToolCompletion(cwd, input, false);
+            completionPersisted = recordToolCompletion(cwd, input, false, journalGuard);
             try {
-              if (!detachSession(cwd, input, intendedAttachment)) {
+              if (!detachSession(cwd, input, intendedAttachment, journalGuard)) {
                 throw new Error("expected attachment disappeared during post-tool cleanup");
               }
             } catch {
               appendLedger(cwd, input, "ownership_cleanup_failed", {
                 attemptedEvent: "provisional_claim_released",
-              });
+              }, journalGuard);
               return contextOutput(
                 input,
                 "PostToolUse",
@@ -3454,7 +4013,7 @@ function handleHookUnsafe(input, eventName, cwd, inspectedTargets) {
             }
             appendLedger(cwd, input, "provisional_claim_released", {
               trigger: "missing_plan_after_post_tool",
-            });
+            }, journalGuard);
           }
           return contextOutput(
             input,
@@ -3463,7 +4022,7 @@ function handleHookUnsafe(input, eventName, cwd, inspectedTargets) {
               (completionPersisted ? "" : " Tool completion persistence failed; its operation outcome remains unknown and must not be replayed automatically."),
           );
         }
-        const claim = claimSession(cwd, input, true);
+        const claim = claimSession(cwd, input, true, journalGuard);
         if (claim.conflict) {
           return contextOutput(
             input,
@@ -3475,22 +4034,22 @@ function handleHookUnsafe(input, eventName, cwd, inspectedTargets) {
         }
       }
       if (!isAttached(cwd, input)) return {};
-      if (!recordToolCompletion(cwd, input, true)) return completionUncertain(input, "PostToolUse");
+      if (!recordToolCompletion(cwd, input, true, journalGuard)) return completionUncertain(input, "PostToolUse");
       return {};
     }
     case "PostToolUseFailure": {
       if (!isAttached(cwd, input)) return {};
       const intendedAttachment = readAttachmentSnapshot(cwd);
-      const completionPersisted = recordToolCompletion(cwd, input, false);
+      const completionPersisted = recordToolCompletion(cwd, input, false, journalGuard);
       if (toolTouchesPlan(inspectedTargets, cwd) && !existsSync(planPath(cwd))) {
         try {
-          if (!detachSession(cwd, input, intendedAttachment)) {
+          if (!detachSession(cwd, input, intendedAttachment, journalGuard)) {
             throw new Error("expected attachment disappeared during failure cleanup");
           }
         } catch {
           appendLedger(cwd, input, "ownership_cleanup_failed", {
             attemptedEvent: "provisional_claim_released",
-          });
+          }, journalGuard);
           return contextOutput(
             input,
             "PostToolUseFailure",
@@ -3499,7 +4058,7 @@ function handleHookUnsafe(input, eventName, cwd, inspectedTargets) {
         }
         appendLedger(cwd, input, "provisional_claim_released", {
           trigger: "post_tool_failure",
-        });
+        }, journalGuard);
       }
       return completionPersisted ? {} : completionUncertain(input, "PostToolUseFailure");
     }
@@ -3507,10 +4066,10 @@ function handleHookUnsafe(input, eventName, cwd, inspectedTargets) {
       if (!isAttached(cwd, input)) return {};
       appendLedger(cwd, input, "pre_compact", {
         trigger: ["auto", "manual"].includes(input?.trigger) ? input.trigger : "unknown",
-      });
+      }, journalGuard);
       return {};
     case "Stop":
-      return handleStop(input, cwd);
+      return handleStop(input, cwd, journalGuard);
     default:
       return {};
   }
@@ -3527,7 +4086,7 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
       return preToolDecision(
         input,
         "deny",
-        "Supervised Worker denied the invocation because the hook payload did not provide an absolute repository cwd.",
+        "Supervised Worker denied the invocation because the hook payload did not provide an absolute repository cwd. Denial journaling is unconfirmed; no retry permit is available.",
       );
     }
     return eventName === "Stop"
@@ -3541,8 +4100,9 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
   let sessionContext = null;
   let sessionLock = null;
   let repositoryLocks = [];
+  let journalLocks = [];
   let routedAttachmentObserved = false;
-  const heldLocks = () => [...repositoryLocks].reverse().concat(sessionLock);
+  const heldLocks = () => [...journalLocks].reverse().concat([...repositoryLocks].reverse(), sessionLock);
   const releaseContext = createLifecycleReleaseContext(() => ({
     roots: [effectiveCwd], input, session: sessionContext,
   }), heldLocks);
@@ -3556,36 +4116,82 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
     const nonWriterObservation = eventName === "PreToolUse" &&
       !PLAN_WRITER_TOOLS.has(boundedToolName(input).toLowerCase().split(/[./]/).at(-1));
     if (nonWriterObservation) {
-      const routing = readSessionLocator(input, false);
+      const routing = readSessionLocator(input, false, true);
       if (!routing.exists && attachedRecord(cwd, input) === null) return {};
     }
     sessionLock = acquireSessionLock(input, sessionContext);
     windowsPathChecksMaySpawn = false;
-    repositoryLocks = acquireHookRepositoryLocks(input, eventName, preparedTargets, cwd, releaseContext);
-    effectiveCwd = resolveHookCwd(input, preparedTargets, cwd);
+    const observation = routineHookObservation(input, eventName, preparedTargets, cwd);
+    if (observation === null) {
+      repositoryLocks = acquireHookRepositoryLocks(input, eventName, preparedTargets, cwd, releaseContext);
+      journalLocks = acquireJournalLocks(repositoryLocks.map((lock) => lock.storageRoot), releaseContext);
+    } else {
+      journalLocks = acquireJournalLocks([observation.root], releaseContext);
+    }
+    const requireJournal = createJournalGuard(journalLocks, [sessionLock, ...repositoryLocks]);
+    const journalGuard = (root) => {
+      requireJournal(root);
+      if (observation !== null) {
+        const current = routineHookObservation(input, eventName, prepareToolTargets(input), cwd);
+        if (current === null || current.binding !== observation.binding) {
+          throw new Error("routine observation routing or ownership changed while acquiring journal exclusion");
+        }
+        requireAttachmentSnapshot(observation.root, observation.snapshot);
+      }
+    };
+    if (observation === null) {
+      if (routineHookObservation(input, eventName, prepareToolTargets(input), cwd) !== null) {
+        throw new Error("hook observation classification changed while acquiring lifecycle guards");
+      }
+      const routing = readSessionLocator(input, false, true);
+      if (routing.context !== null && routing.exists && readSessionMarker(routing.context, input) === null) {
+        journalGuard(routing.locator.repositoryRoot);
+        readSessionLocator(input);
+      }
+      effectiveCwd = resolveHookCwd(input, preparedTargets, cwd, journalGuard);
+    } else {
+      journalGuard(observation.root);
+      effectiveCwd = observation.root;
+    }
     const inspectedTargets = completeToolTargetInspection(preparedTargets, effectiveCwd);
-    const attachment = attachedRecord(effectiveCwd, input);
-    const guarded = repositoryLocks.some((lock) =>
+    const attachmentSnapshot = readAttachmentSnapshot(effectiveCwd);
+    const attachment = attachedRecord(effectiveCwd, input, undefined, attachmentSnapshot);
+    const guarded = journalLocks.some((lock) =>
       pathEquals(lock.storageRoot, effectiveCwd) || pathsShareFilesystemIdentity(lock.storageRoot, effectiveCwd),
     );
     if (!guarded && attachment !== null) {
-      throw new Error("session ownership appeared outside the repository lifecycle guard");
+      throw new Error("session ownership appeared outside the repository journal guard");
     }
     routedAttachmentObserved = attachment?.routeGeneration !== null && attachment !== null;
     if (routedAttachmentObserved && (sessionContext === null || sessionLock === null)) {
       throw new Error("routed attachment requires its workspace-scoped session lock");
     }
     if (!guarded && eventName !== "PreToolUse") return {};
-    const output = handleHookUnsafe(input, eventName, effectiveCwd, inspectedTargets);
-    if (eventName === "PreToolUse" && output.permissionDecision !== "deny") {
-      try {
-        recordToolStart(effectiveCwd, input);
-      } catch {
-        return preToolDecision(input, "deny",
-          "Supervised Worker could not durably record the tool start. The invocation was denied; inspect local ledger state before retrying.");
+    let attempt = null;
+    try {
+      const output = handleHookUnsafe(input, eventName, effectiveCwd, inspectedTargets, journalGuard);
+      if (eventName === "PreToolUse") {
+        if (guarded) attempt = captureToolAttempt(effectiveCwd, input, journalGuard);
+        if (output.permissionDecision === "deny") {
+          return deniedToolOutput(effectiveCwd, input, attempt, output.permissionDecisionReason, journalGuard);
+        }
+        recordToolStart(effectiveCwd, input, journalGuard, attempt);
       }
+      if (guarded) journalGuard(effectiveCwd);
+      return output;
+    } catch (error) {
+      if (eventName !== "PreToolUse") throw error;
+      if (attempt === null && guarded && attachment !== null) {
+        try {
+          requireAttachmentSnapshot(effectiveCwd, attachmentSnapshot);
+          attempt = captureToolAttempt(effectiveCwd, input, journalGuard);
+        } catch {
+          attempt = null;
+        }
+      }
+      return deniedToolOutput(effectiveCwd, input, attempt,
+        "Supervised Worker could not durably admit the tool start or denied retry. Inspect local ledger state before retrying.", journalGuard);
     }
-    return output;
   };
   try {
     return withLifecycleCleanup(action, heldLocks, releaseContext);
@@ -3601,7 +4207,7 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
       return preToolDecision(
         input,
         "deny",
-        `Supervised Worker could not verify local lifecycle state, so the invocation was denied.${detail}`,
+        `Supervised Worker could not verify local lifecycle state, so the invocation was denied.${detail} Denial journaling is unconfirmed; no retry permit is available.`,
       );
     }
     if (eventName === "Stop" && primaryOutput?.decision === "block" && lifecycleError.primaryError === null) {
@@ -3634,7 +4240,11 @@ export function releaseAttachment(cwd) {
   windowsPathChecksMaySpawn = false;
   const releaseContext = createLifecycleReleaseContext(() => ({ roots: [resolvedCwd], session: null }));
   const locks = acquireRepositoryLocks([resolvedCwd], releaseContext);
+  let journalLocks = [];
   return withLifecycleCleanup(() => {
+    journalLocks = acquireJournalLocks([resolvedCwd], releaseContext);
+    const journalGuard = createJournalGuard(journalLocks, locks);
+    journalGuard(cwd);
     requireAttachmentSnapshot(cwd, intended);
     let attachment = null;
     try {
@@ -3649,9 +4259,10 @@ export function releaseAttachment(cwd) {
     } catch {
       // Runtime state is optional; attachment release is the authoritative action.
     }
+    journalGuard(cwd);
     removeAttachmentSnapshot(cwd, intended);
     return { released: true, message: "Released the stale session attachment." };
-  }, () => [...locks].reverse(), releaseContext);
+  }, () => [...journalLocks].reverse().concat([...locks].reverse()), releaseContext);
 }
 
 function runLedgerUnavailable(reason) {
@@ -3700,7 +4311,8 @@ function requireRunLedgerRecord(record, expectedSession) {
     throw runLedgerFailure("run-ledger-invalid");
   }
   const hexadecimal = (value) => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
-  if (Object.hasOwn(record, "planHash") && !hexadecimal(record.planHash)) {
+  if (Object.hasOwn(record, "planHash") && !hexadecimal(record.planHash) &&
+    !(record.event === "tool_denied" && record.planHash === null)) {
     throw runLedgerFailure("run-ledger-invalid");
   }
   if (Object.hasOwn(record, "progressHash") && !hexadecimal(record.progressHash)) {
@@ -3726,8 +4338,12 @@ function requireRunLedgerRecord(record, expectedSession) {
   if (Object.hasOwn(record, "success") && typeof record.success !== "boolean") {
     throw runLedgerFailure("run-ledger-invalid");
   }
-  for (const key of ["attachmentHash", "sourceSessionHash"]) {
+  for (const key of ["attachmentHash", "sourceSessionHash", "ownershipHash"]) {
     if (Object.hasOwn(record, key) && !hexadecimal(record[key])) throw runLedgerFailure("run-ledger-invalid");
+  }
+  if (Object.hasOwn(record, "requestHash") && !(hexadecimal(record.requestHash) ||
+    (record.requestHash === null && ["tool_started", "tool_denied"].includes(record.event)))) {
+    throw runLedgerFailure("run-ledger-invalid");
   }
   for (const key of ["checkpointHash", "invocationHash"]) {
     if (Object.hasOwn(record, key) && !(hexadecimal(record[key]) ||
@@ -3740,7 +4356,8 @@ function requireRunLedgerRecord(record, expectedSession) {
       throw runLedgerFailure("run-ledger-invalid");
     }
   }
-  if (record.event === "tool_started" || Object.hasOwn(record, "observationId")) {
+  if (record.event === "tool_started" || record.event === "tool_denied" ||
+    (record.event === "tool_completed" && Object.hasOwn(record, "observationId"))) {
     if (typeof record.toolName !== "string" || !/^[A-Za-z][A-Za-z0-9_.:/-]{0,127}$/.test(record.toolName) ||
       !(uuid(record.operationId) || (record.event === "tool_completed" && record.operationId === null))) {
       throw runLedgerFailure("run-ledger-invalid");
@@ -3751,6 +4368,30 @@ function requireRunLedgerRecord(record, expectedSession) {
     if (keys.some((key) => Object.hasOwn(record, key)) &&
       (!keys.every((key) => Object.hasOwn(record, key)) || !uuid(record.observationId) ||
        (record.operationId !== null && record.invocationHash === null))) throw runLedgerFailure("run-ledger-invalid");
+  }
+  if (record.event === "tool_denied" && (!uuid(record.observationId) || record.outcome !== "not-executed" ||
+    !generation(record.retryOf) || record.retryOf === record.operationId)) {
+    throw runLedgerFailure("run-ledger-invalid");
+  }
+  if (["denied_retry_reserved", "denied_retry_consumed"].includes(record.event) &&
+    (!uuid(record.sourceOperationId) || !uuid(record.reservationId) || record.attempt !== 1 ||
+      (record.event === "denied_retry_consumed" && (!uuid(record.operationId) ||
+        record.operationId === record.sourceOperationId || !hexadecimal(record.invocationHash))))) {
+    throw runLedgerFailure("run-ledger-invalid");
+  }
+  if (["helper_attempt_reserved", "helper_result", "helper_circuit_open"].includes(record.event)) {
+    if (record.helperId !== HANDOFF_HELPER_ID || !uuid(record.operationId) || !uuid(record.parentOperationId) ||
+      !uuid(record.observationId) || !uuid(record.retryRoot) || !hexadecimal(record.invocationHash) ||
+      record.operationId === record.parentOperationId || record.retryRoot === record.parentOperationId ||
+      ![0, 1].includes(record.attempt) || ((record.attempt === 0) !== (record.retryRoot === record.operationId)) ||
+      record.delivery !== "unconfirmed" ||
+      ["namespaceHash", "parametersHash", "inputHash", "implementationHash", "planBytesHash"]
+        .some((key) => !hexadecimal(record[key])) ||
+      (record.event === "helper_attempt_reserved" ? record.outcome !== "evaluation-pending"
+        : record.event === "helper_circuit_open" ? record.outcome !== "reservation-unconfirmed"
+        : !["validation-passed", "validation-failed"].includes(record.outcome) || !hexadecimal(record.resultHash))) {
+      throw runLedgerFailure("run-ledger-invalid");
+    }
   }
   if (record.event === "checkpoint_resumed" && !uuid(record.claimGeneration)) {
     throw runLedgerFailure("run-ledger-invalid");
@@ -3791,8 +4432,18 @@ function hashRunLedger(files) {
 }
 
 export function summarizeRunLedger(cwd) {
+  try {
+    return withJournalRead(cwd, (journalGuard) => journalGuard === null
+      ? runLedgerUnavailable("run-ledger-absent") : summarizeRunLedgerHeld(cwd, journalGuard));
+  } catch (error) {
+    return runLedgerUnavailable(error?.runLedgerReason ?? "run-ledger-invalid");
+  }
+}
+
+function summarizeRunLedgerHeld(cwd, journalGuard) {
   const directory = path.join(stateDirectory(cwd), "runs");
   try {
+    journalGuard(cwd);
     assertSafeStatePath(cwd, directory);
     if (!existsSync(directory)) return runLedgerUnavailable("run-ledger-absent");
     let directoryBefore;
@@ -3941,6 +4592,7 @@ export function summarizeRunLedger(cwd) {
     ) {
       throw runLedgerFailure("run-ledger-changed-during-read");
     }
+    journalGuard(cwd);
     return {
       status: "available",
       provenance: "worker-recorded-local",
@@ -3960,29 +4612,34 @@ export function summarizeRunLedger(cwd) {
   }
 }
 
-function checkpointStatus(cwd) {
+function checkpointStatus(cwd, journalGuard) {
+  journalGuard(cwd);
   const snapshot = readAttachmentSnapshot(cwd);
   const attachment = snapshot === null ? null : attachmentFromSnapshot(snapshot);
   let operations;
   try {
     if (attachment?.checkpointHash) {
       const receipt = readCheckpointReceipt(cwd, attachment.checkpointHash);
-      requireCheckpointLedger(cwd, receipt, attachment.checkpointHash, false);
+      requireCheckpointLedger(cwd, receipt, attachment.checkpointHash, journalGuard, false);
       operations = attachment.status === "checkpointed" ? receipt.context.operations :
-        inspectOperations(readSessionLedger(cwd, attachment.sessionHash).records, receipt.context.operations);
+        inspectOperations(readSessionLedger(cwd, attachment.sessionHash, journalGuard).records, receipt.context.operations);
     } else {
-      const summary = summarizeRunLedger(cwd);
+      const summary = summarizeRunLedgerHeld(cwd, journalGuard);
       if (summary.status !== "available") {
         operations = unavailableOperations(summary.reason === "run-ledger-absent" ? "ledger-absent" : "ledger-invalid");
       } else {
         const records = readdirSync(path.join(stateDirectory(cwd), "runs")).sort()
-          .flatMap((name) => readSessionLedger(cwd, name.slice(0, 64)).records);
-        operations = summarizeRunLedger(cwd).hash === summary.hash ? inspectOperations(records) : unavailableOperations("ledger-invalid");
+          .flatMap((name) => readSessionLedger(cwd, name.slice(0, 64), journalGuard).records);
+        operations = summarizeRunLedgerHeld(cwd, journalGuard).hash === summary.hash ? inspectOperations(records) : unavailableOperations("ledger-invalid");
       }
     }
   } catch {
     operations = unavailableOperations("ledger-invalid");
   }
+  journalGuard(cwd);
+  if (snapshot === null) {
+    if (readAttachmentSnapshot(cwd) !== null) throw new Error("ownership appeared during checkpoint observation");
+  } else requireAttachmentSnapshot(cwd, snapshot);
   return {
     attachmentHash: snapshot?.hash ?? null,
     attachment: attachment === null ? null : {
@@ -3994,7 +4651,22 @@ function checkpointStatus(cwd) {
 }
 
 export function summarizePlan(cwd) {
+  try {
+    return withJournalRead(cwd, (journalGuard) => journalGuard === null
+      ? { active: false, message: "No durable plan found." } : summarizePlanHeld(cwd, journalGuard));
+  } catch {
+    return {
+      active: null, valid: false, errors: ["Journal-consistent plan observations are unavailable."],
+      mode: null, counts: null, complete: null, planHash: null, attachmentHash: null, attachment: null,
+      operations: unavailableOperations("ledger-invalid"),
+    };
+  }
+}
+
+function summarizePlanHeld(cwd, journalGuard) {
+  journalGuard(cwd);
   const result = loadPlan(cwd);
+  journalGuard(cwd);
   if (!result.exists) return { active: false, message: "No durable plan found." };
   if (result.errors.length > 0) return { active: true, valid: false, errors: result.errors };
   const counts = Object.fromEntries(
@@ -4010,6 +4682,6 @@ export function summarizePlan(cwd) {
     counts,
     complete: isComplete(result.plan),
     planHash: canonicalPlanHash(result.plan),
-    ...checkpointStatus(cwd),
+    ...checkpointStatus(cwd, journalGuard),
   };
 }

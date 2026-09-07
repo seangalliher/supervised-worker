@@ -140,7 +140,7 @@ function withFixture(run) {
   try {
     return run(fixture);
   } finally {
-    rmSync(fixture.cwd, { recursive: true, force: true });
+    rmSync(fixture.cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 }
 

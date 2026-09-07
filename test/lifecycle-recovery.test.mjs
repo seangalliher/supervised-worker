@@ -42,6 +42,7 @@ const faultingHookScript = `
   const storageRoot = transcriptPath ? path.dirname(path.dirname(path.dirname(transcriptPath))) : null;
   const sessionHash = createHash("sha256").update(input.session_id ?? input.sessionId).digest("hex");
   const repositoryDirectory = path.join(input.cwd, ".supervised-worker", "locks", "lifecycle");
+  const journalDirectory = path.join(input.cwd, ".supervised-worker", "locks", "journal");
   const sessionDirectory = storageRoot === null ? null : path.join(storageRoot, "supervised-worker", "session-locks", sessionHash);
   const attachmentFile = path.join(input.cwd, ".supervised-worker", "attachment.json");
   const routeFile = storageRoot === null ? null : path.join(storageRoot, "supervised-worker", "session-roots", sessionHash, "route.json");
@@ -319,7 +320,7 @@ const faultingHookScript = `
     }
     let observed = null;
     if (String(destination).startsWith(String(source) + ".") && String(destination).endsWith(".retired")) {
-      observed = { scope: String(source) === sessionDirectory ? "session" : "repository", source: String(source), code: null };
+      observed = { scope: String(source) === sessionDirectory ? "session" : String(source) === journalDirectory ? "journal" : "repository", source: String(source), code: null };
       allRetirements.push(observed);
     }
     if (
@@ -497,9 +498,9 @@ function withActiveHookFixture(action) {
     assert.deepEqual(invokeHook("PostToolUse", planWrite), {});
 
     const readTool = {
-      tool_name: "read_file",
-      tool_use_id: "faulting-read",
-      tool_input: { filePath: readPath },
+      tool_name: "Write",
+      tool_use_id: "faulting-state-write",
+      tool_input: { file_path: path.join(cwd, ".supervised-worker", "retirement-probe.json") },
     };
     assert.deepEqual(invokeHook("PreToolUse", readTool), {});
     const lockDirectory = path.join(cwd, ".supervised-worker", "locks", "lifecycle");
@@ -510,7 +511,7 @@ function withActiveHookFixture(action) {
 
     action({ base, cwd, storage, session, readTool, invokeHook, lockDirectory, attachmentPath, attachmentBefore });
   } finally {
-    rmSync(base, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 }
 
@@ -953,13 +954,14 @@ for (const scope of ["repository", "session"]) {
   test(`${scope} unavailable retry binding still permits the other lock's first cleanup`, () => {
     withActiveHookFixture((fixture) => {
       const release = runRetirementScenario(fixture, "persistent", scope, { code: retryCode, bindingUnavailable: true });
-      assert.ok(release.bindingFailures >= 2, "both held locks must attempt their post-action binding capture");
+      assert.ok(release.bindingFailures >= 3, "all held locks must attempt their post-action binding capture");
       assert.equal(release.retirementAttempts.length, 1);
       assert.deepEqual(release.waits, []);
       assert.match(retirementMessage(release), /LIFECYCLE_IDENTITY_REJECTED/);
       const other = release.allRetirements.filter((attempt) => attempt.scope !== scope);
-      assert.equal(other.length, 1);
-      assert.equal(other[0].code, null);
+      assert.deepEqual(other.map((attempt) => attempt.scope).sort(),
+        ["repository", "session", "journal"].filter((heldScope) => heldScope !== scope).sort());
+      assert.ok(other.every((attempt) => attempt.code === null));
     });
   });
 
@@ -1117,7 +1119,10 @@ for (const scope of ["repository", "session"]) {
   test(`${scope} actual Windows EPERM exhaustion is explicitly recovered without replay or fence loss`, { skip: process.platform !== "win32" }, async () => {
     await withRecoveryFixture(async (fixture) => {
       attachFixture(fixture);
-      const release = runRetirementScenario(fixture, "permission", scope);
+      const release = runRetirementScenario(fixture, "permission", scope, {
+        input: { tool_name: "Write", tool_use_id: "retirement-state-write",
+          tool_input: { file_path: path.join(fixture.cwd, ".supervised-worker", "retirement-probe.json") } },
+      });
       assert.equal(release.injectionCount, 3);
       assert.equal(release.retirementAttempts.length, 3);
       assert.throws(() => process.kill(release.processId, 0), { code: "ESRCH" });
@@ -1278,6 +1283,7 @@ async function withRecoveryFixture(action) {
     const ledgerPath = path.join(cwd, ".supervised-worker", "runs", `${sha256(sessionId)}.jsonl`);
     const evidenceDirectory = path.join(cwd, ".supervised-worker", "lifecycle-evidence");
     const canonical = (scope) => scope === "repository" ? path.join(cwd, ".supervised-worker", "locks", "lifecycle") :
+      scope === "journal" ? path.join(cwd, ".supervised-worker", "locks", "journal") :
       path.join(storage, "supervised-worker", "session-locks", sha256(sessionId));
     const invoke = (event, extra = {}) => JSON.parse(runChild(cwd, [launcherPath, event], JSON.stringify({ cwd, ...anchor, hook_event_name: event, ...extra })).stdout);
     const fixture = { base, cwd, storage, anchor, attachmentPath, routePath, markerPath, planPath, ledgerPath, evidenceDirectory, canonical, invoke,
@@ -1356,6 +1362,53 @@ function readEvidence(fixture, result) {
   assert.deepEqual(validateLifecycle(intent, "recoveryIntent"), []);
   assert.deepEqual(validateLifecycle(outcome, "recoveryOutcome"), []);
   return { intent, outcome };
+}
+
+for (const replaceOwner of [false, true]) {
+  test(`journal recovery preserves generation fences (replaceOwner=${replaceOwner})`, async () => {
+    await withRecoveryFixture(async (fixture) => {
+      attachFixture(fixture, "unrouted");
+      const attachmentBefore = readFileSync(fixture.attachmentPath);
+      const directory = fixture.canonical("journal");
+      const token = randomUUID();
+      const child = runChild(fixture.cwd, ["--input-type=module", "--eval", `
+        import fs from "node:fs";
+        import path from "node:path";
+        const [directory, token] = process.argv.slice(1);
+        fs.mkdirSync(directory, { recursive: true });
+        fs.writeFileSync(path.join(directory, token + ".json"), JSON.stringify({
+          schemaVersion: 1, token, processId: process.pid, acquiredAt: "2026-09-06T00:00:00.000Z",
+        }), { flag: "wx" });
+      `, directory, token]);
+      assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+      const ownerBefore = readFileSync(path.join(directory, token + ".json"));
+      const inspection = inspectLifecycleLock(fixture.cwd, { scope: "journal", token });
+      assert.equal(inspection.status, "inspected");
+      assert.equal(inspection.diagnostics[0].code, "LIFECYCLE_OWNER_DEAD");
+      assert.equal(inspection.expected.scope, "journal");
+      assert.deepEqual(validateLifecycle(inspection.expected, "snapshot"), []);
+      let replacement = null;
+      if (replaceOwner) {
+        renameSync(directory, directory + ".displaced");
+        mkdirSync(directory);
+        replacement = { schemaVersion: 1, token: randomUUID(), processId: process.pid, acquiredAt: "2026-09-06T00:00:00.000Z" };
+        writeFileSync(path.join(directory, replacement.token + ".json"), JSON.stringify(replacement));
+      }
+      const recovered = recoverLifecycleLock(fixture.cwd, { expected: inspection.expected });
+      assert.equal(recovered.status, replaceOwner ? "unconfirmed" : "recovered");
+      assert.deepEqual(readFileSync(fixture.attachmentPath), attachmentBefore);
+      if (replaceOwner) {
+        assert.deepEqual(JSON.parse(readFileSync(path.join(directory, replacement.token + ".json"))), replacement);
+        assert.deepEqual(readFileSync(path.join(directory + ".displaced", token + ".json")), ownerBefore);
+      } else {
+        assert.equal(existsSync(directory), false);
+        assert.deepEqual(readFileSync(path.join(directory + "." + token + ".recovered", token + ".json")), ownerBefore);
+        const evidence = readEvidence(fixture, recovered);
+        assert.equal(evidence.intent.expected.scope, "journal");
+        assert.equal(evidence.outcome.status, "recovered");
+      }
+    });
+  });
 }
 
 test("CLI inspection of an absent lock creates no state", async () => {
@@ -1976,8 +2029,8 @@ test("two real recoverers fence a replacement acquired after their identical old
       assert.equal((await first.done).result.status, "recovered");
       assert.deepEqual(lockState(target.recovered), target.before);
       const acquirer = start("acquirer-gate", "hook", {
-        cwd: fixture.cwd, ...fixture.anchor, hook_event_name: "PreToolUse", tool_name: "read_file", tool_use_id: "replacement-acquirer",
-        tool_input: { filePath: path.join(fixture.cwd, "tracked.txt") },
+        cwd: fixture.cwd, ...fixture.anchor, hook_event_name: "PreToolUse", tool_name: "Write", tool_use_id: "replacement-acquirer",
+        tool_input: { file_path: path.join(fixture.cwd, ".supervised-worker", "replacement-probe.json") },
       });
       const ready = await acquirer.ready;
       assert.equal(ready.owner.processId, acquirer.child.pid);
@@ -2002,13 +2055,18 @@ test("two real recoverers fence a replacement acquired after their identical old
 });
 
 for (const scope of ["repository", "session"]) {
-  test(`all real hook envelopes and checkpoint consumers report a dead ${scope} owner`, async () => {
+  test(`guarded hook envelopes and checkpoint consumers report a dead ${scope} owner`, async () => {
     await withRecoveryFixture(async (fixture) => {
       attachFixture(fixture);
       const target = seedDeadOwner(fixture, scope);
       const before = preservedCampaign(fixture);
-      for (const event of ["SessionStart", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PreCompact", "Stop"]) {
-        const result = fixture.invoke(event, { tool_name: "read_file", tool_use_id: "blocked-read", tool_input: { filePath: fixture.planPath } });
+      const tool = scope === "repository"
+        ? { tool_name: "Write", tool_input: { file_path: path.join(fixture.cwd, ".supervised-worker", "blocked-probe.json") } }
+        : { tool_name: "read_file", tool_input: { filePath: fixture.planPath } };
+      const events = scope === "repository" ? ["PreToolUse", "PostToolUse", "PostToolUseFailure", "Stop"]
+        : ["SessionStart", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PreCompact", "Stop"];
+      for (const event of events) {
+        const result = fixture.invoke(event, { ...tool, tool_use_id: "blocked-operation" });
         const reason = event === "PreToolUse" ? result.permissionDecisionReason : event === "Stop" ? result.reason : result.additionalContext;
         assert.match(reason, /LIFECYCLE_OWNER_DEAD/);
         assert.match(reason, /lifecycle inspect/);
@@ -2025,8 +2083,8 @@ for (const scope of ["repository", "session"]) {
         assert.deepEqual(preservedCampaign(fixture), before);
         const cliPayload = {
           cwd: fixture.cwd, sessionId: fixture.anchor.session_id,
-          transcript_path: fixture.anchor.transcript_path, tool_name: "read_file",
-          tool_use_id: "blocked-cli-read", tool_input: { filePath: fixture.planPath },
+          transcript_path: fixture.anchor.transcript_path, ...tool,
+          tool_use_id: "blocked-cli-operation",
         };
         const cliResult = JSON.parse(runChild(fixture.cwd, [launcherPath, event], JSON.stringify(cliPayload)).stdout);
         assert.equal(Object.hasOwn(cliResult, "hookSpecificOutput"), false);
@@ -2050,6 +2108,33 @@ for (const scope of ["repository", "session"]) {
         assert.equal(result.status, "unconfirmed");
         assert.ok(result.lifecycleDiagnostics.some((entry) => entry.code === "LIFECYCLE_OWNER_DEAD" && entry.scope === scope));
         assert.deepEqual(preservedCampaign(fixture), before);
+      }
+      if (scope === "repository") {
+        assert.match(fixture.invoke("SessionStart").additionalContext, /durable Supervised Worker plan is active/);
+        assert.deepEqual(fixture.invoke("PreCompact", { trigger: "manual" }), {});
+        for (const terminal of ["PostToolUse", "PostToolUseFailure"]) {
+          const observation = { tool_name: "read_file", tool_use_id: `independent-${terminal}`,
+            tool_input: { filePath: path.join(fixture.cwd, "README.md") } };
+          assert.deepEqual(fixture.invoke("PreToolUse", observation), {});
+          assert.deepEqual(fixture.invoke(terminal, observation), {});
+        }
+        const priorLedger = Buffer.from(before.ledgerPath.bytes, "base64");
+        const currentLedger = readFileSync(fixture.ledgerPath);
+        assert.deepEqual(currentLedger.subarray(0, priorLedger.length), priorLedger);
+        const added = currentLedger.subarray(priorLedger.length).toString("utf8").trim().split("\n").map(JSON.parse);
+        assert.deepEqual(added.map((entry) => entry.event), ["pre_compact", "tool_started", "tool_completed", "tool_started", "tool_completed"]);
+        for (const index of [1, 3]) {
+          for (const field of ["session", "routeGeneration", "claimGeneration", "invocationHash", "operationId", "toolName"]) {
+            assert.equal(added[index][field], added[index + 1][field]);
+          }
+          assert.equal(added[index + 1].success, index === 1);
+        }
+        assert.notEqual(added[1].operationId, added[3].operationId);
+        for (const name of ["attachmentPath", "routePath", "markerPath", "planPath"]) {
+          assert.deepEqual(readFileSync(fixture[name]), Buffer.from(before[name].bytes, "base64"));
+        }
+        assert.equal(existsSync(fixture.canonical("journal")), false);
+        assert.equal(existsSync(fixture.canonical("session")), false);
       }
       assert.deepEqual(lockState(target.directory), target.before);
     });

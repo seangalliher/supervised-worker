@@ -47,7 +47,7 @@ function workspace() {
 }
 
 afterEach(() => {
-  for (const cwd of temporaryWorkspaces) rmSync(cwd, { recursive: true, force: true });
+  for (const cwd of temporaryWorkspaces) rmSync(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   temporaryWorkspaces.clear();
 });
 
@@ -664,7 +664,9 @@ test("a fresh session lock denies concurrent state mutation", () => {
   assert.equal(existsSync(sessionRoutePath(storageRoot, sessionId)), false);
 });
 
-test("PostToolUse waits for a brief same-session lock overlap", async () => {
+test("PostToolUse retries observed same-session contention and correlates completion", async () => {
+  const fs = (await import("node:fs")).default;
+  const { syncBuiltinESMExports } = await import("node:module");
   const pluginRoot = workspace();
   const repositoryRoot = workspace();
   const storageRoot = workspace();
@@ -673,11 +675,25 @@ test("PostToolUse waits for a brief same-session lock overlap", async () => {
   const common = { session_id: sessionId, cwd: pluginRoot, transcript_path: transcriptPath };
   const planTool = {
     tool_name: "Write",
+    tool_use_id: "setup-plan",
     tool_input: { file_path: planPath(repositoryRoot) },
   };
-  handleHook({ ...common, ...planTool, hook_event_name: "PreToolUse" }, "PreToolUse");
+  assert.deepEqual(handleHook({ ...common, ...planTool }, "PreToolUse"), {});
   writePlan(repositoryRoot);
-  handleHook({ ...common, ...planTool, hook_event_name: "PostToolUse" }, "PostToolUse");
+  assert.deepEqual(handleHook({ ...common, ...planTool }, "PostToolUse"), {});
+  const observation = {
+    ...common,
+    tool_name: "read_file",
+    tool_use_id: "contended-read",
+    tool_input: { filePath: path.join(repositoryRoot, "README.md") },
+  };
+  assert.deepEqual(handleHook(observation, "PreToolUse"), {});
+  const ledgerFile = path.join(repositoryRoot, ".supervised-worker", "runs", `${sha256(sessionId)}.jsonl`);
+  const records = () => readFileSync(ledgerFile, "utf8").trim().split("\n").map(JSON.parse);
+  const start = records().at(-1);
+  assert.equal(start.event, "tool_started");
+  const attachmentFile = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
+  const attachmentBefore = readFileSync(attachmentFile);
 
   const lockDirectory = path.join(
     storageRoot,
@@ -686,59 +702,78 @@ test("PostToolUse waits for a brief same-session lock overlap", async () => {
     sha256(sessionId),
   );
   mkdirSync(lockDirectory, { recursive: true });
-  writeFileSync(
-    path.join(lockDirectory, "owner.json"),
-    `${JSON.stringify({
-      schemaVersion: 1,
-      token: "brief-owner",
-      processId: process.pid,
-      acquiredAt: new Date().toISOString(),
-    })}\n`,
-  );
+  const ownerFile = "08a8d07d-de9e-4cc0-a912-7e2688a1c6fd.json";
+  const ownerBytes = `${JSON.stringify({
+    schemaVersion: 1,
+    token: path.basename(ownerFile, ".json"),
+    processId: process.pid,
+    acquiredAt: new Date().toISOString(),
+  })}\n`;
+  writeFileSync(path.join(lockDirectory, ownerFile), ownerBytes);
+  const gate = new Int32Array(new SharedArrayBuffer(4));
   const releaser = new Worker(
     `
-      const { rmSync } = require("node:fs");
+      const assert = require("node:assert/strict");
+      const { readFileSync, readdirSync, rmSync } = require("node:fs");
+      const path = require("node:path");
       const { parentPort, workerData } = require("node:worker_threads");
+      const gate = new Int32Array(workerData.gate);
       parentPort.postMessage("ready");
       parentPort.once("message", () => {
-        setTimeout(() => {
-          rmSync(workerData, { recursive: true, force: true });
-          parentPort.postMessage("released");
-        }, 75);
+        try {
+          assert.deepEqual(readdirSync(workerData.lockDirectory), [workerData.ownerFile]);
+          assert.equal(readFileSync(path.join(workerData.lockDirectory, workerData.ownerFile), "utf8"), workerData.ownerBytes);
+          rmSync(workerData.lockDirectory, { recursive: true, force: true });
+          Atomics.store(gate, 0, 1);
+        } finally {
+          if (Atomics.load(gate, 0) === 0) Atomics.store(gate, 0, -1);
+          Atomics.notify(gate, 0);
+        }
       });
     `,
-    { eval: true, workerData: lockDirectory },
+    { eval: true, workerData: { lockDirectory, ownerFile, ownerBytes, gate: gate.buffer } },
   );
   await once(releaser, "message");
-  releaser.postMessage("release");
-
-  const started = performance.now();
-  const output = handleHook(
-    {
-      ...common,
-      hook_event_name: "PostToolUse",
-      tool_name: "read_file",
-      tool_input: { filePath: path.join(repositoryRoot, "README.md") },
-    },
-    "PostToolUse",
-  );
-  const elapsed = performance.now() - started;
-  assert.deepEqual(output, {});
-  assert.ok(elapsed >= 40, `transient contention premise did not fire: ${elapsed}ms`);
-  assert.ok(elapsed < 500, `transient contention exceeded its bound: ${elapsed}ms`);
-  await once(releaser, "exit");
+  const exited = once(releaser, "exit");
+  const originalMkdir = fs.mkdirSync;
+  let contentions = 0;
+  let acquisitions = 0;
+  fs.mkdirSync = (directory, ...args) => {
+    try {
+      const result = originalMkdir(directory, ...args);
+      if (String(directory) === lockDirectory) acquisitions += 1;
+      return result;
+    } catch (error) {
+      if (String(directory) === lockDirectory && error.code === "EEXIST") {
+        contentions += 1;
+        assert.equal(readFileSync(path.join(lockDirectory, ownerFile), "utf8"), ownerBytes);
+        releaser.postMessage("release");
+        assert.notEqual(Atomics.wait(gate, 0, 0, 10_000), "timed-out");
+        assert.equal(Atomics.load(gate, 0), 1);
+      }
+      throw error;
+    }
+  };
+  syncBuiltinESMExports();
+  try {
+    assert.deepEqual(handleHook(observation, "PostToolUse"), {});
+  } finally {
+    fs.mkdirSync = originalMkdir;
+    syncBuiltinESMExports();
+    if (Atomics.load(gate, 0) === 0) releaser.postMessage("release");
+    await exited;
+  }
+  assert.equal(contentions, 1);
+  assert.equal(acquisitions, 1);
   assert.equal(existsSync(lockDirectory), false);
-
-  const records = readFileSync(
-    path.join(repositoryRoot, ".supervised-worker", "runs", `${sha256(sessionId)}.jsonl`),
-    "utf8",
-  )
-    .trim()
-    .split("\n")
-    .map((line) => JSON.parse(line));
-  assert.equal(records.at(-1).event, "tool_completed");
-  assert.equal(records.at(-1).toolName, "read_file");
-  assert.equal(records.at(-1).success, true);
+  assert.deepEqual(readdirSync(path.join(repositoryRoot, ".supervised-worker", "locks")), []);
+  assert.deepEqual(readFileSync(attachmentFile), attachmentBefore);
+  const completions = records().filter((record) => record.event === "tool_completed" && record.operationId === start.operationId);
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0].success, true);
+  for (const field of ["session", "routeGeneration", "claimGeneration", "invocationHash", "toolName"]) {
+    assert.equal(completions[0][field], start[field]);
+  }
 });
 
 for (const schedule of ["successful-overlap", "bounded-live-rejection"]) {

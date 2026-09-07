@@ -383,10 +383,10 @@ function isContained(rootPath, candidatePath) {
   );
 }
 
-function loadWorkflowRoles(workspace = process.cwd()) {
+function loadWorkflowRoles(workspace = process.cwd(), reader = { lstatSync, readFileSync, realpathSync }) {
   let workspaceRealPath;
   try {
-    workspaceRealPath = realpathSync(path.resolve(workspace));
+    workspaceRealPath = reader.realpathSync(path.resolve(workspace));
   } catch {
     return {
       ok: false,
@@ -402,7 +402,7 @@ function loadWorkflowRoles(workspace = process.cwd()) {
   const githubPath = path.dirname(configPath);
   let githubStats;
   try {
-    githubStats = lstatSync(githubPath);
+    githubStats = reader.lstatSync(githubPath);
   } catch (error) {
     if (error?.code !== "ENOENT") {
       return {
@@ -429,7 +429,7 @@ function loadWorkflowRoles(workspace = process.cwd()) {
   }
   let configStats;
   try {
-    configStats = lstatSync(configPath);
+    configStats = reader.lstatSync(configPath);
   } catch (error) {
     if (error?.code !== "ENOENT") {
       return {
@@ -464,11 +464,11 @@ function loadWorkflowRoles(workspace = process.cwd()) {
     }
     if (configStats.nlink > 1) throw new Error("workflow file has multiple hard links");
     if (configStats.size > MAX_WORKFLOW_BYTES) throw new Error("workflow file exceeds the size limit");
-    const configRealPath = realpathSync(configPath);
+    const configRealPath = reader.realpathSync(configPath);
     if (!isContained(workspaceRealPath, configRealPath)) {
       throw new Error("workflow file resolves outside the workspace");
     }
-    const bytes = readFileSync(configRealPath);
+    const bytes = reader.readFileSync(configRealPath);
     workflowHash = sha256(bytes);
     const workflow = parseWorkflowJson(bytes);
     const errors = validateWorkflowValue(workflow);
@@ -521,37 +521,37 @@ function acceptancePath(workspaceRealPath) {
   return path.join(workspaceRealPath, ...WORKFLOW_ACCEPTANCE_PATH.split("/"));
 }
 
-function inspectStateDirectory(workspaceRealPath, create = false) {
+function inspectStateDirectory(workspaceRealPath, create = false, reader = { lstatSync, realpathSync }) {
   const statePath = path.dirname(acceptancePath(workspaceRealPath));
   let stats;
   try {
-    stats = lstatSync(statePath);
+    stats = reader.lstatSync(statePath);
   } catch (error) {
     if (error?.code !== "ENOENT" || !create) throw error;
     mkdirSync(statePath, { mode: 0o700 });
-    stats = lstatSync(statePath);
+    stats = reader.lstatSync(statePath);
   }
   if (stats.isSymbolicLink() || !stats.isDirectory()) {
     throw new Error("workflow acceptance directory is not a safe local directory");
   }
-  const resolved = realpathSync(statePath);
+  const resolved = reader.realpathSync(statePath);
   if (!isContained(workspaceRealPath, resolved)) {
     throw new Error("workflow acceptance directory resolves outside the workspace");
   }
   return statePath;
 }
 
-function readWorkflowAcceptance(workspaceRealPath) {
+function readWorkflowAcceptance(workspaceRealPath, reader = { lstatSync, readFileSync, realpathSync }) {
   const filePath = acceptancePath(workspaceRealPath);
   try {
-    inspectStateDirectory(workspaceRealPath);
+    inspectStateDirectory(workspaceRealPath, false, reader);
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
   }
   let stats;
   try {
-    stats = lstatSync(filePath);
+    stats = reader.lstatSync(filePath);
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
@@ -560,11 +560,11 @@ function readWorkflowAcceptance(workspaceRealPath) {
     throw new Error("workflow acceptance is not a safe regular file");
   }
   if (stats.size > MAX_WORKFLOW_BYTES) throw new Error("workflow acceptance exceeds the size limit");
-  const resolved = realpathSync(filePath);
+  const resolved = reader.realpathSync(filePath);
   if (!isContained(workspaceRealPath, resolved)) {
     throw new Error("workflow acceptance resolves outside the workspace");
   }
-  const value = parseWorkflowJson(readFileSync(resolved));
+  const value = parseWorkflowJson(reader.readFileSync(resolved));
   if (
     !isRecord(value) ||
     Object.keys(value).sort().join(",") !== "acceptedAt,schemaVersion,workflowHash" ||
@@ -579,14 +579,14 @@ function readWorkflowAcceptance(workspaceRealPath) {
 
 export function resolveWorkflowRoles(
   workspace = process.cwd(),
-  { requireAcceptance = false } = {},
+  { requireAcceptance = false, reader = { lstatSync, readFileSync, realpathSync } } = {},
 ) {
-  const result = loadWorkflowRoles(workspace);
+  const result = loadWorkflowRoles(workspace, reader);
   if (!result.ok) return { ...result, accepted: false };
   if (!result.configured) return { ...result, accepted: true };
   let acceptance;
   try {
-    acceptance = readWorkflowAcceptance(realpathSync(path.resolve(workspace)));
+    acceptance = readWorkflowAcceptance(reader.realpathSync(path.resolve(workspace)), reader);
   } catch (error) {
     return {
       ...result,

@@ -81,6 +81,66 @@ for (const command of ["doctor", "validate"]) {
   });
 }
 
+test("observed handoff CLI binds one retry and rejects untrusted requests", () => {
+  const cwd = workspace();
+  try {
+    const state = writeCampaignState(cwd);
+    const sessionId = "cli-observed-validation";
+    const setup = { cwd, session_id: sessionId, tool_name: "Write", tool_use_id: "setup-observed",
+      tool_input: { file_path: path.join(state, "plan.json") } };
+    for (const event of ["PreToolUse", "PostToolUse"]) {
+      const result = run(["hook", event], { cwd, input: JSON.stringify(setup) });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), {});
+    }
+    const itemId = "cli-observed-item";
+    const itemHash = createHash("sha256").update(itemId).digest("hex");
+    const artifactPath = path.join(state, "handoffs", itemHash, "build-report.json");
+    mkdirSync(path.dirname(artifactPath), { recursive: true });
+    writeFileSync(path.join(cwd, "consumer.mjs"), "export const value = 1;\n");
+    writeFileSync(artifactPath, JSON.stringify({ schemaVersion: 2, kind: "build-report", itemId,
+      producedBy: "supervised-worker:seangalliher-supervised-builder", workflowHash: null,
+      createdAt: "2026-09-06T00:00:00.000Z", status: "blocked", contractHash: "a".repeat(64),
+      testedTreeHash: null, changedFiles: ["consumer.mjs"], checks: [], evidence: [], deviations: [], blocker: "PRIVATE_RESULT" }));
+    const command = ["handoff", "validate", artifactPath, "--observe"];
+    for (const input of ['{"session_id":"first","session_id":"second"}', " ".repeat(8_193),
+      JSON.stringify({ session_id: sessionId, tool_use_id: "forged", retryOf: null, effect: "read-only" })]) {
+      const denied = run(command, { cwd, input });
+      assert.equal(denied.status, 1);
+      assert.equal(JSON.parse(denied.stdout).status, "denied");
+      assert.doesNotMatch(denied.stdout, /PRIVATE_RESULT/);
+    }
+    const invoke = (hostId, retryOf) => {
+      const parent = { cwd, session_id: sessionId, tool_name: "run_in_terminal", tool_use_id: hostId,
+        tool_input: { command: "PRIVATE_PARENT_COMMAND" } };
+      const started = run(["hook", "PreToolUse"], { cwd, input: JSON.stringify(parent) });
+      assert.deepEqual(JSON.parse(started.stdout), {});
+      return run(command, { cwd, input: JSON.stringify({ session_id: sessionId, tool_use_id: hostId, retryOf }) });
+    };
+    const first = invoke("cli-helper-first", null);
+    assert.equal(first.status, 0, first.stdout + first.stderr);
+    const original = JSON.parse(first.stdout);
+    assert.equal(original.status, "evaluated");
+    assert.equal(original.delivery, "unconfirmed");
+    const second = invoke("cli-helper-second", original.operationId);
+    assert.equal(second.status, 0, second.stdout + second.stderr);
+    const retry = JSON.parse(second.stdout);
+    assert.equal(retry.attempt, 1);
+    assert.equal(retry.retryRoot, original.operationId);
+    const third = invoke("cli-helper-third", original.operationId);
+    assert.equal(third.status, 1);
+    assert.equal(JSON.parse(third.stdout).status, "denied");
+    const ledgerPath = path.join(state, "runs", createHash("sha256").update(sessionId).digest("hex") + ".jsonl");
+    const bytes = readFileSync(ledgerPath, "utf8");
+    const records = bytes.trim().split("\n").map(JSON.parse);
+    assert.equal(records.filter((record) => record.event === "helper_attempt_reserved").length, 2);
+    assert.equal(records.some((record) => record.event === "tool_completed" && record.operationId === original.parentOperationId), false);
+    assert.doesNotMatch(bytes, /PRIVATE_/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
 test("CLI status, checkpoint, fresh resume, and Stop cross real process boundaries", () => {
   const cwd = workspace();
   try {
@@ -153,6 +213,86 @@ for (const command of ["checkpoint", "resume"]) {
     }
   });
 }
+
+test("observation retry-denied rejects unbounded or caller-asserted evidence", () => {
+  const cwd = workspace();
+  try {
+    const state = writeCampaignState(cwd);
+    const planBytes = readFileSync(path.join(state, "plan.json"));
+    const request = { session_id: "PRIVATE_RETRY_SESSION", sourceOperationId: "11111111-1111-4111-8111-111111111111",
+      planHash: "a".repeat(64), attachmentHash: "b".repeat(64) };
+    for (const input of [
+      "", "{PRIVATE_INPUT", "null", "[]", "{}",
+      '{"session_id":"PRIVATE_INPUT","session_id":"other"}',
+      JSON.stringify({ ...request, command: "PRIVATE_EXECUTION" }),
+      JSON.stringify({ ...request, effect: "read-only", outcome: "not-executed" }),
+      JSON.stringify({ ...request, cwd: "PRIVATE_OVERRIDE" }),
+      JSON.stringify({ ...request, transcript_path: "PRIVATE_INPUT".repeat(8_192) }),
+      Buffer.from([0xff, 0x7b, 0x7d]),
+      JSON.stringify(request),
+    ]) {
+      const result = run(["observation", "retry-denied"], { cwd, input });
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.equal(result.stderr, "");
+      const report = JSON.parse(result.stdout);
+      assert.equal(report.status, "denied");
+      assert.equal(report.permit, null);
+      assert.doesNotMatch(result.stdout, /PRIVATE_/);
+      assert.deepEqual(readFileSync(path.join(state, "plan.json")), planBytes);
+      assert.equal(existsSync(path.join(state, "attachment.json")), false);
+    }
+    const extra = run(["observation", "retry-denied", "extra"], { cwd, input: "PRIVATE_INPUT" });
+    assert.equal(extra.status, 1);
+    assert.match(extra.stdout, /^Usage:/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("observation retry-denied reserves hook evidence without bypassing policy", () => {
+  const cwd = workspace();
+  try {
+    const state = writeCampaignState(cwd);
+    const setup = { cwd, session_id: "cli-denied-owner", tool_name: "Write", tool_use_id: "cli-setup",
+      tool_input: { file_path: path.join(state, "plan.json") } };
+    for (const event of ["PreToolUse", "PostToolUse"]) {
+      const result = run(["hook", event], { cwd, input: JSON.stringify(setup) });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.deepEqual(JSON.parse(result.stdout), {});
+    }
+    const tool = { ...setup, tool_use_id: "PRIVATE_DENIED_CLI_ID",
+      tool_input: { file_path: path.join(cwd, ".github", "supervised-worker.json"), content: "PRIVATE_AUTHORITY_CHANGE" } };
+    const denied = run(["hook", "PreToolUse"], { cwd, input: JSON.stringify(tool) });
+    assert.equal(denied.status, 0, denied.stderr || denied.stdout);
+    assert.equal(JSON.parse(denied.stdout).permissionDecision, "deny");
+    const ledgerFile = path.join(state, "runs", `${createHash("sha256").update(setup.session_id).digest("hex")}.jsonl`);
+    const records = () => readFileSync(ledgerFile, "utf8").trim().split("\n").map(JSON.parse);
+    const denial = records().at(-1);
+    assert.equal(denial.event, "tool_denied");
+    assert.equal(denial.outcome, "not-executed");
+    const status = run(["status"], { cwd });
+    assert.equal(status.status, 0, status.stderr || status.stdout);
+    const summary = JSON.parse(status.stdout);
+    const request = { session_id: setup.session_id, sourceOperationId: denial.operationId,
+      planHash: summary.planHash, attachmentHash: summary.attachmentHash };
+    const reservation = run(["observation", "retry-denied"], { cwd, input: JSON.stringify(request) });
+    assert.equal(reservation.status, 0, reservation.stderr || reservation.stdout);
+    assert.equal(JSON.parse(reservation.stdout).status, "reserved");
+    assert.equal(JSON.parse(reservation.stdout).sourceOperationId, denial.operationId);
+    const second = run(["hook", "PreToolUse"], { cwd, input: JSON.stringify({ ...tool, tool_use_id: "PRIVATE_RETRY_CLI_ID" }) });
+    assert.equal(second.status, 0, second.stderr || second.stdout);
+    assert.equal(JSON.parse(second.stdout).permissionDecision, "deny");
+    assert.equal(records().at(-1).retryOf, denial.operationId);
+    assert.equal(records().some((record) => record.event === "denied_retry_consumed"), false);
+    const repeated = run(["observation", "retry-denied"], { cwd, input: JSON.stringify(request) });
+    assert.equal(repeated.status, 1, repeated.stderr || repeated.stdout);
+    assert.equal(JSON.parse(repeated.stdout).permit, null);
+    assert.doesNotMatch(readFileSync(ledgerFile, "utf8"), /PRIVATE_/);
+    assert.equal(existsSync(path.join(cwd, ".github", "supervised-worker.json")), false);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test("malformed hook JSON fails open without echoing its content", () => {
   const result = run(["hook", "Stop"], { input: "{TOPSECRET" });
@@ -443,6 +583,10 @@ test("campaign export supports only deterministic JSON and Markdown stdout forms
   try {
     const state = writeCampaignState(cwd);
     const before = readdirSync(state).sort();
+    const planBefore = readFileSync(path.join(state, "plan.json"));
+    const ledgerSnapshot = () => readdirSync(path.join(state, "runs")).sort()
+      .map((file) => [file, readFileSync(path.join(state, "runs", file))]);
+    const ledgerBefore = ledgerSnapshot();
     const defaultJson = run(["campaign", "export"], { cwd });
     const explicitJson = run(["campaign", "export", "--format", "json"], { cwd });
     const markdown = run(["campaign", "export", "--format", "markdown"], { cwd });
@@ -463,7 +607,10 @@ test("campaign export supports only deterministic JSON and Markdown stdout forms
     assert.match(markdown.stdout, /^# Local Campaign Receipt/);
     assert.match(markdown.stdout, /Local-only, not Provider-Verified Completion/);
     assert.doesNotMatch(markdown.stdout, /SECRET CLI|secret-cli-id/);
-    assert.deepEqual(readdirSync(state).sort(), before);
+    assert.deepEqual(readdirSync(state).sort(), [...before, "locks"].sort());
+    assert.deepEqual(readdirSync(path.join(state, "locks")), []);
+    assert.deepEqual(readFileSync(path.join(state, "plan.json")), planBefore);
+    assert.deepEqual(ledgerSnapshot(), ledgerBefore);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

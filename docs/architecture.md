@@ -180,6 +180,39 @@ is required because that release added Agent Plugins v1 manifest support.
 
 ### Helper
 
+Routine starts and completions share one journal transaction with legacy event
+appenders. It covers correlation, complete-file read/modify/publication, fsync,
+read-back, and admission under the existing record, file-count, file-size, and
+aggregate bounds. No acknowledged prefix is truncated or overwritten by a
+concurrent writer. Checkpoint capture holds this boundary through its exact
+`checkpoint_persisted` watermark and ownership tombstone. A completion that wins
+the boundary is included; a checkpoint that wins retains an outcome-unknown
+operation. Late hooks cannot rewrite a receipt or satisfy another claim.
+
+`observation retry-denied` accepts bounded JSON containing the owning session,
+optional transcript anchor, source operation UUID, plan hash, and attachment
+hash. Only a uniquely recorded `tool_denied` event with `not-executed` outcome
+can reserve one retry. The next matching actual hook consumes it before start
+permission, binding the complete normalized argument hash and new invocation
+identity. Changed ownership or ambiguous evidence denies admission. A failed
+start with unconfirmed denial journaling supplies no retry permit. The Worker
+must independently verify the host denial; this API never executes a command.
+
+`handoff validate <artifact> --observe` accepts an owning session, optional
+transcript anchor, current `tool_use_id`, and `retryOf` (null or the first helper
+operation UUID). This opt-in adapter proves only its own deterministic handoff
+validation, not the effects of its enclosing terminal command. It snapshots
+artifact bytes, workflow/acceptance inputs or absence, inspected path predicates,
+parameters, implementation/runtime identity, and separate ownership/plan bindings.
+Validation consumes that captured snapshot. A retry reopens and hashes the same
+dependency set and reserves its sole second attempt before evaluation. Results
+are returned on stdout, while only typed identities and hashes enter the ledger.
+Delivery stays unconfirmed; a successful child does not resolve an unknown parent.
+Second missing results or uncertain reservations break the circuit. When a
+reservation-failure marker cannot be persisted, the journal lock is retained for
+explicit snapshot-bound recovery rather than exposing another unused allowance.
+Neither API permits replay of an unknown mutation or accepts caller effect labels.
+
 The runtime-dependency-free Node helper owns deterministic parsing, hashing,
 atomic state writes, and bounded Stop state. Development validation uses Ajv and
 YAML to check the published Draft 2020-12 schemas, examples, plugin manifest, and
@@ -198,8 +231,9 @@ recorded original source hash. Completion audit records and campaign export
 likewise share one canonical plan hash implementation.
 
 Plan observations reveal only a domain-separated hash of each item ID and its
-status. Ledger observation is closed to eleven event variants: the original
-eight plus `tool_started`, `checkpoint_persisted`, and `checkpoint_resumed`.
+status. Ledger observation uses a closed event vocabulary including tool starts,
+completions, verified denials, denied-retry reservations and consumption, helper
+attempts/results/circuit breaks, and checkpoint persistence/resumption.
 The parser rejects unsafe or unstable files and is bounded by file count, file
 bytes, aggregate bytes, and record bytes. Only event names, counts, UTC bounds,
 and a length-framed ledger hash leave the parser; record details and session
@@ -238,6 +272,7 @@ The state directory belongs to the repository being worked on, not the plugin:
 |-- runs/*.jsonl    # append-only metadata events by hashed session id
 |-- checkpoints/*.json # immutable receipts named by exact file-byte SHA-256
 |-- locks/lifecycle/ # shared repository lifecycle exclusion
+|-- locks/journal/   # bounded metadata publication and checkpoint-watermark exclusion
 |-- attachment.json # v3 claim/route identity; provisional, active, or checkpointed
 `-- runtime/*.json  # bounded Stop counters
 ```
@@ -279,12 +314,16 @@ The record contains the session hash, repository root and hash, random claim
 generation, lifecycle status, and timestamps; it contains no transcript
 content. Targetless events accept an active or provisional route only while the
 repository's `attachment.json` carries the same session hash and generation.
-Route and attachment transitions and ledger mutations are serialized by the
-workspace-scoped session lock when available, followed by repository lifecycle
-locks in canonical-root order. A repository lock is also required for sessions
-without transcript routing. No path acquires a session lock while holding a
-repository lock. Old-root reconciliation when rebinding and explicit release
-use the same repository exclusion. Explicit release captures its attachment
+Route and attachment transitions use the workspace-scoped session lock when
+available, followed by repository lifecycle locks and then journal locks in
+canonical-root order. Ordinary tool observations and targetless session/compact
+observations use only session and journal exclusion. Repairing a missing binding
+marker or mutating protected state still requires the lifecycle guard. Unrouted
+sessions share the same repository-local journal mutex; an in-process mutex is
+not used as cross-process exclusion. No path upgrades a journal lock into a
+session or lifecycle lock. Old-root reconciliation and explicit release retain
+the stronger lifecycle guard and coordinate with the journal boundary.
+Explicit release captures its attachment
 before waiting and revalidates that exact byte hash and filesystem identity
 under the lock, so a delayed release cannot remove a successor.
 Potentially blocking drive-locality checks for the hook cwd, qualified
@@ -296,7 +335,7 @@ without deleting, renaming, or replacing its owner. A delayed scheduler wake
 may return later but cannot retry acquisition after the deadline. A lock that
 remains authoritative then fails visibly and requires explicit snapshot-bound
 recovery. A new session has a different hashed session lock but cannot bypass
-the repository's shared lifecycle lock. Each lock writes one UUID-named owner file and
+the repository's shared transition and journal guards. Each lock writes one UUID-named owner file and
 holds that file open so copied contents cannot impersonate its filesystem
 identity. The owner must remain the sole entry in the same stable, nonzero
 device/inode directory identity. Release atomically renames the canonical lock

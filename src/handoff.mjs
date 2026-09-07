@@ -1,13 +1,18 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import {
+  closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync,
+  openSync, readFileSync, readSync, realpathSync,
+} from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { atomicWriteJson, sha256, stateDirectory } from "./core.mjs";
 import {
   LEGACY_DEFAULT_ROLES,
   parseWorkflowJson,
   resolveWorkflowRoles,
+  WORKFLOW_ACCEPTANCE_PATH,
   WORKFLOW_CONFIG_PATH,
 } from "./workflow.mjs";
 
@@ -55,6 +60,10 @@ function isRecord(value) {
 
 function nonBlank(value) {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function handoffReader() {
+  return { lstatSync, readFileSync, realpathSync };
 }
 
 function isDateTime(value) {
@@ -107,12 +116,12 @@ export function directoryIdentityMatches(leftPath, rightPath, left, right) {
   );
 }
 
-function sameDirectoryIdentity(leftPath, rightPath) {
+function sameDirectoryIdentity(leftPath, rightPath, reader = handoffReader()) {
   return directoryIdentityMatches(
     leftPath,
     rightPath,
-    lstatSync(leftPath, { bigint: true }),
-    lstatSync(rightPath, { bigint: true }),
+    reader.lstatSync(leftPath, { bigint: true }),
+    reader.lstatSync(rightPath, { bigint: true }),
   );
 }
 
@@ -177,11 +186,11 @@ function validateBlockedBy(value, label, errors) {
   }
 }
 
-function assertExistingPathSafe(workspace, repositoryPath, label, errors) {
+function assertExistingPathSafe(workspace, repositoryPath, label, errors, reader) {
   const workspacePath = path.resolve(workspace);
   let workspaceReal;
   try {
-    workspaceReal = realpathSync(workspacePath);
+    workspaceReal = reader.realpathSync(workspacePath);
   } catch {
     errors.push(`${label} workspace cannot be resolved`);
     return;
@@ -191,7 +200,7 @@ function assertExistingPathSafe(workspace, repositoryPath, label, errors) {
     current = path.join(current, segment);
     let stats;
     try {
-      stats = lstatSync(current);
+      stats = reader.lstatSync(current);
     } catch (error) {
       if (error?.code === "ENOENT") break;
       errors.push(`${label} cannot be resolved safely`);
@@ -206,7 +215,7 @@ function assertExistingPathSafe(workspace, repositoryPath, label, errors) {
       return;
     }
     try {
-      const currentReal = realpathSync(current);
+      const currentReal = reader.realpathSync(current);
       if (!isContained(workspaceReal, currentReal)) {
         errors.push(`${label} resolves outside the workspace`);
         return;
@@ -218,7 +227,7 @@ function assertExistingPathSafe(workspace, repositoryPath, label, errors) {
   }
 }
 
-export function validateRepositoryPath(workspace, value, label = "path") {
+export function validateRepositoryPath(workspace, value, label = "path", reader = handoffReader()) {
   const errors = [];
   if (!nonBlank(value)) return [`${label} must be a non-empty string`];
   if (/\s/.test(value[0]) || /\s/.test(value.at(-1))) {
@@ -243,7 +252,7 @@ export function validateRepositoryPath(workspace, value, label = "path") {
   if (segments.map((segment) => segment.toLowerCase()).join("/") === WORKFLOW_CONFIG_PATH) {
     errors.push(`${label} targets protected role authority`);
   }
-  if (errors.length === 0) assertExistingPathSafe(workspace, value, label, errors);
+  if (errors.length === 0) assertExistingPathSafe(workspace, value, label, errors, reader);
   return errors;
 }
 
@@ -271,7 +280,7 @@ function companionProducers(workflow, role) {
   return [...new Set(producers)];
 }
 
-function validateBuildContract(value, workspace, roles) {
+function validateBuildContract(value, workspace, roles, reader) {
   const errors = [];
   const keys = new Set([
     "schemaVersion", "kind", "itemId", "producedBy", "workflowHash", "createdAt", "status", "premise",
@@ -318,7 +327,7 @@ function validateBuildContract(value, workspace, roles) {
   }
   const targetFiles = stringArray(value.targetFiles, "targetFiles", errors, { unique: true });
   targetFiles.forEach((file, index) => {
-    errors.push(...validateRepositoryPath(workspace, file, `targetFiles[${index}]`));
+    errors.push(...validateRepositoryPath(workspace, file, `targetFiles[${index}]`, reader));
   });
   stringArray(value.consumers, "consumers", errors, { unique: true });
   stringArray(value.acceptanceCriteria, "acceptanceCriteria", errors, { unique: true });
@@ -354,7 +363,7 @@ function validateCheck(value, label, errors) {
   validateEvidence(value.evidence, `${label}.evidence`, errors);
 }
 
-function validateBuildReport(value, workspace, roles) {
+function validateBuildReport(value, workspace, roles, reader) {
   const errors = [];
   const keys = new Set([
     "schemaVersion", "kind", "itemId", "producedBy", "workflowHash", "createdAt", "status", "contractHash",
@@ -374,7 +383,7 @@ function validateBuildReport(value, workspace, roles) {
   if (!HASH_RE.test(value.contractHash ?? "")) errors.push("contractHash must be a SHA-256 hash");
   const changedFiles = stringArray(value.changedFiles, "changedFiles", errors, { unique: true });
   changedFiles.forEach((file, index) => {
-    errors.push(...validateRepositoryPath(workspace, file, `changedFiles[${index}]`));
+    errors.push(...validateRepositoryPath(workspace, file, `changedFiles[${index}]`, reader));
   });
   if (!Array.isArray(value.checks)) errors.push("checks must be an array");
   else {
@@ -542,9 +551,9 @@ function validateReviewReport(value, roles) {
   return errors;
 }
 
-export function validateHandoffValue(value, workspace = process.cwd()) {
+export function validateHandoffValue(value, workspace = process.cwd(), reader = handoffReader()) {
   if (!isRecord(value)) return ["handoff must be a JSON object"];
-  const workflow = resolveWorkflowRoles(workspace, { requireAcceptance: true });
+  const workflow = resolveWorkflowRoles(workspace, { requireAcceptance: true, reader });
   if (!workflow.ok) return workflow.errors.map((error) => `workflow: ${error}`);
   const effectiveWorkflow = {
     ...workflow.roles,
@@ -552,8 +561,8 @@ export function validateHandoffValue(value, workspace = process.cwd()) {
     workflowHash: workflow.workflowHash,
     reviewPolicy: workflow.reviewPolicy,
   };
-  if (value.kind === "build-contract") return validateBuildContract(value, workspace, effectiveWorkflow);
-  if (value.kind === "build-report") return validateBuildReport(value, workspace, effectiveWorkflow);
+  if (value.kind === "build-contract") return validateBuildContract(value, workspace, effectiveWorkflow, reader);
+  if (value.kind === "build-report") return validateBuildReport(value, workspace, effectiveWorkflow, reader);
   if (value.kind === "review-report") return validateReviewReport(value, effectiveWorkflow);
   return ["handoff kind is unsupported"];
 }
@@ -742,12 +751,12 @@ function loadModelReceipt(workspace, review, workflow, role, attempt, now) {
   return value;
 }
 
-function assertSafeArtifactPath(workspace, filePath) {
+function assertSafeArtifactPath(workspace, filePath, reader = handoffReader()) {
   const workspacePath = path.resolve(workspace);
   const requestedPath = path.resolve(workspacePath, filePath);
   let workspaceRealPath;
   try {
-    workspaceRealPath = realpathSync(workspacePath);
+    workspaceRealPath = reader.realpathSync(workspacePath);
   } catch {
     throw new Error("handoff workspace cannot be resolved safely");
   }
@@ -768,11 +777,11 @@ function assertSafeArtifactPath(workspace, filePath) {
   }
   let requestedWorkspaceRealPath;
   try {
-    requestedWorkspaceRealPath = realpathSync(requestedWorkspacePrefix);
+    requestedWorkspaceRealPath = reader.realpathSync(requestedWorkspacePrefix);
   } catch {
     throw new Error("handoff path prefix cannot be resolved safely");
   }
-  if (!sameDirectoryIdentity(requestedWorkspaceRealPath, workspaceRealPath)) {
+  if (!sameDirectoryIdentity(requestedWorkspaceRealPath, workspaceRealPath, reader)) {
     throw new Error("handoff path prefix does not identify the active workspace");
   }
 
@@ -788,7 +797,7 @@ function assertSafeArtifactPath(workspace, filePath) {
   ]) {
     let stats;
     try {
-      stats = lstatSync(candidate);
+      stats = reader.lstatSync(candidate);
     } catch {
       throw new Error("handoff file does not exist or cannot be resolved safely");
     }
@@ -806,8 +815,8 @@ function assertSafeArtifactPath(workspace, filePath) {
   let resolved;
   let handoffsRealPath;
   try {
-    resolved = realpathSync(requestedPath);
-    handoffsRealPath = realpathSync(handoffsPath);
+    resolved = reader.realpathSync(requestedPath);
+    handoffsRealPath = reader.realpathSync(handoffsPath);
   } catch {
     throw new Error("handoff file does not exist or cannot be resolved safely");
   }
@@ -822,22 +831,22 @@ function assertSafeArtifactPath(workspace, filePath) {
   ) {
     throw new Error("handoff resolved identity differs from the requested item and artifact");
   }
-  const stats = lstatSync(artifactPath);
+  const stats = reader.lstatSync(artifactPath);
   if (stats.nlink > 1) throw new Error("handoff artifact has multiple hard links");
   if (stats.size > MAX_HANDOFF_BYTES) throw new Error("handoff file exceeds the size limit");
   return { resolved, itemHash: requestedItemHash, fileName: requestedFileName };
 }
 
-function loadHandoffFile(workspace, filePath, expectedKind = null) {
-  const safe = assertSafeArtifactPath(workspace, filePath);
-  const bytes = readFileSync(safe.resolved);
+function loadHandoffFile(workspace, filePath, expectedKind = null, reader = handoffReader()) {
+  const safe = assertSafeArtifactPath(workspace, filePath, reader);
+  const bytes = reader.readFileSync(safe.resolved);
   let value;
   try {
     value = JSON.parse(bytes.toString("utf8"));
   } catch {
     return { value: null, hash: sha256(bytes), errors: ["handoff file is not valid JSON"], ...safe };
   }
-  const errors = validateHandoffValue(value, workspace);
+  const errors = validateHandoffValue(value, workspace, reader);
   if (expectedKind && value.kind !== expectedKind) errors.push(`handoff kind must be ${expectedKind}`);
   const expectedName = ARTIFACT_FILES.get(value.kind);
   if (expectedName && safe.fileName !== expectedName) errors.push(`handoff file name must be ${expectedName}`);
@@ -847,9 +856,9 @@ function loadHandoffFile(workspace, filePath, expectedKind = null) {
   return { value, hash: sha256(bytes), errors, ...safe };
 }
 
-export function inspectHandoffFile(workspace, filePath) {
+export function inspectHandoffFile(workspace, filePath, reader = handoffReader()) {
   try {
-    const result = loadHandoffFile(workspace, filePath);
+    const result = loadHandoffFile(workspace, filePath, null, reader);
     return {
       ok: result.errors.length === 0,
       kind: result.value?.kind ?? null,
@@ -860,6 +869,205 @@ export function inspectHandoffFile(workspace, filePath) {
   } catch (error) {
     return { ok: false, kind: null, itemId: null, sha256: null, errors: [error.message] };
   }
+}
+
+function handoffSnapshotStats(stats) {
+  const regular = stats.isFile();
+  return {
+    type: stats.isSymbolicLink() ? "link" : regular ? "file" : stats.isDirectory() ? "directory" : "other",
+    dev: String(stats.dev), ino: String(stats.ino), mode: String(stats.mode),
+    nlink: regular ? String(stats.nlink) : null,
+    size: regular ? String(stats.size) : null,
+    modified: regular ? String(stats.mtimeNs ?? stats.mtimeMs) : null,
+    changed: regular ? String(stats.ctimeNs ?? stats.ctimeMs) : null,
+  };
+}
+
+function readHandoffSnapshotFile(filePath) {
+  const before = lstatSync(filePath, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n ||
+    before.size > BigInt(MAX_HANDOFF_BYTES)) throw new Error("helper input is not a bounded single-link file");
+  const resolved = realpathSync(filePath);
+  const identity = JSON.stringify(handoffSnapshotStats(before));
+  const descriptor = openSync(filePath,
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+  try {
+    if (JSON.stringify(handoffSnapshotStats(fstatSync(descriptor, { bigint: true }))) !== identity) {
+      throw new Error("helper input changed while opening");
+    }
+    const bytes = Buffer.alloc(Number(before.size) + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const count = readSync(descriptor, bytes, length, bytes.length - length, length);
+      if (count === 0) break;
+      length += count;
+    }
+    if (length !== Number(before.size) || realpathSync(filePath) !== resolved ||
+      JSON.stringify(handoffSnapshotStats(fstatSync(descriptor, { bigint: true }))) !== identity ||
+      JSON.stringify(handoffSnapshotStats(lstatSync(filePath, { bigint: true }))) !== identity) {
+      throw new Error("helper input changed while reading");
+    }
+    return { bytes: bytes.subarray(0, length), identity, resolved };
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+const HANDOFF_IMPLEMENTATION_FILES = [
+  "./handoff.mjs", "./workflow.mjs", "./core.mjs", "./cli.mjs", "../schemas/lifecycle.schema.json",
+].map((relative) => fileURLToPath(new URL(relative, import.meta.url)));
+
+function handoffImplementationHash() {
+  const modules = HANDOFF_IMPLEMENTATION_FILES.map((filePath) => {
+    const captured = readHandoffSnapshotFile(filePath);
+    return { filePath, resolved: captured.resolved, identity: captured.identity, hash: sha256(captured.bytes) };
+  });
+  const runtime = {
+    executable: realpathSync(process.execPath),
+    identity: handoffSnapshotStats(lstatSync(process.execPath, { bigint: true })),
+    version: process.version, versions: process.versions, platform: process.platform, arch: process.arch,
+    arguments: process.execArgv, options: process.env.NODE_OPTIONS ?? null,
+  };
+  const bytes = JSON.stringify({ modules, runtime });
+  if (Buffer.byteLength(bytes) > MAX_HANDOFF_BYTES) throw new Error("helper implementation identity exceeds its bound");
+  return sha256(`supervised-worker-handoff-implementation-v1\0${bytes}`);
+}
+
+const LOADED_HANDOFF_IMPLEMENTATION_HASH = (() => {
+  try {
+    return handoffImplementationHash();
+  } catch {
+    return null;
+  }
+})();
+
+export function captureHandoffValidation(workspace, filePath) {
+  const entries = new Map();
+  let totalBytes = 0;
+  let metadataBytes = 0;
+  let sealed = false;
+  let incomplete = false;
+  let evaluated = false;
+  const current = (kind, candidate) => {
+    try {
+      if (kind === "bytes") {
+        const captured = readHandoffSnapshotFile(candidate);
+        return { value: captured.bytes, signature: {
+          state: "present", hash: sha256(captured.bytes), identity: captured.identity, resolved: captured.resolved,
+        } };
+      }
+      const value = kind === "realpath" ? realpathSync(candidate)
+        : lstatSync(candidate, { bigint: kind === "bigint-stat" });
+      return { value, signature: { state: "present", value: kind === "realpath" ? value : handoffSnapshotStats(value) } };
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      return { value: null, signature: { state: "absent" } };
+    }
+  };
+  const read = (kind, candidate) => {
+    const resolved = path.resolve(candidate);
+    const key = JSON.stringify([kind, resolved]);
+    let entry = entries.get(key);
+    if (entry === undefined) {
+      if (sealed) {
+        incomplete = true;
+        throw new Error("validation attempted an uncaptured dependency");
+      }
+      if (entries.size >= 4_096 || Buffer.byteLength(resolved) > 4_096) {
+        throw new Error("helper dependency count or path exceeds its bound");
+      }
+      entry = { kind, path: resolved, ...current(kind, resolved) };
+      totalBytes += Buffer.isBuffer(entry.value) ? entry.value.length : 0;
+      metadataBytes += Buffer.byteLength(JSON.stringify([key, entry.signature]));
+      if (totalBytes > 8_388_608 || metadataBytes > MAX_HANDOFF_BYTES) {
+        throw new Error("helper snapshot exceeds its aggregate bound");
+      }
+      entries.set(key, entry);
+    }
+    if (entry.signature.state === "absent") {
+      throw Object.assign(new Error("captured dependency is absent"), { code: "ENOENT" });
+    }
+    return Buffer.isBuffer(entry.value) ? Buffer.from(entry.value) : entry.value;
+  };
+  const reader = {
+    lstatSync: (candidate, options) => read(options?.bigint ? "bigint-stat" : "stat", candidate),
+    realpathSync: (candidate) => read("realpath", candidate),
+    readFileSync: (candidate) => read("bytes", candidate),
+  };
+  const canonicalWorkspace = reader.realpathSync(path.resolve(workspace));
+  const safe = assertSafeArtifactPath(workspace, filePath, reader);
+  const artifactBytes = reader.readFileSync(safe.resolved);
+  for (const relative of [WORKFLOW_CONFIG_PATH, WORKFLOW_ACCEPTANCE_PATH]) {
+    let candidate = canonicalWorkspace;
+    const segments = relative.split("/");
+    for (const [index, segment] of segments.entries()) {
+      candidate = path.join(candidate, segment);
+      let stats;
+      try {
+        stats = reader.lstatSync(candidate);
+      } catch (error) {
+        if (error?.code === "ENOENT") continue;
+        throw error;
+      }
+      const leaf = index === segments.length - 1;
+      if (stats.isSymbolicLink() || (leaf ? !stats.isFile() || stats.nlink !== 1 : !stats.isDirectory())) {
+        throw new Error("helper workflow dependency is unsafe");
+      }
+      const resolved = reader.realpathSync(candidate);
+      if (!isContained(canonicalWorkspace, resolved)) throw new Error("helper dependency escapes the workspace");
+      if (leaf) reader.readFileSync(resolved);
+    }
+  }
+  let value = null;
+  try {
+    value = JSON.parse(artifactBytes.toString("utf8"));
+  } catch {
+    value = null;
+  }
+  const paths = value?.kind === "build-contract" ? value.targetFiles
+    : value?.kind === "build-report" ? value.changedFiles : [];
+  if (Array.isArray(paths)) {
+    if (paths.length > 256) throw new Error("helper path predicate count exceeds its bound");
+    for (const candidate of paths.filter(nonBlank)) {
+      validateRepositoryPath(workspace, candidate, "helper path", reader);
+    }
+  }
+  sealed = true;
+  const parameters = { workspace, filePath, mode: "observe", requireAcceptance: true };
+  const namespaceHash = sha256(`supervised-worker-handoff-namespace-v1\0${JSON.stringify({
+    workspace: canonicalWorkspace, artifact: safe.resolved,
+  })}`);
+  const parametersHash = sha256(`supervised-worker-handoff-parameters-v1\0${JSON.stringify(parameters)}`);
+  const inputHash = sha256(`supervised-worker-handoff-input-v1\0${JSON.stringify({
+    namespaceHash, parametersHash,
+    dependencies: [...entries].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, entry]) => [key, entry.signature]),
+  })}`);
+  const requireUnchanged = () => {
+    if (incomplete || LOADED_HANDOFF_IMPLEMENTATION_HASH === null ||
+      handoffImplementationHash() !== LOADED_HANDOFF_IMPLEMENTATION_HASH) {
+      throw new Error("helper implementation or captured dependency set is inconsistent");
+    }
+    for (const entry of entries.values()) {
+      if (JSON.stringify(current(entry.kind, entry.path).signature) !== JSON.stringify(entry.signature)) {
+        throw new Error("helper input changed after capture");
+      }
+    }
+  };
+  requireUnchanged();
+  return Object.freeze({
+    namespaceHash, parametersHash, inputHash, implementationHash: LOADED_HANDOFF_IMPLEMENTATION_HASH,
+    requireUnchanged,
+    evaluate() {
+      if (evaluated) throw new Error("captured validation was already evaluated");
+      evaluated = true;
+      const result = inspectHandoffFile(workspace, filePath, reader);
+      if (incomplete || Buffer.byteLength(JSON.stringify(result)) > MAX_HANDOFF_BYTES) {
+        throw new Error("helper evaluation exceeded its captured inputs or result bound");
+      }
+      return result;
+    },
+  });
 }
 
 function setEquals(left, right) {
