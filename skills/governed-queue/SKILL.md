@@ -10,8 +10,8 @@ or work expected to span several implementation slices.
 
 ## Durable Plan
 
-Create `.supervised-worker/plan.json` through a fully qualified file target using
-this minimum shape:
+Publish `.supervised-worker/plan.json` through the verified immutable helper's
+`lifecycle plan` transition, using this minimum plan shape:
 
 ```json
 {
@@ -39,12 +39,18 @@ Allowed item states are `pending`, `in_progress`, `banked`, and `parked`.
 Exactly one item should normally be `in_progress`. Never turn a failed queue
 enumeration into an empty `items` array.
 
-Create or update `plan.json` through a file-editing tool. The pre-tool hook
-creates a provisional, generation-bound claim for the hashed writing session;
-the successful post-tool hook promotes it and records completion metadata. A
-failed first write that leaves no materialized plan, or Stop without one,
-releases the provisional claim. Other Copilot sessions in the same repository
-remain inert and do not log tools or receive Stop decisions.
+The trusted host must provide `SUPERVISED_WORKER_HOST_AUTHORITY` for exactly one
+Worker and hook from the selected immutable installation. Do not create that
+inventory yourself or infer authority from a selector. Missing or unverifiable
+host authority is a blocker, not permission to initialize state another way.
+Run `node <immutable-plugin-root>/src/cli.mjs lifecycle observe` with JSON stdin
+containing `session_id` and any `transcript_path`. Pass that exact observation as
+`expected`, plus the session fields and `plan`, to `lifecycle plan`. Direct file
+edits are denied. The transition owns claim, plan publication, and promotion.
+Use explicit `resume` for an existing ownerless plan or checkpoint tombstone.
+Other sessions, including sibling worktrees and checkpointed source sessions,
+remain inert and do not acquire lifecycle locks, log tools, or receive Stop
+behavior. Only a validated owning-session capability enables lifecycle hooks.
 If route or attachment cleanup fails, the hook reports that failure and the
 claim remains recoverable; do not treat that output as a release receipt.
 

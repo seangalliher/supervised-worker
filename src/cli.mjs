@@ -11,21 +11,25 @@ import {
   serializeLocalCampaignReceipt,
 } from "./campaign.mjs";
 import {
+  applyCampaignPlan,
   checkpointSession,
-  handleHook,
+  handlePluginHook,
   inspectLifecycleLock,
+  issueRescueCapability,
   lifecycleFailureDetails,
   MAX_CHECKPOINT_REQUEST_BYTES,
   MAX_LIFECYCLE_REQUEST_BYTES,
   MAX_OBSERVATION_REQUEST_BYTES,
   observeHandoffValidation,
-  recoverLifecycleLock,
+  observeCampaignTransition,
   releaseAttachment,
   requestDeniedToolRetry,
+  rescueLifecycle,
   resumeSession,
   summarizePlan,
   validatePlan,
 } from "./core.mjs";
+import { verifyWorkerAuthority } from "./authority.mjs";
 import { inspectGitHubQueue, validateGitHubQueueObservation } from "./github-queue.mjs";
 import {
   inspectHandoffFile,
@@ -343,7 +347,7 @@ async function main() {
   const [command = "help", argument, ...argumentsAfter] = process.argv.slice(2);
   const hasNoArguments = argument === undefined && argumentsAfter.length === 0;
   const usage =
-    "Usage: node src/cli.mjs <validate|doctor|install|status|checkpoint|resume|release|observation retry-denied|lifecycle inspect|lifecycle recover|queue inspect OWNER/REPO --state open|closed|all|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
+    "Usage: node src/cli.mjs <validate|doctor|install|status|checkpoint|resume|release|observation retry-denied|lifecycle observe|lifecycle plan|lifecycle rescue-authorize|lifecycle inspect|lifecycle recover|queue inspect OWNER/REPO --state open|closed|all|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
   if (command === "help" && hasNoArguments) {
     process.stdout.write(usage);
     return;
@@ -405,7 +409,7 @@ async function main() {
       );
       return;
     }
-    process.stdout.write(`${JSON.stringify(handleHook(input, argument, input.cwd))}\n`);
+    process.stdout.write(`${JSON.stringify(handlePluginHook(input, argument, root))}\n`);
     return;
   }
   if (command === "observation" && argument === "retry-denied" && argumentsAfter.length === 0) {
@@ -420,7 +424,12 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    const result = requestDeniedToolRetry(process.cwd(), request);
+    let result;
+    try {
+      result = requestDeniedToolRetry(process.cwd(), request, verifyWorkerAuthority(process.cwd(), request, root));
+    } catch {
+      result = { status: "denied", permit: null, reason: "Denied retry requires a verified owning Worker capability." };
+    }
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     if (result.status !== "reserved") process.exitCode = 1;
     return;
@@ -435,11 +444,35 @@ async function main() {
       return;
     }
     try {
-      const result = command === "checkpoint" ? checkpointSession(process.cwd(), request) : resumeSession(process.cwd(), request);
+      const authority = verifyWorkerAuthority(process.cwd(), request, root);
+      const result = command === "checkpoint" ? checkpointSession(process.cwd(), request, authority) : resumeSession(process.cwd(), request, authority);
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       if (result.status !== (command === "checkpoint" ? "checkpointed" : "resumed")) process.exitCode = 1;
     } catch (error) {
       process.stdout.write(`${JSON.stringify(lifecycleFailureDetails(error) ?? { status: "unconfirmed", error: error.message })}\n`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (command === "lifecycle" && ["observe", "plan", "rescue-authorize"].includes(argument) && argumentsAfter.length === 0) {
+    try {
+      const request = parseWorkflowJson(await readStdin(argument === "plan" ? MAX_STDIN_BYTES + MAX_CHECKPOINT_REQUEST_BYTES : MAX_CHECKPOINT_REQUEST_BYTES));
+      let result;
+      if (argument === "observe") {
+        if (!request || typeof request !== "object" || Array.isArray(request) ||
+          Object.keys(request).some((key) => !["session_id", "transcript_path"].includes(key))) throw new Error("invalid observation request");
+        result = observeCampaignTransition(process.cwd(), request);
+      } else if (argument === "rescue-authorize") {
+        result = issueRescueCapability(process.cwd(), request, verifyWorkerAuthority(process.cwd(), request, root));
+      } else {
+        result = applyCampaignPlan(process.cwd(), request, verifyWorkerAuthority(process.cwd(), request, root));
+      }
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } catch (error) {
+      process.stdout.write(`${JSON.stringify(lifecycleFailureDetails(error) ?? {
+        schemaVersion: 1, kind: "campaign-transition-outcome", status: error?.transitionCode ? "conflict" : "unconfirmed",
+        code: error?.transitionCode ?? "CAMPAIGN_AUTHORITY_OR_STATE_UNCONFIRMED",
+      })}\n`);
       process.exitCode = 1;
     }
     return;
@@ -452,7 +485,7 @@ async function main() {
       request = null;
     }
     const result = argument === "recover"
-      ? recoverLifecycleLock(process.cwd(), request) : inspectLifecycleLock(process.cwd(), request);
+      ? rescueLifecycle(process.cwd(), request) : inspectLifecycleLock(process.cwd(), request);
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     if (result.status === "unconfirmed") process.exitCode = 1;
     return;
@@ -526,7 +559,12 @@ async function main() {
   }
   if (command === "release" && hasNoArguments) {
     try {
-      process.stdout.write(`${JSON.stringify(releaseAttachment(process.cwd()), null, 2)}\n`);
+      const request = parseWorkflowJson(await readStdin(MAX_CHECKPOINT_REQUEST_BYTES));
+      if (!request || typeof request !== "object" || Array.isArray(request) ||
+        Object.keys(request).some((key) => !["session_id", "transcript_path", "expected"].includes(key)) ||
+        !Object.hasOwn(request, "expected")) throw new Error("release requires an exact expected state and owning session");
+      process.stdout.write(`${JSON.stringify(releaseAttachment(process.cwd(), request.expected, request,
+        verifyWorkerAuthority(process.cwd(), request, root)), null, 2)}\n`);
     } catch (error) {
       process.stdout.write(
         `${JSON.stringify(lifecycleFailureDetails(error) ?? { released: false, message: "Local attachment could not be released safely." }, null, 2)}\n`,
@@ -540,14 +578,25 @@ async function main() {
     if (argument === "validate" && argumentsAfter.length === 1) {
       report = inspectHandoffFile(process.cwd(), argumentsAfter[0]);
     } else if (argument === "validate" && argumentsAfter.length === 2 && argumentsAfter[1] === "--observe") {
+      let request;
       try {
-        const request = parseWorkflowJson(await readStdin(MAX_OBSERVATION_REQUEST_BYTES));
-        report = observeHandoffValidation(process.cwd(), argumentsAfter[0], request);
+        request = parseWorkflowJson(await readStdin(MAX_OBSERVATION_REQUEST_BYTES));
       } catch {
         report = {
           ok: false, status: "denied", outcome: "not-evaluated",
+          code: "HANDOFF_OBSERVATION_INPUT_INVALID",
           errors: ["Observed handoff validation requires bounded, duplicate-key-free JSON stdin."],
         };
+      }
+      if (report === undefined) {
+        try {
+          report = observeHandoffValidation(process.cwd(), argumentsAfter[0], request, verifyWorkerAuthority(process.cwd(), request, root));
+        } catch {
+          report = {
+            ok: false, status: "denied", outcome: "not-evaluated", code: "WORKER_AUTHORITY_UNCONFIRMED",
+            errors: ["Observed handoff validation requires a verified immutable installation and owning-session host authority."],
+          };
+        }
       }
     } else if (argument === "pre-review" && argumentsAfter.length === 2) {
       report = verifyBuildHandoff(process.cwd(), ...argumentsAfter);

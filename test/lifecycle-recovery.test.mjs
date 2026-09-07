@@ -23,7 +23,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 
 import { canonicalPlanHash, checkpointSession, inspectLifecycleLock, recoverLifecycleLock, sha256, validateLifecycle } from "../src/core.mjs";
 
-const launcherPath = fileURLToPath(new URL("../src/hook-launcher.mjs", import.meta.url));
+const launcherPath = fileURLToPath(new URL("./kernel-hook-fixture.mjs", import.meta.url));
 const cliPath = fileURLToPath(new URL("../src/cli.mjs", import.meta.url));
 const coreUrl = new URL("../src/core.mjs", import.meta.url).href;
 const faultingHookScript = `
@@ -1236,7 +1236,9 @@ function childEnvironment() {
 }
 
 function runCli(cwd, args, request, expectedCode = 0) {
-  const result = spawnSync(process.execPath, [cliPath, ...args], {
+  const kernelOperation = args.length === 1 && ["checkpoint", "resume", "release"].includes(args[0]) ? args[0]
+    : args.length === 2 && args[0] === "lifecycle" && args[1] === "recover" ? "recover" : null;
+  const result = spawnSync(process.execPath, kernelOperation === null ? [cliPath, ...args] : [launcherPath, kernelOperation], {
     cwd, env: childEnvironment(), encoding: "utf8", timeout: 20_000,
     input: typeof request === "string" ? request : JSON.stringify(request),
   });
@@ -2408,8 +2410,8 @@ test(`Git campaign snapshots survive recovery before 16 serial hooks and two fou
         syncBuiltinESMExports();
         await import(${JSON.stringify(coreUrl)});
         rendezvous("ready");
-        process.argv = [process.execPath, "hook-launcher.mjs", options.event];
-        await import(${JSON.stringify(new URL("../src/hook-launcher.mjs", import.meta.url).href)});
+        process.argv = [process.execPath, "kernel-hook-fixture.mjs", options.event];
+        await import(${JSON.stringify(new URL("./kernel-hook-fixture.mjs", import.meta.url).href)});
         await new Promise((resolve, reject) => process.send({ type: "result", processId: process.pid, ownership,
           attemptTimes, contentions, waits, observations, readdirObservations, monotonicTime, gateVisits, gateTimeouts },
           (error) => error ? reject(error) : resolve()));

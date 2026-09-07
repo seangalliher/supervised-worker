@@ -41,6 +41,7 @@ const SCHEMA_FILES = [
   "policy-proposal.schema.json",
   "procedure.schema.json",
   "role-handoff.schema.json",
+  "transition.schema.json",
   "workflow.schema.json",
 ];
 const EXAMPLE_SCHEMAS = [
@@ -430,6 +431,13 @@ export function validatePublishedSchemas(root) {
     } catch (error) {
       errors.push(`schemas/${fileName} could not be compiled: ${error.message}`);
     }
+  }
+
+  try {
+    const transitionId = schemas.get("transition.schema.json");
+    if (!transitionId || !ajv.getSchema(transitionId)) errors.push("transition schema could not be compiled");
+  } catch (error) {
+    errors.push(`transition schema could not be compiled: ${error.message}`);
   }
 
   for (const [examplePath, schemaFile] of EXAMPLE_SCHEMAS) {

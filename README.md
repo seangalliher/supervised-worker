@@ -15,6 +15,13 @@ metadata-only lifecycle records, and a bounded completion gate.
 > repositories. It is not yet a security boundary or an unattended production
 > scheduler.
 
+Worker ownership now requires a verified immutable installation and a trusted
+host-supplied authority inventory. Ordinary chats remain inert even in a
+checkpointed repository. Direct plan-file edits cannot start a campaign; use the
+typed lifecycle helper. Hosts without the authority integration fail closed.
+See [Lifecycle Transitions](docs/lifecycle-transitions.md) for the startup
+contract, mutation table, journal boundary, and bounded rescue executor.
+
 ## Why It Exists
 
 Long-running coding sessions commonly fail between otherwise-correct steps:

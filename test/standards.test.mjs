@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
-import { canonicalPlanHash, checkpointSession, handleHook, MAX_CHECKPOINT_BYTES, sha256, validateCheckpoint } from "../src/core.mjs";
+import { canonicalPlanHash, checkpointSession, handleHook, MAX_CHECKPOINT_BYTES, observeCampaignTransition, sha256, validateCheckpoint, validateTransition } from "../src/core.mjs";
 import {
   validatePluginManifest,
   validateSkillDocument,
@@ -35,6 +35,41 @@ function mutateJson(rootPath, relativePath, mutate) {
 
 test("published plugin, skill, schemas, examples, and safety gates conform", () => {
   assert.deepEqual(validateStandards(root), []);
+});
+
+test("transition observations and rescue requests agree with the closed published schema", () => {
+  const cwd = realpathSync(mkdtempSync(path.join(os.tmpdir(), "supervised-worker-transition-schema-")));
+  try {
+    const ajv = new Ajv2020({ allErrors: true, strictTypes: false, strictRequired: false });
+    addFormats(ajv);
+    for (const name of ["lifecycle", "plan", "transition"]) {
+      ajv.addSchema(JSON.parse(readFileSync(path.join(root, "schemas", `${name}.schema.json`))));
+    }
+    const schema = ajv.getSchema("https://supervised-worker.dev/schemas/transition.schema.json");
+    const observation = observeCampaignTransition(cwd, { session_id: "schema-owner" });
+    const request = { session_id: "schema-owner", capability: "a".repeat(64),
+      incidentId: "11111111-1111-4111-8111-111111111111", snapshotHash: "b".repeat(64), action: "inspect" };
+    const plan = { schemaVersion: 1, mode: "active", goal: "Fixture",
+      items: [{ id: "one", title: "One", status: "pending" }], completion: null };
+    for (const value of [observation, request, { session_id: "schema-owner", expected: observation, plan }]) {
+      assert.equal(schema(value), true, JSON.stringify(schema.errors));
+      assert.deepEqual(validateTransition(value), []);
+    }
+    for (const value of [
+      { ...observation, claimGeneration: ["11111111-1111-4111-8111-111111111111"] },
+      { ...observation, state: "complete" },
+      { ...observation, repositoryHash: null },
+      { ...request, action: "shell" },
+      { ...request, capability: [request.capability] },
+      { ...request, command: "PRIVATE_COMMAND" },
+    ]) {
+      assert.equal(schema(value), false);
+      assert.ok(validateTransition(value).length > 0);
+    }
+    assert.throws(() => observeCampaignTransition("relative-root"), /absolute/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("checkpoint runtime and published schema accept producer artifacts and reject untyped fields", () => {
@@ -259,6 +294,18 @@ test("standards validation rejects drift in the Copilot hook manifest", () => {
     const copy = path.join(target, "com.github.copilot", "hooks", "hooks.json");
     writeFileSync(copy, `${readFileSync(copy, "utf8")}\n`);
     assert.match(validateStandards(target).join("\n"), /hooks\.json differs from hooks\.json/);
+  } finally {
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("standards validation compiles the transition contract even without example artifacts", () => {
+  const target = fixture();
+  try {
+    mutateJson(target, "schemas/transition.schema.json", (schema) => {
+      schema.$defs.planRequest.properties.plan.$ref = "missing-plan.schema.json";
+    });
+    assert.match(validateStandards(target).join("\n"), /transition schema could not be compiled/);
   } finally {
     rmSync(target, { recursive: true, force: true });
   }

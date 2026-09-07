@@ -16,13 +16,14 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { parseWorkflowJson, WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
 import { captureHandoffValidation } from "./handoff.mjs";
+import { requireVerifiedWorkerAuthority, verifyWorkerAuthority } from "./authority.mjs";
 
 export const STATE_DIRECTORY = ".supervised-worker";
 export const PLAN_FILE = "plan.json";
@@ -35,6 +36,7 @@ export const MAX_LIFECYCLE_REQUEST_BYTES = 8_192;
 export const MAX_OBSERVATION_REQUEST_BYTES = 8_192;
 const MAX_LIFECYCLE_EVIDENCE_BYTES = 32_768;
 let lifecycleSchema = null;
+let transitionSchema = null;
 const MAX_CHECKPOINT_ITEMS = 4_096;
 const MAX_CHECKPOINT_ORPHANS = 256;
 const MAX_GIT_POINTER_BYTES = 4_096;
@@ -98,8 +100,21 @@ const ATTACHMENT_KEYS = new Set([
   "attachedAt",
   "updatedAt",
 ]);
-const ATTACHMENT_V3_KEYS = new Set([...ATTACHMENT_KEYS, "claimGeneration", "checkpointHash"]);
+const ATTACHMENT_V3_KEYS = new Set([...ATTACHMENT_KEYS, "claimGeneration", "checkpointHash", "workerAuthorityHash"]);
 const ATTACHMENT_STATUSES = new Set(["provisional", "active"]);
+const owningSessionCapabilities = new WeakSet();
+const transitionOwners = new WeakMap();
+const sessionRequestAuthorities = new WeakMap();
+export const CAMPAIGN_TRANSITIONS = Object.freeze({
+  claim: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed"]),
+  promote: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed"]),
+  plan: Object.freeze(["released", "provisional", "active", "resumed"]),
+  checkpoint: Object.freeze(["active", "resumed", "checkpointed"]),
+  resume: Object.freeze(["released", "checkpointed", "resumed"]),
+  stop: Object.freeze(["provisional", "active", "resumed"]),
+  release: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed", "recovery-fenced"]),
+  recover: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed", "recovery-fenced"]),
+});
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const PLAN_WRITER_MATCHER =
   "Write|Edit|create|edit|apply_patch|create_file|str_replace_editor|insert|insert_edit_into_file|replace_string_in_file|multi_replace_string_in_file";
@@ -122,6 +137,7 @@ const HANDOFF_HELPER_FIELDS = [
   "outcome", "delivery",
 ];
 const RUN_LEDGER_EVENT_FIELDS = new Map([
+  ["plan_transitioned", { required: ["planHash", "priorPlanHash", "authorityHash", "routeGeneration", "claimGeneration"], optional: [] }],
   ["plan_inactive", { required: [], optional: [] }],
   ["completion_verified", { required: ["planHash"], optional: [] }],
   ["completion_unverified_release", { required: ["progressHash", "reason"], optional: [] }],
@@ -249,7 +265,7 @@ function ensureSafeDirectory(cwd, directoryPath) {
   return safeDirectory;
 }
 
-export function atomicWriteJson(cwd, filePath, value) {
+export function atomicWriteJson(cwd, filePath, value, beforePublish = null) {
   const safePath = assertSafeStatePath(cwd, filePath);
   ensureSafeDirectory(cwd, path.dirname(safePath));
   assertSafeStatePath(cwd, safePath);
@@ -263,6 +279,7 @@ export function atomicWriteJson(cwd, filePath, value) {
   try {
     assertSafeStatePath(cwd, path.dirname(safePath));
     assertSafeStatePath(cwd, safePath);
+    if (beforePublish !== null) beforePublish();
     renameSync(temporaryPath, safePath);
   } catch (error) {
     rmSync(temporaryPath, { force: true });
@@ -578,6 +595,7 @@ function attachmentFromSnapshot(snapshot) {
     !isDateTime(attachment.attachedAt) ||
     !isDateTime(attachment.updatedAt) ||
     (version3 && (
+      (Object.hasOwn(attachment, "workerAuthorityHash") && !digest(attachment.workerAuthorityHash)) ||
       !(uuid(attachment.claimGeneration) ||
         (checkpointed && attachment.claimGeneration === null)) ||
       !(typeof attachment.checkpointHash === "string" &&
@@ -608,9 +626,9 @@ function requireAttachmentSnapshot(cwd, expected) {
   }
 }
 
-function removeAttachmentSnapshot(cwd, expected) {
+function removeAttachmentSnapshot(cwd, expected, journalGuard) {
   requireAttachmentSnapshot(cwd, expected);
-  removeStateFile(cwd, attachmentPath(cwd));
+  transitionMutation(journalGuard, () => removeStateFile(cwd, attachmentPath(cwd)));
 }
 
 function attachedRecord(cwd, input, routeGeneration = undefined, snapshot = undefined) {
@@ -625,6 +643,137 @@ function attachedRecord(cwd, input, routeGeneration = undefined, snapshot = unde
 
 function isAttached(cwd, input) {
   return attachedRecord(cwd, input) !== null;
+}
+
+function owningSessionCapability(cwd, input) {
+  const routing = readSessionLocator(input, false, true);
+  const root = routing.exists && routing.locator.status !== "released" ? routing.locator.repositoryRoot : cwd;
+  const snapshot = readAttachmentSnapshot(root);
+  const attachment = attachedRecord(root, input, undefined, snapshot);
+  if (attachment === null) return null;
+  if (attachment.routeGeneration !== null) {
+    if (routing.context === null || !routing.exists || routing.locator.status === "released" ||
+      routing.locator.generation !== attachment.routeGeneration ||
+      !pathEquals(root, routing.locator.repositoryRoot) || readSessionMarker(routing.context, input) === null) return null;
+  } else if (routing.exists && routing.locator.status !== "released") return null;
+  const capability = Object.freeze({ root, snapshot, sessionHash: attachment.sessionHash,
+    claimGeneration: attachment.claimGeneration, routeGeneration: attachment.routeGeneration });
+  owningSessionCapabilities.add(capability);
+  return capability;
+}
+
+function requireOwningSessionCapability(capability, input) {
+  if (!owningSessionCapabilities.has(capability) || capability.sessionHash !== sessionHash(input)) {
+    throw new Error("lifecycle behavior requires a validated owning-session capability");
+  }
+  const current = owningSessionCapability(capability.root, input);
+  if (current === null || current.claimGeneration !== capability.claimGeneration ||
+    current.routeGeneration !== capability.routeGeneration || !pathEquals(current.root, capability.root)) {
+    throw new Error("owning-session capability no longer matches the current generation");
+  }
+}
+
+function transitionFileHash(root, filePath, maximum = MAX_SESSION_LOCATOR_BYTES) {
+  assertSafeStatePath(root, filePath);
+  return existsSync(filePath) ? sha256(readBoundedStateBytes(root, filePath, maximum).bytes) : null;
+}
+
+export function observeCampaignTransition(cwd, input = {}) {
+  if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd)) {
+    throw new Error("campaign observation requires a local absolute repository root");
+  }
+  const root = realpathSync(cwd);
+  const plan = loadPlan(root);
+  const snapshot = readAttachmentSnapshot(root);
+  let attachment = null;
+  let state = "released";
+  if (snapshot !== null) {
+    try {
+      attachment = attachmentFromSnapshot(snapshot);
+      state = attachment.status === "active" && attachment.checkpointHash !== null ? "resumed" : attachment.status;
+    } catch {
+      state = "recovery-fenced";
+    }
+  }
+  const context = sessionLocatorContext(input);
+  return {
+    schemaVersion: 1, kind: "campaign-transition-observation", state,
+    repositoryHash: sha256(canonicalJson(recoveryBoundary(root, root))),
+    sessionHash: sessionHash(input),
+    planHash: plan.exists && plan.errors.length === 0 ? canonicalPlanHash(plan.plan) : null,
+    planBytesHash: transitionFileHash(root, planPath(root), MAX_PLAN_BYTES),
+    attachmentHash: snapshot?.hash ?? null,
+    claimGeneration: attachment?.claimGeneration ?? null,
+    routeGeneration: attachment?.routeGeneration ?? null,
+    routeHash: context === null ? null : transitionFileHash(context.storageRoot, context.filePath),
+    markerHash: context === null ? null : transitionFileHash(context.storageRoot, context.markerPath),
+    stopHash: sessionHash(input) === null ? null : transitionFileHash(root, runtimeStatePath(root, input)),
+  };
+}
+
+function withCampaignTransition(operation, cwd, input, expected, guard, action) {
+  if (transitionOwners.has(guard) || validateTransition(expected, "observation").length > 0 || !CAMPAIGN_TRANSITIONS[operation]?.includes(expected.state)) {
+    throw Object.assign(new Error("campaign transition compare-and-set rejected its source state or owner"), {
+      transitionCode: "CAMPAIGN_COMPARE_AND_SET_CONFLICT",
+    });
+  }
+  let current = expected;
+  let uncertain = false;
+  const requireCurrent = () => {
+    guard(cwd);
+    if (uncertain || canonicalJson(observeCampaignTransition(cwd, input)) !== canonicalJson(current)) {
+      throw Object.assign(new Error("campaign transition compare-and-set rejected changed expected state"), {
+        transitionCode: "CAMPAIGN_COMPARE_AND_SET_CONFLICT",
+      });
+    }
+  };
+  requireCurrent();
+  transitionOwners.set(guard, {
+    mutate: (mutation) => {
+      requireCurrent();
+      try {
+        const result = mutation(requireCurrent);
+        current = observeCampaignTransition(cwd, input);
+        return result;
+      } catch (error) {
+        try {
+          uncertain = canonicalJson(observeCampaignTransition(cwd, input)) !== canonicalJson(current);
+        } catch {
+          uncertain = true;
+        }
+        throw error;
+      }
+    },
+  });
+  try {
+    const result = action();
+    try {
+      requireCurrent();
+    } catch (error) {
+      error.transitionResult = result;
+      throw error;
+    }
+    return result;
+  } finally {
+    transitionOwners.delete(guard);
+  }
+}
+
+function transitionMutation(guard, mutation) {
+  const owner = transitionOwners.get(guard);
+  if (owner === undefined) throw new Error("campaign mutation requires the generation-bound transition owner");
+  return owner.mutate(mutation);
+}
+
+function transitionWriteJson(guard, cwd, filePath, value) {
+  return transitionMutation(guard, (requireCurrent) => atomicWriteJson(cwd, filePath, value, requireCurrent));
+}
+
+function transitionWriteBytes(guard, cwd, filePath, bytes, maximum, immutable = false, beforePublish = null) {
+  return transitionMutation(guard, (requireCurrent) => durableWriteBytes(cwd, filePath, bytes, maximum, immutable, null, () => {
+    requireCurrent();
+    if (beforePublish !== null) beforePublish();
+  }));
 }
 
 function pathNameEquals(left, right) {
@@ -1327,12 +1476,17 @@ function withJournalRead(cwd, action) {
   }, () => [...locks].reverse(), releaseContext);
 }
 
-function lifecycleShapeMatches(shape, value) {
-  if (shape.$ref) return lifecycleShapeMatches(lifecycleSchema.$defs[shape.$ref.slice("#/$defs/".length)], value);
-  if (shape.anyOf && !shape.anyOf.some((branch) => lifecycleShapeMatches(branch, value))) return false;
-  if (shape.allOf && !shape.allOf.every((branch) => lifecycleShapeMatches(branch, value))) return false;
+function lifecycleShapeMatches(shape, value, schema = lifecycleSchema) {
+  if (shape.$ref === "https://github.com/seangalliher/supervised-worker/schemas/plan.schema.json") return validatePlan(value).length === 0;
+  if (shape.$ref?.startsWith("lifecycle.schema.json#/$defs/")) {
+    lifecycleSchema ??= parseWorkflowJson(readFileSync(new URL("../schemas/lifecycle.schema.json", import.meta.url)));
+    return lifecycleShapeMatches(lifecycleSchema.$defs[shape.$ref.split("/$defs/")[1]], value, lifecycleSchema);
+  }
+  if (shape.$ref) return lifecycleShapeMatches(schema.$defs[shape.$ref.slice("#/$defs/".length)], value, schema);
+  if (shape.anyOf && !shape.anyOf.some((branch) => lifecycleShapeMatches(branch, value, schema))) return false;
+  if (shape.allOf && !shape.allOf.every((branch) => lifecycleShapeMatches(branch, value, schema))) return false;
   if (shape.if && !lifecycleShapeMatches(
-    lifecycleShapeMatches(shape.if, value) ? shape.then ?? {} : shape.else ?? {}, value,
+    lifecycleShapeMatches(shape.if, value, schema) ? shape.then ?? {} : shape.else ?? {}, value, schema,
   )) return false;
   if (Object.hasOwn(shape, "const") && value !== shape.const) return false;
   if (shape.enum && !shape.enum.includes(value)) return false;
@@ -1346,17 +1500,18 @@ function lifecycleShapeMatches(shape, value) {
     const length = [...value].length;
     if (length < (shape.minLength ?? 0) || length > (shape.maxLength ?? Infinity) ||
       (shape.pattern && !new RegExp(shape.pattern, "u").test(value))) return false;
+    if (shape.format === "date-time" && !isDateTime(value)) return false;
   }
   if (typeof value === "number" && (value < (shape.minimum ?? -Infinity) || value > (shape.maximum ?? Infinity))) return false;
   if (Array.isArray(value)) {
     if (value.length < (shape.minItems ?? 0) || value.length > (shape.maxItems ?? Infinity)) return false;
-    if (shape.items && !value.every((entry) => lifecycleShapeMatches(shape.items, entry))) return false;
+    if (shape.items && !value.every((entry) => lifecycleShapeMatches(shape.items, entry, schema))) return false;
   }
   if (object) {
     if (shape.required?.some((key) => !Object.hasOwn(value, key))) return false;
     if (shape.additionalProperties === false && Object.keys(value).some((key) => !Object.hasOwn(shape.properties ?? {}, key))) return false;
     for (const [key, property] of Object.entries(shape.properties ?? {})) {
-      if (Object.hasOwn(value, key) && !lifecycleShapeMatches(property, value[key])) return false;
+      if (Object.hasOwn(value, key) && !lifecycleShapeMatches(property, value[key], schema)) return false;
     }
     for (const [key, required] of Object.entries(shape.dependentRequired ?? {})) {
       if (Object.hasOwn(value, key) && required.some((name) => !Object.hasOwn(value, name))) return false;
@@ -1375,6 +1530,18 @@ export function validateLifecycle(value, definition = null) {
     return [];
   } catch {
     return ["lifecycle value is invalid or exceeds its published bound"];
+  }
+}
+
+export function validateTransition(value, definition = null) {
+  try {
+    transitionSchema ??= parseWorkflowJson(readFileSync(new URL("../schemas/transition.schema.json", import.meta.url)));
+    const shape = definition === null ? transitionSchema : transitionSchema.$defs[definition];
+    const maximum = definition === "planRequest" ? MAX_PLAN_BYTES + MAX_CHECKPOINT_REQUEST_BYTES : MAX_LIFECYCLE_EVIDENCE_BYTES;
+    if (!shape || Buffer.byteLength(JSON.stringify(value)) > maximum || !lifecycleShapeMatches(shape, value, transitionSchema)) throw new Error();
+    return [];
+  } catch {
+    return ["campaign transition value is invalid or exceeds its published bound"];
   }
 }
 
@@ -1467,7 +1634,7 @@ function recoveryAttachment(root) {
   if (snapshot === null) return { state: "absent" };
   const raw = parseWorkflowJson(snapshot.bytes);
   const keys = raw?.schemaVersion === 1 ? ["schemaVersion", "sessionHash", "attachedAt"] :
-    raw?.schemaVersion === 2 ? [...ATTACHMENT_KEYS] : [...ATTACHMENT_V3_KEYS];
+    raw?.schemaVersion === 2 ? [...ATTACHMENT_KEYS] : [...ATTACHMENT_V3_KEYS].filter((key) => key !== "workerAuthorityHash" || Object.hasOwn(raw, key));
   if (!exactObject(raw, keys)) rejectRecoveryIdentity();
   const attachment = attachmentFromSnapshot(snapshot);
   return {
@@ -1591,7 +1758,7 @@ export function inspectLifecycleLock(cwd, request) {
   }
 }
 
-export function recoverLifecycleLock(cwd, request) {
+export function recoverLifecycleLock(cwd, request, authorize = () => {}) {
   let result = { schemaVersion: 1, kind: "lifecycle-recovery", status: "unconfirmed", intentHash: null, outcomeHash: null, diagnostics: [] };
   let context = null;
   let phase = "request-validation";
@@ -1601,6 +1768,7 @@ export function recoverLifecycleLock(cwd, request) {
     roots: [context.root], input: context.input, session: context.session,
   }), () => guards);
   try {
+    authorize();
     if (validateLifecycle(request, "recoverRequest").length > 0) rejectRecoveryIdentity();
     context = recoveryContext(cwd, request, "recover");
     const expected = request.expected;
@@ -1617,6 +1785,7 @@ export function recoverLifecycleLock(cwd, request) {
     let intentIdentity = null;
     let evidenceIdentity = null;
     const requireRepository = () => {
+      authorize();
       if (canonicalJson(recoveryBoundary(context.root, context.root)) !== canonicalJson(expected.repository)) rejectRecoveryIdentity();
       for (const guard of guards) {
         if (!lifecycleLockIdentityMatches(guard) || !lifecycleLockOwnerIdentityMatches(guard)) rejectRecoveryIdentity();
@@ -1644,6 +1813,8 @@ export function recoverLifecycleLock(cwd, request) {
       if (current === null || canonicalJson(current.file) !== canonicalJson(intentIdentity) ||
         canonicalJson(recoveryBoundary(context.root, evidenceDirectory)) !== canonicalJson(evidenceIdentity)) rejectRecoveryIdentity();
     };
+    const transitionGuard = () => requireRepository();
+    const transitionExpected = observeCampaignTransition(context.root, context.input);
     const publishOutcome = (status, diagnostics) => {
       requireIntent();
       const outcome = { schemaVersion: 1, kind: "lifecycle-recovery-outcome", intentHash, status, diagnostics };
@@ -1651,7 +1822,7 @@ export function recoverLifecycleLock(cwd, request) {
       const bytes = Buffer.from(`${canonicalJson(outcome)}\n`);
       const hash = sha256(bytes);
       const filePath = path.join(evidenceDirectory, `${hash}.outcome.json`);
-      durableWriteBytes(context.root, filePath, bytes, MAX_LIFECYCLE_EVIDENCE_BYTES, true, null, requireIntent);
+      transitionWriteBytes(transitionGuard, context.root, filePath, bytes, MAX_LIFECYCLE_EVIDENCE_BYTES, true, requireIntent);
       const confirmed = recoveryFile(context.root, filePath, MAX_LIFECYCLE_EVIDENCE_BYTES, true);
       if (confirmed === null || !confirmed.bytes.equals(bytes)) rejectRecoveryIdentity();
       requireIntent();
@@ -1675,7 +1846,7 @@ export function recoverLifecycleLock(cwd, request) {
         requireExpected(alreadyRecovered ? recoveredDirectory : context.sourceDirectory);
         phase = "intent-persistence";
         if (validateLifecycle(intent, "recoveryIntent").length > 0) rejectRecoveryIdentity();
-        durableWriteBytes(context.root, intentPath, intentBytes, MAX_LIFECYCLE_EVIDENCE_BYTES, true, null,
+        transitionWriteBytes(transitionGuard, context.root, intentPath, intentBytes, MAX_LIFECYCLE_EVIDENCE_BYTES, true,
           () => requireExpected(alreadyRecovered ? recoveredDirectory : context.sourceDirectory));
         const confirmedIntent = readIntent(true);
         if (confirmedIntent === null) rejectRecoveryIdentity();
@@ -1689,7 +1860,10 @@ export function recoverLifecycleLock(cwd, request) {
           if (recoveryPathStats(context.storageRoot, recoveredDirectory) !== null) rejectRecoveryIdentity();
           phase = "retirement";
           attempts = 1;
-          renameSync(context.sourceDirectory, recoveredDirectory);
+          transitionMutation(transitionGuard, () => {
+            requireExpected(context.sourceDirectory);
+            renameSync(context.sourceDirectory, recoveredDirectory);
+          });
         }
         phase = "retired-validation";
         requireExpected(recoveredDirectory);
@@ -1710,12 +1884,110 @@ export function recoverLifecycleLock(cwd, request) {
       }
       return result;
     };
-    result = withLifecycleCleanup(action, () => [...guards].reverse(), releaseContext);
+    result = withLifecycleCleanup(() => withCampaignTransition("recover", context.root, context.input,
+      transitionExpected, transitionGuard, action), () => [...guards].reverse(), releaseContext);
     return result;
   } catch (error) {
     result.status = "unconfirmed";
     result.diagnostics = [...result.diagnostics, ...recoveryDiagnostics(error, context?.scope ?? null, "recover", phase, attempts)];
     return result;
+  }
+}
+
+export function issueRescueCapability(cwd, request, authority) {
+  const allowed = ["session_id", "transcript_path", "scope", "location", "token", "incidentId", "expiresAt"];
+  if (!request || typeof request !== "object" || Array.isArray(request) ||
+    Object.keys(request).some((key) => !allowed.includes(key)) || !uuid(request.incidentId) ||
+    !isDateTime(request.expiresAt) || Date.parse(request.expiresAt) <= Date.now() ||
+    Date.parse(request.expiresAt) - Date.now() > 900_000) throw new Error("rescue grant request is invalid or expired");
+  requireVerifiedWorkerAuthority(authority, cwd, request);
+  const capability = owningSessionCapability(cwd, request);
+  if (capability === null || attachmentFromSnapshot(capability.snapshot).workerAuthorityHash !== authority.grantHash) {
+    throw new Error("rescue issuance requires the current owning Worker grant");
+  }
+  const selector = Object.fromEntries(Object.entries(request).filter(([key]) => !["incidentId", "expiresAt"].includes(key)));
+  if (selector.transcript_path === undefined) delete selector.session_id;
+  const inspection = inspectLifecycleLock(cwd, selector);
+  if (inspection.status !== "inspected" || inspection.diagnostics[0]?.code !== "LIFECYCLE_OWNER_DEAD") {
+    throw new Error("rescue issuance requires exact verified dead ownership");
+  }
+  const expected = inspection.expected;
+  const context = recoveryContext(cwd, { ...selector, expected }, "recover");
+  const observation = observeCampaignTransition(cwd, request);
+  const token = randomBytes(32).toString("hex");
+  const snapshotHash = sha256(canonicalJson({ expected, observation }));
+  const record = {
+    schemaVersion: 1, kind: "lifecycle-rescue-capability", capabilityHash: sha256(token),
+    incidentId: request.incidentId, expiresAt: request.expiresAt, authorityHash: authority.grantHash,
+    snapshotHash, expected, observation,
+  };
+  const filePath = path.join(stateDirectory(cwd), "rescue-capabilities", `${record.capabilityHash}.json`);
+  let guards = [];
+  const releaseContext = createLifecycleReleaseContext(() => ({ roots: [cwd], input: request, session: context.session }), () => guards);
+  const requireExact = () => {
+    requireVerifiedWorkerAuthority(authority, cwd, request);
+    requireOwningSessionCapability(capability, request);
+    if (Date.parse(request.expiresAt) <= Date.now() || canonicalJson(recoverySnapshot(context)) !== canonicalJson(expected) ||
+      recoveryLiveness(context, expected).code !== "LIFECYCLE_OWNER_DEAD") rejectRecoveryIdentity();
+    for (const guard of guards) {
+      if (!lifecycleLockIdentityMatches(guard) || !lifecycleLockOwnerIdentityMatches(guard)) rejectRecoveryIdentity();
+    }
+  };
+  return withLifecycleCleanup(() => {
+    if (context.scope !== "repository" || context.location === "retired") guards = acquireRepositoryLocks([cwd], releaseContext);
+    return withCampaignTransition("recover", cwd, request, observation, requireExact, () => {
+      transitionWriteBytes(requireExact, cwd, filePath, Buffer.from(`${canonicalJson(record)}\n`), MAX_LIFECYCLE_EVIDENCE_BYTES, true, requireExact);
+      return { schemaVersion: 1, kind: "lifecycle-rescue-grant", status: "issued", capability: token,
+        incidentId: request.incidentId, snapshotHash, expiresAt: request.expiresAt, observation };
+    });
+  }, () => [...guards].reverse(), releaseContext);
+}
+
+export function rescueLifecycle(cwd, request) {
+  const denied = { schemaVersion: 1, kind: "lifecycle-rescue-result", status: "unconfirmed", code: "RESCUE_CAPABILITY_OR_SNAPSHOT_REJECTED" };
+  try {
+    const required = ["capability", "incidentId", "snapshotHash", "action", "session_id"];
+    if (!request || typeof request !== "object" || Array.isArray(request) ||
+      validateTransition(request, "rescueRequest").length > 0 ||
+      Object.keys(request).some((key) => ![...required, "transcript_path"].includes(key)) ||
+      !required.every((key) => Object.hasOwn(request, key)) || !digest(request.capability) ||
+      !uuid(request.incidentId) || !digest(request.snapshotHash) || !["inspect", "recover"].includes(request.action) ||
+      Buffer.byteLength(JSON.stringify(request)) > MAX_LIFECYCLE_REQUEST_BYTES) return denied;
+    if (process.platform === "win32") resetWindowsPathChecks();
+    if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd) ||
+      !pathEquals(path.resolve(cwd), realpathSync(cwd))) return denied;
+    const filePath = path.join(stateDirectory(cwd), "rescue-capabilities", `${sha256(request.capability)}.json`);
+    const snapshot = recoveryFile(cwd, filePath, MAX_LIFECYCLE_EVIDENCE_BYTES);
+    if (snapshot === null) return denied;
+    const record = parseWorkflowJson(snapshot.bytes);
+    if (!exactObject(record, ["schemaVersion", "kind", "capabilityHash", "incidentId", "expiresAt", "authorityHash", "snapshotHash", "expected", "observation"]) ||
+      record.schemaVersion !== 1 || record.kind !== "lifecycle-rescue-capability" || record.capabilityHash !== sha256(request.capability) ||
+      record.incidentId !== request.incidentId || record.snapshotHash !== request.snapshotHash || !digest(record.authorityHash) ||
+      validateLifecycle(record.expected, "snapshot").length > 0 || !isDateTime(record.expiresAt)) return denied;
+    const input = { session_id: request.session_id, ...(request.transcript_path === undefined ? {} : { transcript_path: request.transcript_path }) };
+    const recoveryInput = request.transcript_path === undefined ? {} : input;
+    const requireGrant = () => {
+      const current = recoveryFile(cwd, filePath, MAX_LIFECYCLE_EVIDENCE_BYTES);
+      if (current === null || canonicalJson(current.file) !== canonicalJson(snapshot.file) ||
+        Date.parse(record.expiresAt) <= Date.now() ||
+        record.snapshotHash !== sha256(canonicalJson({ expected: record.expected, observation: record.observation })) ||
+        canonicalJson(observeCampaignTransition(cwd, input)) !== canonicalJson(record.observation)) rejectRecoveryIdentity();
+    };
+    requireGrant();
+    if (request.action === "recover") {
+      const result = recoverLifecycleLock(cwd, { ...recoveryInput, expected: record.expected }, requireGrant);
+      return { schemaVersion: 1, kind: "lifecycle-rescue-result", status: result.status,
+        incidentId: record.incidentId, snapshotHash: record.snapshotHash,
+        intentHash: result.intentHash, outcomeHash: result.outcomeHash, diagnostics: result.diagnostics };
+    }
+    const context = recoveryContext(cwd, { ...recoveryInput, expected: record.expected }, "recover");
+    if (canonicalJson(recoverySnapshot(context)) !== canonicalJson(record.expected) ||
+      recoveryLiveness(context, record.expected).code !== "LIFECYCLE_OWNER_DEAD") return denied;
+    requireGrant();
+    return { schemaVersion: 1, kind: "lifecycle-rescue-result", status: "inspected", incidentId: record.incidentId,
+      snapshotHash: record.snapshotHash, observation: record.observation, owner: "dead" };
+  } catch {
+    return denied;
   }
 }
 
@@ -1806,7 +2078,7 @@ function readSessionMarker(context, input) {
   return marker;
 }
 
-function ensureSessionMarker(context, input) {
+function ensureSessionMarker(context, input, journalGuard) {
   const existing = readSessionMarker(context, input);
   if (existing !== null) return existing;
   ensureSafeDirectory(context.storageRoot, path.dirname(context.markerPath));
@@ -1816,11 +2088,11 @@ function ensureSessionMarker(context, input) {
     firstBoundAt: new Date().toISOString(),
   };
   try {
-    writeFileSync(context.markerPath, `${JSON.stringify(marker, null, 2)}\n`, {
+    transitionMutation(journalGuard, () => writeFileSync(context.markerPath, `${JSON.stringify(marker, null, 2)}\n`, {
       encoding: "utf8",
       mode: 0o600,
       flag: "wx",
-    });
+    }));
     return marker;
   } catch (error) {
     if (error?.code !== "EEXIST") throw error;
@@ -1828,14 +2100,14 @@ function ensureSessionMarker(context, input) {
   }
 }
 
-function readSessionLocator(input, repairMarker = true, inspectMissingMarker = false) {
+function readSessionLocator(input, repairMarker = false, inspectMissingMarker = false, journalGuard = null) {
   const context = sessionLocatorContext(input);
   if (context === null) return { context: null, exists: false, locator: null };
   const marker = readSessionMarker(context, input);
   assertSafeStatePath(context.storageRoot, context.directoryPath);
   assertSafeStatePath(context.storageRoot, context.filePath);
   if (existsSync(context.filePath) && marker === null && !inspectMissingMarker) {
-    if (repairMarker) ensureSessionMarker(context, input);
+    if (repairMarker) ensureSessionMarker(context, input, journalGuard);
     throw new Error("session repository binding marker is missing");
   }
   if (!existsSync(context.filePath)) {
@@ -1890,7 +2162,7 @@ function bindSessionLocator(input, cwd, journalGuard) {
     }
     return { bound: false, created: false, conflict: false };
   }
-  ensureSessionMarker(context, input);
+  ensureSessionMarker(context, input, journalGuard);
   const repositoryRoot = realpathSync(path.resolve(cwd));
   const now = new Date().toISOString();
   const record = {
@@ -1906,11 +2178,11 @@ function bindSessionLocator(input, cwd, journalGuard) {
   ensureSafeDirectory(context.storageRoot, context.directoryPath);
   assertSafeStatePath(context.storageRoot, context.filePath);
   try {
-    writeFileSync(context.filePath, `${JSON.stringify(record, null, 2)}\n`, {
+    transitionMutation(journalGuard, () => writeFileSync(context.filePath, `${JSON.stringify(record, null, 2)}\n`, {
       encoding: "utf8",
       mode: 0o600,
       flag: "wx",
-    });
+    }));
     return { bound: true, created: true, conflict: false, generation: record.generation };
   } catch (error) {
     if (error?.code !== "EEXIST") throw error;
@@ -1920,14 +2192,14 @@ function bindSessionLocator(input, cwd, journalGuard) {
       journalGuard(existing.repositoryRoot);
       const snapshot = readAttachmentSnapshot(existing.repositoryRoot);
       if (attachedRecord(existing.repositoryRoot, input, existing.generation, snapshot)) {
-        removeAttachmentSnapshot(existing.repositoryRoot, snapshot);
+        removeAttachmentSnapshot(existing.repositoryRoot, snapshot, journalGuard);
       }
-      atomicWriteJson(context.storageRoot, context.filePath, record);
+      transitionWriteJson(journalGuard, context.storageRoot, context.filePath, record);
       return { bound: true, created: true, conflict: false, generation: record.generation };
     }
     if (pathEquals(existing.repositoryRoot, repositoryRoot)) {
       if (readAttachment(existing.repositoryRoot) === null) {
-        atomicWriteJson(context.storageRoot, context.filePath, record);
+        transitionWriteJson(journalGuard, context.storageRoot, context.filePath, record);
         return { bound: true, created: true, conflict: false, generation: record.generation };
       }
       return {
@@ -1966,10 +2238,10 @@ function updateSessionLocatorStatus(input, expectedCwd, generation, status, jour
   };
   journalGuard(expectedCwd);
   if (durable) {
-    durableWriteBytes(result.context.storageRoot, result.context.filePath,
-      Buffer.from(`${JSON.stringify(updated, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES, false, null,
+    transitionWriteBytes(journalGuard, result.context.storageRoot, result.context.filePath,
+      Buffer.from(`${JSON.stringify(updated, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES, false,
       () => journalGuard(expectedCwd));
-  } else atomicWriteJson(result.context.storageRoot, result.context.filePath, updated);
+  } else transitionWriteJson(journalGuard, result.context.storageRoot, result.context.filePath, updated);
 }
 
 function bestEffortReleaseSessionLocator(input, expectedCwd, generation, journalGuard) {
@@ -1993,7 +2265,7 @@ function attachedSessionRoot(input, journalGuard) {
   );
   if (result.locator.status === "released") {
     if (attachment !== null) {
-      removeAttachmentSnapshot(result.locator.repositoryRoot, snapshot);
+      removeAttachmentSnapshot(result.locator.repositoryRoot, snapshot, journalGuard);
     }
     return null;
   }
@@ -2494,7 +2766,7 @@ function promoteAttachment(cwd, input, routeGeneration, journalGuard) {
   };
   journalGuard(cwd);
   requireAttachmentSnapshot(cwd, snapshot);
-  atomicWriteJson(cwd, attachmentPath(cwd), promoted);
+  transitionWriteJson(journalGuard, cwd, attachmentPath(cwd), promoted);
   return promoted;
 }
 
@@ -2533,17 +2805,18 @@ function claimSession(cwd, input, promote = false, journalGuard) {
     routeGeneration: locatorClaim.generation ?? null,
     claimGeneration: randomUUID(),
     checkpointHash: null,
+    ...(digest(input.workerAuthorityHash) ? { workerAuthorityHash: input.workerAuthorityHash } : {}),
     attachedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
   let attachmentCreated = false;
   try {
     journalGuard(cwd);
-    writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, {
+    transitionMutation(journalGuard, () => writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, {
       encoding: "utf8",
       mode: 0o600,
       flag: "wx",
-    });
+    }));
     attachmentCreated = true;
   } catch (error) {
     if (error?.code !== "EEXIST") {
@@ -2573,7 +2846,7 @@ function claimSession(cwd, input, promote = false, journalGuard) {
       try {
         journalGuard(cwd);
         requireAttachmentSnapshot(cwd, existingSnapshot);
-        atomicWriteJson(cwd, filePath, migrated);
+        transitionWriteJson(journalGuard, cwd, filePath, migrated);
         migrationWritten = true;
         updateSessionLocatorStatus(input, cwd, record.routeGeneration, migrated.status, journalGuard);
         if (promote) promoteSessionClaim(cwd, input, record.routeGeneration, journalGuard);
@@ -2581,7 +2854,7 @@ function claimSession(cwd, input, promote = false, journalGuard) {
         try {
           if (migrationWritten) {
             journalGuard(cwd);
-            atomicWriteJson(cwd, filePath, JSON.parse(existingSnapshot.bytes.toString("utf8")));
+            transitionWriteJson(journalGuard, cwd, filePath, JSON.parse(existingSnapshot.bytes.toString("utf8")));
           }
         } finally {
           if (locatorClaim.created) {
@@ -2608,7 +2881,7 @@ function claimSession(cwd, input, promote = false, journalGuard) {
   } catch (error) {
     if (attachmentCreated) {
       journalGuard(cwd);
-      removeStateFile(cwd, filePath);
+      transitionMutation(journalGuard, () => removeStateFile(cwd, filePath));
     }
     if (locatorClaim.created) {
       bestEffortReleaseSessionLocator(input, cwd, locatorClaim.generation, journalGuard);
@@ -2637,7 +2910,7 @@ function detachSession(cwd, input, snapshot = readAttachmentSnapshot(cwd), journ
     );
   }
   journalGuard(cwd);
-  removeAttachmentSnapshot(cwd, snapshot);
+  removeAttachmentSnapshot(cwd, snapshot, journalGuard);
   return true;
 }
 
@@ -3134,6 +3407,22 @@ function checkpointFailure(reason) {
 }
 
 function requireSessionRequest(request, operation) {
+  if (operation === "release") {
+    if (validateTransition(request, "releaseRequest").length > 0 ||
+      Buffer.byteLength(JSON.stringify(request)) > MAX_CHECKPOINT_REQUEST_BYTES) checkpointFailure("release request is invalid");
+    return;
+  }
+  if (operation === "plan") {
+    const keys = ["session_id", "expected", "plan"];
+    const allowed = [...keys, "transcript_path"];
+    if (!request || typeof request !== "object" || Array.isArray(request) ||
+      Object.keys(request).some((key) => !allowed.includes(key)) ||
+      !keys.every((key) => Object.hasOwn(request, key)) || sessionHash(request) === null ||
+      Buffer.byteLength(JSON.stringify(request)) > MAX_PLAN_BYTES + MAX_CHECKPOINT_REQUEST_BYTES ||
+      validateTransition(request, "planRequest").length > 0 ||
+      validatePlan(request.plan).length > 0) checkpointFailure("plan transition request is invalid");
+    return;
+  }
   if (operation === "observe-handoff") {
     const required = ["session_id", "tool_use_id", "retryOf"];
     const allowed = [...required, "transcript_path"];
@@ -3194,9 +3483,19 @@ function withSessionLifecycle(cwd, request, operation, action) {
     }
     root = realpathSync(cwd);
     const rootBoundary = canonicalJson(recoveryBoundary(root, root));
-    input = { ...request, cwd: root };
+    const authority = sessionRequestAuthorities.get(request);
+    input = { ...request, cwd: root, ...(authority === undefined ? {} : { workerAuthorityHash: authority.grantHash }) };
+    if (authority !== undefined) requireVerifiedWorkerAuthority(authority, root, input);
+    if (authority !== undefined && ["observe-handoff", "retry-denied"].includes(operation)) {
+      const capability = owningSessionCapability(root, input);
+      if (capability === null || attachmentFromSnapshot(capability.snapshot).workerAuthorityHash !== authority.grantHash) {
+        checkpointFailure("journal observation requires the current owning Worker grant");
+      }
+    }
     preflightSessionLocatorLocality(input);
     context = sessionLocatorContext(input);
+    const transitionExpected = ["observe-handoff", "retry-denied"].includes(operation)
+      ? null : request.expected ?? observeCampaignTransition(root, input);
     if (Object.hasOwn(request, "transcript_path")) {
       if (context === null || !pathEquals(context.storageRoot, realpathSync(context.storageRoot))) {
         checkpointFailure(`${operation} requires a valid canonical transcript anchor`);
@@ -3213,7 +3512,11 @@ function withSessionLifecycle(cwd, request, operation, action) {
     windowsPathChecksMaySpawn = false;
     repositoryLocks = ["observe-handoff", "retry-denied"].includes(operation) ? [] : acquireRepositoryLocks([root], releaseContext);
     journalLocks = acquireJournalLocks([root], releaseContext);
-    const journalGuard = createJournalGuard(journalLocks, [sessionLock, ...repositoryLocks]);
+    const requireJournal = createJournalGuard(journalLocks, [sessionLock, ...repositoryLocks]);
+    const journalGuard = (guardedRoot) => {
+      requireJournal(guardedRoot);
+      if (authority !== undefined) requireVerifiedWorkerAuthority(authority, root, input);
+    };
     const requireGuards = () => {
       journalGuard(root);
       if (canonicalJson(recoveryBoundary(root, root)) !== rootBoundary) {
@@ -3225,21 +3528,27 @@ function withSessionLifecycle(cwd, request, operation, action) {
     if (canonicalJson(currentRouting) !== canonicalJson(routing)) {
       checkpointFailure(`${operation} session routing changed while acquiring guards`);
     }
-    return action(root, input, currentRouting, requireGuards, journalGuard, () => {
+    const execute = () => action(root, input, currentRouting, requireGuards, journalGuard, () => {
       preserveJournal = true;
       for (const lock of journalLocks) closeSync(lock.ownerFd);
     });
+    return transitionExpected === null ? execute()
+      : withCampaignTransition(operation, root, input, transitionExpected, journalGuard, execute);
   };
   try {
     return withLifecycleCleanup(guardedAction, heldLocks, releaseContext);
   } catch (error) {
-    if (error instanceof LifecycleError || error?.checkpointReason) throw error;
+    if (error instanceof LifecycleError || error?.checkpointReason || error?.transitionCode) throw error;
     throw new Error(`${operation} could not confirm its local lifecycle state; inspect status, ledger integrity, and ownership before retrying`, { cause: error });
   }
 }
 
-export function requestDeniedToolRetry(cwd, request) {
+export function requestDeniedToolRetry(cwd, request, authority = undefined) {
   try {
+    if (authority !== undefined) {
+      requireVerifiedWorkerAuthority(authority, cwd, request);
+      sessionRequestAuthorities.set(request, authority);
+    }
     return withSessionLifecycle(cwd, request, "retry-denied", (root, input, _routing, requireGuards, journalGuard) => {
       const snapshot = readAttachmentSnapshot(root);
       const attachment = attachedRecord(root, input, undefined, snapshot);
@@ -3281,10 +3590,14 @@ export function requestDeniedToolRetry(cwd, request) {
   }
 }
 
-export function observeHandoffValidation(cwd, filePath, request) {
+export function observeHandoffValidation(cwd, filePath, request, authority = undefined) {
   let attempt = null;
   let outcome = "not-evaluated";
   try {
+    if (authority !== undefined) {
+      requireVerifiedWorkerAuthority(authority, cwd, request);
+      sessionRequestAuthorities.set(request, authority);
+    }
     if (typeof filePath !== "string" || filePath.length === 0 || Buffer.byteLength(filePath) > 4_096 ||
       /[\x00-\x1f\x7f]/.test(filePath)) throw new Error("helper artifact parameter is invalid");
     return withSessionLifecycle(cwd, request, "observe-handoff", (root, input, _routing, requireGuards, journalGuard, preserveJournal) => {
@@ -3532,13 +3845,20 @@ function checkpointResult(cwd, hash, receipt) {
   };
 }
 
-export function checkpointSession(cwd, request) {
+export function checkpointSession(cwd, request, authority = undefined) {
+  if (authority !== undefined) {
+    requireVerifiedWorkerAuthority(authority, cwd, request);
+    sessionRequestAuthorities.set(request, authority);
+  }
   return withSessionLifecycle(cwd, request, "checkpoint", (root, input, routing, requireGuards, journalGuard) => {
     const plan = requireActivePlan(root, request.planHash);
     const snapshot = readAttachmentSnapshot(root);
     if (snapshot === null) checkpointFailure("checkpoint requires the current owning attachment");
     const attachment = attachmentFromSnapshot(snapshot);
     if (attachment.sessionHash !== sessionHash(input)) checkpointFailure("checkpoint session does not own the attachment");
+    if (authority !== undefined && attachment.status !== "checkpointed" && attachment.workerAuthorityHash !== authority.grantHash) {
+      checkpointFailure("checkpoint requires the current immutable Worker grant");
+    }
     if (attachment.status === "checkpointed") {
       const receipt = readCheckpointReceipt(root, attachment.checkpointHash);
       if (receipt.attachmentHash !== request.attachmentHash || receipt.planHash !== request.planHash ||
@@ -3582,7 +3902,7 @@ export function checkpointSession(cwd, request) {
       requireAttachmentSnapshot(root, snapshot);
       requireActivePlan(root, request.planHash);
     };
-    durableWriteBytes(root, path.join(stateDirectory(root), "checkpoints", `${hash}.json`), bytes, MAX_CHECKPOINT_BYTES, true, null, requireSource);
+    transitionWriteBytes(journalGuard, root, path.join(stateDirectory(root), "checkpoints", `${hash}.json`), bytes, MAX_CHECKPOINT_BYTES, true, requireSource);
     requireAttachmentSnapshot(root, snapshot);
     requireActivePlan(root, request.planHash);
     appendDurableLedger(root, input, "checkpoint_persisted", {
@@ -3596,7 +3916,7 @@ export function checkpointSession(cwd, request) {
       routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration,
       checkpointHash: hash, attachedAt: attachment.attachedAt, updatedAt: new Date().toISOString(),
     };
-    durableWriteBytes(root, attachmentPath(root), Buffer.from(`${JSON.stringify(tombstone, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES, false, null, requireSource);
+    transitionWriteBytes(journalGuard, root, attachmentPath(root), Buffer.from(`${JSON.stringify(tombstone, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES, false, requireSource);
     requireGuards();
     if (attachment.routeGeneration !== null) updateSessionLocatorStatus(input, root, attachment.routeGeneration, "released", journalGuard, true);
     return checkpointResult(root, hash, receipt);
@@ -3616,7 +3936,7 @@ function restoreStopSnapshot(cwd, input, state, journalGuard) {
     if (canonicalJson(existing) !== canonicalJson(state)) checkpointFailure("fresh successor Stop state conflicts with the checkpoint");
     return;
   }
-  durableWriteBytes(cwd, filePath, Buffer.from(`${JSON.stringify(state, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES);
+  transitionWriteBytes(journalGuard, cwd, filePath, Buffer.from(`${JSON.stringify(state, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES);
 }
 
 function ownerlessContext(cwd, plan, journalGuard) {
@@ -3647,7 +3967,11 @@ function ownerlessContext(cwd, plan, journalGuard) {
   return checkpointContext(plan, states.values().next().value ?? null, operations);
 }
 
-export function resumeSession(cwd, request) {
+export function resumeSession(cwd, request, authority = undefined) {
+  if (authority !== undefined) {
+    requireVerifiedWorkerAuthority(authority, cwd, request);
+    sessionRequestAuthorities.set(request, authority);
+  }
   return withSessionLifecycle(cwd, request, "resume", (root, input, routing, requireGuards, journalGuard) => {
     const plan = requireActivePlan(root, request.planHash);
     const snapshot = readAttachmentSnapshot(root);
@@ -3678,6 +4002,9 @@ export function resumeSession(cwd, request) {
     }
     let successor = existing?.status === "active" ? existing : null;
     if (successor !== null) {
+      if (authority !== undefined && successor.workerAuthorityHash !== authority.grantHash) {
+        checkpointFailure("resume retry does not match the successor immutable Worker grant");
+      }
       if (successor.routeGeneration !== null && (routing.context === null || !routing.exists ||
         routing.locator.generation !== successor.routeGeneration || routing.locator.status === "released")) {
         checkpointFailure("resume retry does not match the successor transcript route");
@@ -3697,9 +4024,10 @@ export function resumeSession(cwd, request) {
       successor = {
         schemaVersion: 3, sessionHash: sessionHash(input), status: "active",
         routeGeneration: route.generation ?? null, claimGeneration: randomUUID(), checkpointHash: request.checkpointHash,
+        ...(digest(input.workerAuthorityHash) ? { workerAuthorityHash: input.workerAuthorityHash } : {}),
         attachedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       };
-      durableWriteBytes(root, attachmentPath(root), Buffer.from(`${JSON.stringify(successor, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES, false, null, () => {
+      transitionWriteBytes(journalGuard, root, attachmentPath(root), Buffer.from(`${JSON.stringify(successor, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES, false, () => {
         requireGuards();
         if (snapshot === null) {
           if (readAttachmentSnapshot(root) !== null) checkpointFailure("ownership appeared during ownerless recovery");
@@ -3734,6 +4062,69 @@ export function resumeSession(cwd, request) {
   });
 }
 
+export function applyCampaignPlan(cwd, request, authority) {
+  requireVerifiedWorkerAuthority(authority, cwd, request);
+  sessionRequestAuthorities.set(request, authority);
+  return withSessionLifecycle(cwd, request, "plan", (root, input, _routing, requireGuards, journalGuard) => {
+    const existing = readAttachment(root);
+    if (existing === null && loadPlan(root).exists) checkpointFailure("an existing ownerless plan requires explicit resume");
+    if (existing !== null && (existing.sessionHash !== sessionHash(input) || existing.workerAuthorityHash !== authority.grantHash)) {
+      checkpointFailure("plan transition requires the current owning Worker capability");
+    }
+    const claim = claimSession(root, input, false, journalGuard);
+    if (!claim.claimed || claim.conflict) checkpointFailure("plan transition could not claim its expected source state");
+    const bytes = Buffer.from(`${JSON.stringify(request.plan, null, 2)}\n`);
+    transitionWriteBytes(journalGuard, root, planPath(root), bytes, MAX_PLAN_BYTES, false, requireGuards);
+    const attachment = readAttachment(root);
+    promoteSessionClaim(root, input, attachment.routeGeneration, journalGuard);
+    const observation = observeCampaignTransition(root, input);
+    appendDurableLedger(root, input, "plan_transitioned", {
+      planHash: observation.planHash, priorPlanHash: request.expected.planHash,
+      authorityHash: authority.grantHash, routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration,
+    }, journalGuard, requireGuards);
+    return { schemaVersion: 1, kind: "campaign-transition-outcome", status: "applied", operation: "plan",
+      previousHash: sha256(canonicalJson(request.expected)), observation };
+  });
+}
+
+export function handlePluginHook(input, eventName, pluginRoot) {
+  let cwd = input?.cwd;
+  let inspectedTargets;
+  let protectedMutation = true;
+  try {
+    if (process.platform === "win32") resetWindowsPathChecks();
+    if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd)) {
+      return eventName === "PreToolUse"
+        ? preToolDecision(input, "deny", "Supervised Worker denied the invocation because the hook payload did not provide an absolute repository cwd.") : {};
+    }
+    const targets = prepareToolTargets(input);
+    const routing = protectedTargetRouting(targets);
+    cwd = routing.roots[0] ?? cwd;
+    inspectedTargets = completeToolTargetInspection(targets, cwd);
+    protectedMutation = inspectedTargets.unsafe || routing.hasUnqualifiedTarget || routing.roots.length > 1 ||
+      toolTouchesState(inspectedTargets, cwd) || toolTouchesGitMetadata(inspectedTargets, cwd) || toolTouchesWorkflowConfig(inspectedTargets, cwd);
+    const lifecycleEdit = toolTouchesState(inspectedTargets, cwd) && inspectedTargets.targets.some((target) =>
+      !targetWithin(target, path.join(stateDirectory(cwd), "handoffs"), canonicalizeDeepestExisting(path.join(stateDirectory(cwd), "handoffs"))) &&
+      !targetWithin(target, path.join(stateDirectory(cwd), "runtime", "review-attempts"), canonicalizeDeepestExisting(path.join(stateDirectory(cwd), "runtime", "review-attempts"))));
+    if (lifecycleEdit && ["PostToolUse", "PostToolUseFailure"].includes(eventName)) return {};
+    const capability = owningSessionCapability(cwd, input);
+    if (capability === null) {
+      return eventName === "PreToolUse" && protectedMutation
+        ? preToolDecision(input, "deny", "Protected lifecycle and authority files require a validated owning Worker capability and their typed transition entry point.") : {};
+    }
+    const authority = verifyWorkerAuthority(capability.root, input, pluginRoot);
+    const attachment = attachmentFromSnapshot(capability.snapshot);
+    if (attachment.workerAuthorityHash !== authority.grantHash) throw new Error("attachment has no matching immutable Worker grant");
+    requireOwningSessionCapability(capability, input);
+    requireVerifiedWorkerAuthority(authority, capability.root, input);
+    return handleHook(input, eventName, input.cwd, lifecycleEdit
+      ? "Protected lifecycle files require their typed transition entry point; direct file edits are denied." : null, authority);
+  } catch {
+    return eventName === "PreToolUse" && protectedMutation
+      ? preToolDecision(input, "deny", "Protected campaign mutation requires verified ownership and immutable Worker provenance.") : {};
+  }
+}
+
 function stopReason(planResult) {
   if (planResult.errors.length > 0) {
     return "The durable Supervised Worker plan is invalid. Repair .supervised-worker/plan.json against the published schema, then continue the task.";
@@ -3757,7 +4148,7 @@ function releaseStop(cwd, input, event, detail, output, journalGuard) {
   journalGuard(cwd);
   const intendedAttachment = readAttachmentSnapshot(cwd);
   try {
-    removeStateFile(cwd, runtimeStatePath(cwd, input));
+    transitionMutation(journalGuard, () => removeStateFile(cwd, runtimeStatePath(cwd, input)));
   } catch {
     // Runtime counters are recoverable; ownership cleanup remains authoritative.
   }
@@ -3856,7 +4247,7 @@ function handleStop(input, cwd, journalGuard) {
     );
   }
   if (stateWasInvalid) {
-    removeStateFile(cwd, filePath);
+    transitionMutation(journalGuard, () => removeStateFile(cwd, filePath));
     state = {
       schemaVersion: 2,
       progressHash,
@@ -3886,7 +4277,7 @@ function handleStop(input, cwd, journalGuard) {
   state.sameProgressBlocks += 1;
   state.totalBlocks += 1;
   journalGuard(cwd);
-  atomicWriteJson(cwd, filePath, state);
+  transitionWriteJson(journalGuard, cwd, filePath, state);
   appendLedger(cwd, input, "stop_blocked", {
     progressHash,
     sameProgressBlocks: state.sameProgressBlocks,
@@ -4075,7 +4466,7 @@ function handleHookUnsafe(input, eventName, cwd, inspectedTargets, journalGuard)
   }
 }
 
-export function handleHook(input, eventName, cwd = input?.cwd) {
+export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = null, authority = undefined) {
   if (process.platform === "win32") {
     resetWindowsPathChecks();
   }
@@ -4113,12 +4504,36 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
     }
     preflightSessionLocatorLocality(input);
     sessionContext = sessionLocatorContext(input);
-    const nonWriterObservation = eventName === "PreToolUse" &&
-      !PLAN_WRITER_TOOLS.has(boundedToolName(input).toLowerCase().split(/[./]/).at(-1));
-    if (nonWriterObservation) {
-      const routing = readSessionLocator(input, false, true);
-      if (!routing.exists && attachedRecord(cwd, input) === null) return {};
+    const preliminaryTargets = completeToolTargetInspection(preparedTargets, cwd);
+    const protectedRouting = protectedTargetRouting(preparedTargets);
+    const protectedMutation = ["PreToolUse", "PostToolUse", "PostToolUseFailure"].includes(eventName) &&
+      (preliminaryTargets.unsafe || protectedRouting.hasUnqualifiedTarget ||
+      protectedRouting.roots.length > 0 || toolTouchesState(preliminaryTargets, cwd) ||
+      toolTouchesGitMetadata(preliminaryTargets, cwd) || toolTouchesWorkflowConfig(preliminaryTargets, cwd));
+    let capability = null;
+    try {
+      capability = owningSessionCapability(cwd, input);
+    } catch {
+      if (protectedMutation) throw new Error("protected mutation ownership cannot be verified");
     }
+    if (eventName === "PreToolUse" && preliminaryTargets.unsafe && capability === null) {
+      return preToolDecision(input, "deny", "Supervised Worker denied a file edit because its target path could not be resolved safely.");
+    }
+    if (!protectedMutation) {
+      if (capability === null) {
+        if (eventName === "PreToolUse") {
+          const route = readSessionLocator(input, false, true);
+          if (route.exists && route.locator.status !== "released" && attachedRecord(route.locator.repositoryRoot, input) !== null) {
+            return preToolDecision(input, "deny", "The existing Worker session binding no longer matches its route; no retry or lifecycle capability is available.");
+          }
+        }
+        return {};
+      }
+      requireOwningSessionCapability(capability, input);
+    }
+    const initialRouting = readSessionLocator(input, false, true);
+    const transitionRoot = protectedRouting.roots[0] ?? initialRouting.locator?.repositoryRoot ?? cwd;
+    let transitionExpected = observeCampaignTransition(transitionRoot, input);
     sessionLock = acquireSessionLock(input, sessionContext);
     windowsPathChecksMaySpawn = false;
     const observation = routineHookObservation(input, eventName, preparedTargets, cwd);
@@ -4131,6 +4546,7 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
     const requireJournal = createJournalGuard(journalLocks, [sessionLock, ...repositoryLocks]);
     const journalGuard = (root) => {
       requireJournal(root);
+      if (authority !== undefined) requireVerifiedWorkerAuthority(authority, root, input);
       if (observation !== null) {
         const current = routineHookObservation(input, eventName, prepareToolTargets(input), cwd);
         if (current === null || current.binding !== observation.binding) {
@@ -4140,20 +4556,26 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
       }
     };
     if (observation === null) {
-      if (routineHookObservation(input, eventName, prepareToolTargets(input), cwd) !== null) {
-        throw new Error("hook observation classification changed while acquiring lifecycle guards");
-      }
-      const routing = readSessionLocator(input, false, true);
-      if (routing.context !== null && routing.exists && readSessionMarker(routing.context, input) === null) {
-        journalGuard(routing.locator.repositoryRoot);
-        readSessionLocator(input);
-      }
-      effectiveCwd = resolveHookCwd(input, preparedTargets, cwd, journalGuard);
+      const resolve = () => {
+        if (routineHookObservation(input, eventName, prepareToolTargets(input), cwd) !== null) {
+          throw new Error("hook observation classification changed while acquiring lifecycle guards");
+        }
+        const routing = readSessionLocator(input, false, true);
+        if (routing.context !== null && routing.exists && readSessionMarker(routing.context, input) === null) {
+          journalGuard(routing.locator.repositoryRoot);
+          readSessionLocator(input, true, false, journalGuard);
+        }
+        return resolveHookCwd(input, preparedTargets, cwd, journalGuard);
+      };
+      effectiveCwd = repositoryLocks.length === 0 ? resolve()
+        : withCampaignTransition("release", transitionRoot, input, transitionExpected, journalGuard, resolve);
+      transitionExpected = observeCampaignTransition(effectiveCwd, input);
     } else {
       journalGuard(observation.root);
       effectiveCwd = observation.root;
     }
     const inspectedTargets = completeToolTargetInspection(preparedTargets, effectiveCwd);
+    if (capability !== null) requireOwningSessionCapability(capability, input);
     const attachmentSnapshot = readAttachmentSnapshot(effectiveCwd);
     const attachment = attachedRecord(effectiveCwd, input, undefined, attachmentSnapshot);
     const guarded = journalLocks.some((lock) =>
@@ -4169,7 +4591,12 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
     if (!guarded && eventName !== "PreToolUse") return {};
     let attempt = null;
     try {
-      const output = handleHookUnsafe(input, eventName, effectiveCwd, inspectedTargets, journalGuard);
+      const execute = () => eventName === "PreToolUse" && forcedDenial !== null
+        ? preToolDecision(input, "deny", forcedDenial)
+        : handleHookUnsafe(input, eventName, effectiveCwd, inspectedTargets, journalGuard);
+      const operation = eventName === "Stop" ? "stop" : eventName === "PreToolUse" ? "claim" : "promote";
+      const output = repositoryLocks.length === 0 ? execute()
+        : withCampaignTransition(operation, effectiveCwd, input, transitionExpected, journalGuard, execute);
       if (eventName === "PreToolUse") {
         if (guarded) attempt = captureToolAttempt(effectiveCwd, input, journalGuard);
         if (output.permissionDecision === "deny") {
@@ -4197,9 +4624,10 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
     return withLifecycleCleanup(action, heldLocks, releaseContext);
   } catch (error) {
     const lifecycleError = error instanceof LifecycleError ? error : null;
-    const primaryOutput = lifecycleError?.primaryResult;
+    const primaryOutput = lifecycleError?.primaryResult ?? error?.transitionResult;
     const primaryContext = primaryOutput?.permissionDecisionReason ?? primaryOutput?.reason ?? primaryOutput?.additionalContext;
-    const detail = lifecycleError === null ? "" :
+    const detail = lifecycleError === null ? (error?.transitionCode
+      ? ` ${error.transitionCode}. ${primaryContext ?? "The expected campaign state changed; no cleanup or completion is confirmed."}` : "") :
       ` ${lifecycleError.message}${primaryContext ? ` Primary hook context before cleanup: ${primaryContext}` : ""}` +
       `${lifecycleError.primaryError === null ? "" : " The primary hook operation also failed."}` +
       " Any prior state changes have not been rolled back; do not replay side effects automatically.";
@@ -4224,7 +4652,24 @@ export function handleHook(input, eventName, cwd = input?.cwd) {
   }
 }
 
-export function releaseAttachment(cwd) {
+export function releaseAttachment(cwd, expected = undefined, request = {}, authority = undefined) {
+  if (authority !== undefined) {
+    requireVerifiedWorkerAuthority(authority, cwd, request);
+    const capability = owningSessionCapability(cwd, request);
+    if (capability === null || attachmentFromSnapshot(capability.snapshot).workerAuthorityHash !== authority.grantHash) {
+      throw new Error("release requires the current owning Worker capability");
+    }
+    const transitionRequest = { ...request, expected };
+    sessionRequestAuthorities.set(transitionRequest, authority);
+    return withSessionLifecycle(cwd, transitionRequest, "release", (root, input, _routing, requireGuards, journalGuard) => {
+      requireGuards();
+      requireOwningSessionCapability(capability, input);
+      requireAttachmentSnapshot(root, capability.snapshot);
+      transitionMutation(journalGuard, () => removeStateFile(root, runtimeStatePath(root, input)));
+      if (!detachSession(root, input, capability.snapshot, journalGuard)) checkpointFailure("release lost its expected owning attachment");
+      return { released: true, message: "Released the owning session attachment and route." };
+    });
+  }
   if (process.platform === "win32") resetWindowsPathChecks();
   if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd)) {
     throw new Error("release requires a local repository root");
@@ -4237,31 +4682,36 @@ export function releaseAttachment(cwd) {
   assertSafeStatePath(cwd, filePath);
   const intended = readAttachmentSnapshot(cwd);
   if (intended === null) return { released: false, message: "No attachment found." };
+  const transitionExpected = expected ?? observeCampaignTransition(cwd, request);
   windowsPathChecksMaySpawn = false;
   const releaseContext = createLifecycleReleaseContext(() => ({ roots: [resolvedCwd], session: null }));
   const locks = acquireRepositoryLocks([resolvedCwd], releaseContext);
   let journalLocks = [];
   return withLifecycleCleanup(() => {
     journalLocks = acquireJournalLocks([resolvedCwd], releaseContext);
-    const journalGuard = createJournalGuard(journalLocks, locks);
-    journalGuard(cwd);
-    requireAttachmentSnapshot(cwd, intended);
-    let attachment = null;
-    try {
-      attachment = attachmentFromSnapshot(intended);
-    } catch {
-      // Explicit release may remove malformed local ownership state, but never a link.
-    }
-    try {
-      if (attachment) {
-        removeStateFile(cwd, path.join(stateDirectory(cwd), "runtime", `${attachment.sessionHash}.json`));
+    const requireJournal = createJournalGuard(journalLocks, locks);
+    const journalGuard = (root) => {
+      requireJournal(root);
+      if (authority !== undefined) requireVerifiedWorkerAuthority(authority, cwd, request);
+    };
+    return withCampaignTransition("release", cwd, request, transitionExpected, journalGuard, () => {
+      requireAttachmentSnapshot(cwd, intended);
+      let attachment = null;
+      try {
+        attachment = attachmentFromSnapshot(intended);
+      } catch {
+        // Explicit release may remove malformed local ownership state, but never a link.
       }
-    } catch {
-      // Runtime state is optional; attachment release is the authoritative action.
-    }
-    journalGuard(cwd);
-    removeAttachmentSnapshot(cwd, intended);
-    return { released: true, message: "Released the stale session attachment." };
+      try {
+        if (attachment) {
+          transitionMutation(journalGuard, () => removeStateFile(cwd, path.join(stateDirectory(cwd), "runtime", `${attachment.sessionHash}.json`)));
+        }
+      } catch {
+        // Runtime state is optional; attachment release is the authoritative action.
+      }
+      removeAttachmentSnapshot(cwd, intended, journalGuard);
+      return { released: true, message: "Released the stale session attachment." };
+    });
   }, () => [...journalLocks].reverse().concat([...locks].reverse()), releaseContext);
 }
 
@@ -4394,6 +4844,10 @@ function requireRunLedgerRecord(record, expectedSession) {
     }
   }
   if (record.event === "checkpoint_resumed" && !uuid(record.claimGeneration)) {
+    throw runLedgerFailure("run-ledger-invalid");
+  }
+  if (record.event === "plan_transitioned" && (!digest(record.authorityHash) ||
+    !(record.priorPlanHash === null || digest(record.priorPlanHash)) || !uuid(record.claimGeneration))) {
     throw runLedgerFailure("run-ledger-invalid");
   }
   if (record.event === "checkpoint_resumed" &&

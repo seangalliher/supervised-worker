@@ -113,13 +113,20 @@ separate from the agent so other Copilot agents can adopt the same queue contrac
 
 ### Lifecycle Hooks
 
+The production admission and generation-bound mutation protocol is documented
+in [Lifecycle Transitions](lifecycle-transitions.md). `handlePluginHook` now
+requires a verified immutable owning-session grant before calling the lifecycle
+kernel. The first plan write is a typed `lifecycle plan` transition, not an
+implicit file-tool claim. The historical kernel details below remain useful for
+compatibility and fault testing, but do not grant production startup authority.
+
 The plugin uses PascalCase event names so Copilot CLI emits the VS Code-compatible
 snake_case payload. Current events are:
 
 - `SessionStart`: inject bounded counts and checkpoint/orphan references only
         for an already owned durable plan; fresh sessions remain inert.
-- `PreToolUse`: create a generation-bound provisional claim for the first plan
-        writer, deny conflicting writers, and durably observe every owned invocation.
+- `PreToolUse`: deny direct lifecycle-file edits, enforce protected mutation
+        authority, and durably observe each validated owning-session invocation.
 - `PostToolUse` and, on supporting hosts, `PostToolUseFailure`: append
         metadata-only events and reconcile provisional plan claims.
 - `PreCompact`: record metadata about a context transition without checkpointing
