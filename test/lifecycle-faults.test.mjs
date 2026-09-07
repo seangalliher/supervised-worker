@@ -1776,8 +1776,8 @@ test("repository lock cleanup cannot remove a copied replacement owner", () => {
         }
         return result;
       };
-      fs.lstatSync = (filePath, ...args) => {
-        if (injected && path.resolve(String(filePath)) === path.resolve(ownerPath)) {
+      fs.lstatSync = function injectedLstat(filePath, ...args) {
+        if (fs.lstatSync === injectedLstat && injected && path.resolve(String(filePath)) === path.resolve(ownerPath)) {
           return originalLstatSync(copiedOwnerPath, ...args);
         }
         return originalLstatSync(filePath, ...args);
@@ -1795,6 +1795,11 @@ test("repository lock cleanup cannot remove a copied replacement owner", () => {
       assert.equal(originalExistsSync(lockDirectory), true);
       assert.equal(originalExistsSync(ownerPath), true);
       assert.equal(originalExistsSync(attachmentPath), true);
+      const retainedLstat = fs.lstatSync;
+      fs.lstatSync = originalLstatSync;
+      syncBuiltinESMExports();
+      originalRmSync(copiedOwnerPath);
+      assert.equal(retainedLstat(ownerPath).isFile(), true, "restored fault injection must not affect retained filesystem consumers");
     ${filesystemCleanup()}
   `);
 });
