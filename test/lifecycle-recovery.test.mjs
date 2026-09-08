@@ -532,7 +532,10 @@ function runRetirementScenario(fixture, fault, scope = "repository", options = {
     JSON.stringify({ ...options, scope }),
   ]);
   const release = JSON.parse(child.stdout);
-  assert.ok(release.injectionCount > 0, "the selected retirement failure must fire");
+  assert.doesNotMatch(JSON.stringify(release.output), /private injected|PRIVATE_UNKNOWN_CODE/);
+  assert.ok(release.injectionCount > 0, `the selected retirement failure must fire: ${JSON.stringify({
+    injectionCount: release.injectionCount, actionCalls: release.actionCalls, output: release.output,
+  })}`);
   assert.equal(release.processId, child.pid);
   assert.equal(release.scope, scope);
   assert.equal(release.actionCalls, 1);
@@ -545,7 +548,6 @@ function runRetirementScenario(fixture, fault, scope = "repository", options = {
       : path.join(fixture.cwd, ".supervised-worker", "locks", "lifecycle");
     assert.equal(existsSync(otherLock), false, "failure must not skip the other scope's normal cleanup");
   }
-  assert.doesNotMatch(JSON.stringify(release.output), /private injected|PRIVATE_UNKNOWN_CODE/);
   return release;
 }
 

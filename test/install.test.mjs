@@ -164,7 +164,8 @@ test("isolated installed dispatch durably observes an owned non-writer", () => {
           env: { ...process.env, SUPERVISED_WORKER_HOST_AUTHORITY: runtime.inventoryPath } });
       assert.equal(execution.error, undefined, execution.error?.message);
       assert.equal(execution.status, 0, execution.stderr);
-      assert.ok(execution.elapsedMs < manifest.hooks[event][0].timeoutSec * 1_000);
+      assert.ok(execution.elapsedMs < manifest.hooks[event][0].timeoutSec * 1_000,
+        JSON.stringify({ event, elapsedMs: execution.elapsedMs, timeoutMs: manifest.hooks[event][0].timeoutSec * 1_000 }));
       return JSON.parse(execution.stdout);
     };
     assert.deepEqual(invoke("SessionStart", { session_id: "ordinary-session" }), {});

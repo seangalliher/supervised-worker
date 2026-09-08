@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
-import test from "node:test";
+import test, { mock } from "node:test";
 
 import { doctorHash } from "../src/doctor-state.mjs";
 import { snapshotDoctorUserWork } from "../src/doctor-repair.mjs";
@@ -14,7 +16,9 @@ for (const fault of [null, "lost-reply", "post-health"]) {
       const previousBytes = sha256(readFileSync(path.join(fixture.initial.installRoot, "src", "core.mjs")));
       const intent = fixture.makeIntent("promote", [doctorHash(fixture.reviewed)]);
       const result = fixture.run(intent, fixture.adapter);
-      assert.equal(result.status, fault === "post-health" ? "blocked" : "succeeded", JSON.stringify(result));
+      assert.equal(result.status, fault === "post-health" ? "blocked" : "succeeded", JSON.stringify({ result,
+        hostOperations: fixture.operations.size, childResults: fixture.childResults }));
+      assert.ok(fixture.childResults.some((child) => child.timeout === 30_000), "promotion must exercise observed candidate replay");
       if (fault === "post-health") {
         assert.equal(result.reason ?? result.outcome.reason, "DOCTOR_CANDIDATE_ROLLED_BACK");
         assert.equal(fixture.active().installRoot, fixture.initial.installRoot);
@@ -36,6 +40,35 @@ for (const fault of [null, "lost-reply", "post-health"]) {
     }, fault);
   });
 }
+
+test("candidate replay timeout remains unknown with diagnostic evidence and no activation", () => {
+  const originalSpawn = childProcess.spawnSync;
+  let injected = 0;
+  const timedOutSpawn = mock.method(childProcess, "spawnSync", (command, args, options) => {
+    if (command === process.execPath && args[0] === "--input-type=module" && args[1] === "-e" &&
+      args[2].includes("replayDoctorHistory(JSON.parse")) {
+      injected += 1;
+      return { error: Object.assign(new Error("fixture replay timeout"), { code: "ETIMEDOUT" }),
+        status: null, signal: "SIGTERM", stdout: "", stderr: "" };
+    }
+    return originalSpawn(command, args, options);
+  });
+  syncBuiltinESMExports();
+  try {
+    withDoctorCandidateFixture((fixture) => {
+      const result = fixture.run(fixture.makeIntent("promote", [doctorHash(fixture.reviewed)]), fixture.adapter);
+      assert.equal(injected, 1, "the candidate replay timeout must be reached exactly once");
+      assert.equal(result.status, "unknown");
+      assert.equal(result.outcome.reason, "DOCTOR_EFFECT_OUTCOME_UNKNOWN");
+      assert.equal(fixture.operations.size, 0);
+      assert.equal(fixture.active().installRoot, fixture.initial.installRoot);
+      assert.equal(fixture.childResults.filter((child) => child.errorCode === "ETIMEDOUT" && child.timeout === 30_000).length, 1);
+    });
+  } finally {
+    timedOutSpawn.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
 
 test("Doctor can explicitly roll back the exact recorded promoted candidate", () => {
   withDoctorCandidateFixture((fixture) => {

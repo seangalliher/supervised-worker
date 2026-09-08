@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
+import { mock } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { sha256 } from "../src/core.mjs";
@@ -131,8 +135,23 @@ export function withDoctorCandidateFixture(callback, fault = null) {
         status: fault === "continue-unknown" ? "unknown" : "resumed" }),
     });
     const observeBinding = () => reviewed.binding;
-    callback({ campaign, source, input, authority, workflow, worker, repairRoot: location.root, reviewed, commit, tree, initial,
-      makeIntent, run, observe, adapter, active: () => active, operations, humanHash });
+    const childResults = [];
+    const originalSpawn = childProcess.spawnSync;
+    const observedSpawn = mock.method(childProcess, "spawnSync", (command, args, options) => {
+      const startedAt = performance.now();
+      const result = originalSpawn(command, args, options);
+      childResults.push({ executable: path.basename(command), timeout: options?.timeout ?? null,
+        status: result.status, errorCode: result.error?.code ?? null, elapsedMs: performance.now() - startedAt });
+      return result;
+    });
+    syncBuiltinESMExports();
+    try {
+      callback({ campaign, source, input, authority, workflow, worker, repairRoot: location.root, reviewed, commit, tree, initial,
+        makeIntent, run, observe, adapter, active: () => active, operations, humanHash, childResults });
+    } finally {
+      observedSpawn.mock.restore();
+      syncBuiltinESMExports();
+    }
   } finally {
     rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
