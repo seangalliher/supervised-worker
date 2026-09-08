@@ -1166,25 +1166,30 @@ function verifyBuildContext(workspace, contractPath, buildReportPath, source = n
 
   let stagedTreeHash = null;
   let sourceBinding = null;
+  let gitPhase = "source-context";
   try {
     let sourceRoot = workspace;
     if (source !== null) {
       if (!isRecord(source) || Object.keys(source).sort().join(",") !== "baseCommit,sourceRoot" ||
         !TREE_HASH_RE.test(source.baseCommit ?? "") || typeof source.sourceRoot !== "string" || !path.isAbsolute(source.sourceRoot)) throw new Error("invalid source context");
+      gitPhase = "source-root";
       sourceRoot = realpathSync(source.sourceRoot);
       const artifactRoot = realpathSync(workspace);
       if (isContained(artifactRoot, sourceRoot) || isContained(sourceRoot, artifactRoot) ||
-        pathKey(realpathSync(runGit(sourceRoot, ["rev-parse", "--show-toplevel"], "utf8").trim())) !== pathKey(sourceRoot)) throw new Error("repair requires separate canonical roots");
+        !sameDirectoryIdentity(realpathSync(runGit(sourceRoot, ["rev-parse", "--show-toplevel"], "utf8").trim()), sourceRoot)) throw new Error("repair requires separate canonical roots");
+      gitPhase = "base-ancestry";
       runGit(sourceRoot, ["merge-base", "--is-ancestor", source.baseCommit, "HEAD"], "utf8");
       sourceBinding = sha256(JSON.stringify({ artifactRoot: pathKey(artifactRoot), sourceRoot: pathKey(sourceRoot), baseCommit: source.baseCommit }));
       for (const target of new Set([...contract.value.targetFiles, ...build.value.changedFiles])) {
         errors.push(...validateRepositoryPath(sourceRoot, target).map((error) => `repair source: ${error}`));
       }
     }
+    gitPhase = "write-tree";
     stagedTreeHash = runGit(sourceRoot, ["write-tree"], "utf8").trim();
     if (build.value.testedTreeHash !== stagedTreeHash) {
       errors.push("build report testedTreeHash does not match the current Git index");
     }
+    gitPhase = "staged-paths";
     const staged = new Set(
       gitPaths(sourceRoot, [
         "diff",
@@ -1198,6 +1203,7 @@ function verifyBuildContext(workspace, contractPath, buildReportPath, source = n
       ]).map(pathKey),
     );
     if (!setEquals(staged, changed)) errors.push("staged paths do not exactly match build report changedFiles");
+    gitPhase = "unstaged-paths";
     const unstaged = new Set(gitPaths(sourceRoot, [
       "diff",
       "--no-ext-diff",
@@ -1206,6 +1212,7 @@ function verifyBuildContext(workspace, contractPath, buildReportPath, source = n
       "-z",
     ]).map(pathKey));
     if (unstaged.size > 0) errors.push("worktree contains unstaged tracked changes");
+    gitPhase = "untracked-paths";
     const untracked = gitPaths(sourceRoot, ["ls-files", "--others", "--exclude-standard", "-z"])
       .map(pathKey)
       .filter((file) => source !== null || (file !== ".supervised-worker" && !file.startsWith(".supervised-worker/")));
@@ -1213,7 +1220,7 @@ function verifyBuildContext(workspace, contractPath, buildReportPath, source = n
       errors.push(source === null ? "worktree contains untracked files outside .supervised-worker" : "repair worktree contains untracked files");
     }
   } catch {
-    errors.push("Git staged state could not be verified");
+    errors.push(source === null ? "Git staged state could not be verified" : `Git staged state could not be verified: ${gitPhase}`);
   }
 
   return {

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   copyFileSync,
@@ -161,7 +163,7 @@ test("runtime validates and hash-binds a complete staged handoff chain", () => {
   });
 });
 
-test("repair handoffs keep artifacts in their owner and bind a separate source worktree", () => {
+test("repair handoffs keep artifacts in their owner and bind a separate source worktree", (context) => {
   withFixture((fixture) => {
     const sourceRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), "repair-handoff-source-")));
     try {
@@ -173,7 +175,30 @@ test("repair handoffs keep artifacts in their owner and bind a separate source w
       git(sourceRoot, "add", "src/module.js");
       const source = { sourceRoot, baseCommit };
       assert.equal(git(sourceRoot, "write-tree"), fixture.build.testedTreeHash, "fixture must carry the same tree in a distinct repository");
-      assert.equal(verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath, source).ok, true);
+      const baseline = verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath, source);
+      assert.equal(baseline.ok, true, baseline.errors.join("\n"));
+      if (process.platform === "win32") {
+        const originalRealpath = fs.realpathSync;
+        const gitRoot = git(sourceRoot, "rev-parse", "--show-toplevel");
+        let aliasReads = 0;
+        context.mock.method(fs, "realpathSync", (value, options) => {
+          const resolved = originalRealpath(value, options);
+          if (value === gitRoot) {
+            aliasReads += 1;
+            return resolved.toUpperCase();
+          }
+          return resolved;
+        });
+        syncBuiltinESMExports();
+        try {
+          const aliased = verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath, source);
+          assert.ok(aliasReads > 0, "Git's actual toplevel path must cross the alias comparison");
+          assert.equal(aliased.ok, true, aliased.errors.join("\n"));
+        } finally {
+          context.mock.restoreAll();
+          syncBuiltinESMExports();
+        }
+      }
       assert.equal(verifyHandoffChain(fixture.cwd, fixture.contractPath, fixture.buildPath, fixture.reviewPath, source).ok, false, "an old same-tree attempt has no source binding");
       const attempt = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath, source);
       assert.equal(attempt.ok, true, attempt.errors.join("\n"));
@@ -185,7 +210,9 @@ test("repair handoffs keep artifacts in their owner and bind a separate source w
       assert.equal(verifyHandoffChain(fixture.cwd, fixture.contractPath, fixture.buildPath, fixture.reviewPath).ok, false, "source-bound review cannot be reused without its context");
       writeFileSync(path.join(sourceRoot, "src", "module.js"), "changed after review\n");
       assert.equal(verifyHandoffChain(fixture.cwd, fixture.contractPath, fixture.buildPath, fixture.reviewPath, source).ok, false);
-      assert.equal(verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath, { sourceRoot: fixture.cwd, baseCommit }).ok, false);
+      const overlapping = verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath, { sourceRoot: fixture.cwd, baseCommit });
+      assert.equal(overlapping.ok, false);
+      assert.ok(overlapping.errors.includes("Git staged state could not be verified: source-root"));
     } finally {
       rmSync(sourceRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
