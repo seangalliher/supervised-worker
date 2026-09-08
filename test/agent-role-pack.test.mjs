@@ -35,6 +35,7 @@ test("plugin ships the complete namespaced companion role pack", () => {
     "seangalliher-supervised-architect",
     "seangalliher-supervised-builder",
     "seangalliher-supervised-diff-reviewer",
+    "seangalliher-supervised-doctor",
     "seangalliher-supervised-worker",
     "supervised-worker",
   ]);
@@ -152,5 +153,19 @@ test("main worker is the sole durable-plan owner and names every handoff", () =>
     assert.match(worker.body, /handoff\s+verify/is);
     assert.match(worker.body, /host-reported Builder and Reviewer model IDs/i);
     assert.match(worker.body, /host\s+fallback is a failed review precondition/i);
+  }
+});
+
+test("Doctor is an on-demand reasoning role with no durable-state or shell authority", () => {
+  const doctor = readAgent("seangalliher-supervised-doctor");
+  assert.deepEqual(doctor.metadata.tools, ["read", "search", "web", "agent"]);
+  assert.equal(doctor.metadata["user-invocable"], false);
+  assert.equal(doctor.metadata["disable-model-invocation"], false);
+  assert.match(doctor.body, /Do not create, read, edit, or acquire independent ownership/);
+  assert.match(doctor.body, /schemas\/doctor\.schema\.json/);
+  assert.match(doctor.body, /Never author host inventories/);
+  for (const id of ["seangalliher-supervised-worker", "supervised-worker"]) {
+    assert.match(readAgent(id).body, /invoke `Supervised Doctor`/);
+    assert.match(readAgent(id).body, /src\/doctor-rescue\.mjs/);
   }
 });

@@ -101,6 +101,7 @@ async function validateRepository() {
     "seangalliher-supervised-architect.agent.md",
     "seangalliher-supervised-builder.agent.md",
     "seangalliher-supervised-diff-reviewer.agent.md",
+    "seangalliher-supervised-doctor.agent.md",
     "seangalliher-supervised-worker.agent.md",
     "supervised-worker.agent.md",
   ];
@@ -121,6 +122,7 @@ async function validateRepository() {
     "hooks.json",
     "com.github.copilot/hooks/hooks.json",
     "docs/architecture.md",
+    "docs/doctor.md",
     "docs/customizing-roles.md",
     "docs/evaluation.md",
     "docs/roadmap.md",
@@ -134,6 +136,7 @@ async function validateRepository() {
     "examples/local-campaign-receipt.json",
     "policy/constitution.json",
     "schemas/checkpoint.schema.json",
+    "schemas/doctor.schema.json",
     "schemas/episode.schema.json",
     "schemas/lifecycle.schema.json",
     "schemas/local-campaign-receipt.schema.json",
@@ -409,7 +412,8 @@ async function main() {
       );
       return;
     }
-    process.stdout.write(`${JSON.stringify(handlePluginHook(input, argument, root))}\n`);
+    const { routeDoctorFromHook } = await import("./doctor-routing.mjs");
+    process.stdout.write(`${JSON.stringify(routeDoctorFromHook(input, handlePluginHook(input, argument, root), root))}\n`);
     return;
   }
   if (command === "observation" && argument === "retry-denied" && argumentsAfter.length === 0) {

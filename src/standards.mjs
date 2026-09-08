@@ -33,6 +33,7 @@ const SKILL_KEYS = new Set([
 ]);
 const SCHEMA_FILES = [
   "checkpoint.schema.json",
+  "doctor.schema.json",
   "episode.schema.json",
   "lifecycle.schema.json",
   "local-campaign-receipt.schema.json",

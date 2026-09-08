@@ -161,6 +161,37 @@ test("runtime validates and hash-binds a complete staged handoff chain", () => {
   });
 });
 
+test("repair handoffs keep artifacts in their owner and bind a separate source worktree", () => {
+  withFixture((fixture) => {
+    const sourceRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), "repair-handoff-source-")));
+    try {
+      git(sourceRoot, "init", "--quiet");
+      git(sourceRoot, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false", "commit", "--allow-empty", "-m", "baseline");
+      const baseCommit = git(sourceRoot, "rev-parse", "HEAD");
+      mkdirSync(path.join(sourceRoot, "src"));
+      writeFileSync(path.join(sourceRoot, "src", "module.js"), "export const value = 1;\n");
+      git(sourceRoot, "add", "src/module.js");
+      const source = { sourceRoot, baseCommit };
+      assert.equal(git(sourceRoot, "write-tree"), fixture.build.testedTreeHash, "fixture must carry the same tree in a distinct repository");
+      assert.equal(verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath, source).ok, true);
+      assert.equal(verifyHandoffChain(fixture.cwd, fixture.contractPath, fixture.buildPath, fixture.reviewPath, source).ok, false, "an old same-tree attempt has no source binding");
+      const attempt = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath, source);
+      assert.equal(attempt.ok, true, attempt.errors.join("\n"));
+      Object.assign(fixture.review, { reviewAttemptId: attempt.reviewAttemptId, createdAt: attempt.issuedAt });
+      writeModelReceipts(fixture.cwd, fixture.review, null, DEFAULT_ROLES);
+      writeJson(fixture.reviewPath, fixture.review);
+      assert.equal(verifyHandoffChain(fixture.cwd, fixture.contractPath, fixture.buildPath, fixture.reviewPath, source).ok, true);
+      assert.equal(existsSync(path.join(sourceRoot, ".supervised-worker")), false);
+      assert.equal(verifyHandoffChain(fixture.cwd, fixture.contractPath, fixture.buildPath, fixture.reviewPath).ok, false, "source-bound review cannot be reused without its context");
+      writeFileSync(path.join(sourceRoot, "src", "module.js"), "changed after review\n");
+      assert.equal(verifyHandoffChain(fixture.cwd, fixture.contractPath, fixture.buildPath, fixture.reviewPath, source).ok, false);
+      assert.equal(verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath, { sourceRoot: fixture.cwd, baseCommit }).ok, false);
+    } finally {
+      rmSync(sourceRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+});
+
 test("handoff verification never executes a workspace-planted Git binary", {
   skip: process.platform !== "win32",
 }, () => {

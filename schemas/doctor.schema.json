@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervised-worker.dev/schemas/doctor.schema.json",
+  "title": "Incident-Scoped Supervised Doctor Records",
+  "oneOf": [
+    { "$ref": "#/$defs/incident" },
+    { "$ref": "#/$defs/capability" },
+    { "$ref": "#/$defs/step" },
+    { "$ref": "#/$defs/repairIntent" },
+    { "$ref": "#/$defs/repairOutcome" },
+    { "$ref": "#/$defs/promotion" },
+    { "$ref": "#/$defs/rollback" },
+    { "$ref": "#/$defs/continuation" },
+    { "$ref": "#/$defs/handoff" },
+    { "$ref": "#/$defs/repairAttempt" },
+    { "$ref": "#/$defs/validation" },
+    { "$ref": "#/$defs/review" },
+    { "$ref": "#/$defs/commit" }
+  ],
+  "$defs": {
+    "validation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "actionId", "repairHash", "sourceRootHash", "baseCommit", "tree", "contractHash", "buildReportHash", "reviewAttemptId", "issuedAt"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-validation" }, "binding": { "$ref": "#/$defs/binding" },
+        "actionId": { "$ref": "#/$defs/id" }, "repairHash": { "$ref": "#/$defs/hash" }, "sourceRootHash": { "$ref": "#/$defs/hash" },
+        "baseCommit": { "$ref": "#/$defs/gitHash" }, "tree": { "$ref": "#/$defs/gitHash" }, "contractHash": { "$ref": "#/$defs/hash" },
+        "buildReportHash": { "$ref": "#/$defs/hash" }, "reviewAttemptId": { "$ref": "#/$defs/id" }, "issuedAt": { "$ref": "#/$defs/time" }
+      }
+    },
+    "review": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "actionId", "validationHash", "repairHash", "sourceRootHash", "baseCommit", "tree", "contractHash", "buildReportHash", "reviewReportHash", "reviewAttemptId"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-review" }, "binding": { "$ref": "#/$defs/binding" },
+        "actionId": { "$ref": "#/$defs/id" }, "validationHash": { "$ref": "#/$defs/hash" }, "repairHash": { "$ref": "#/$defs/hash" },
+        "sourceRootHash": { "$ref": "#/$defs/hash" }, "baseCommit": { "$ref": "#/$defs/gitHash" }, "tree": { "$ref": "#/$defs/gitHash" },
+        "contractHash": { "$ref": "#/$defs/hash" }, "buildReportHash": { "$ref": "#/$defs/hash" },
+        "reviewReportHash": { "$ref": "#/$defs/hash" }, "reviewAttemptId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "commit": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "incident", "records"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-commit" }, "binding": { "$ref": "#/$defs/binding" },
+        "incident": { "$ref": "#/$defs/incident" },
+        "records": { "type": "array", "maxItems": 8, "items": { "oneOf": [
+          { "$ref": "#/$defs/step" }, { "$ref": "#/$defs/repairIntent" }, { "$ref": "#/$defs/repairOutcome" },
+          { "$ref": "#/$defs/repairAttempt" }, { "$ref": "#/$defs/promotion" }, { "$ref": "#/$defs/rollback" },
+          { "$ref": "#/$defs/continuation" }, { "$ref": "#/$defs/handoff" },
+          { "$ref": "#/$defs/validation" }, { "$ref": "#/$defs/review" }
+        ] } }
+      }
+    },
+    "repairAttempt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "attemptId", "actionId", "contractHash", "baseCommit", "rootHash", "sourceSnapshotHash", "status"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-repair-attempt" }, "binding": { "$ref": "#/$defs/binding" },
+        "attemptId": { "$ref": "#/$defs/id" }, "actionId": { "$ref": "#/$defs/id" }, "contractHash": { "$ref": "#/$defs/hash" },
+        "baseCommit": { "$ref": "#/$defs/gitHash" }, "rootHash": { "$ref": "#/$defs/hash" }, "sourceSnapshotHash": { "$ref": "#/$defs/hash" },
+        "status": { "enum": ["created", "retained", "removed"] }
+      }
+    },
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "gitHash": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "nullableHash": { "anyOf": [{ "$ref": "#/$defs/hash" }, { "type": "null" }] },
+    "id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "time": { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" },
+    "mode": { "enum": ["supervised", "delegated"] },
+    "state": { "enum": ["detected", "diagnosing", "stabilizing", "repairing", "validating", "reviewing", "promoting", "resuming", "resolved", "blocked"] },
+    "action": { "enum": ["diagnose", "inspect", "recover", "create-repair", "cleanup-repair", "validate", "review", "promote", "rollback", "continue", "cancel", "revoke"] },
+    "effect": { "enum": ["read-only", "internal-state", "git-local", "host-activation", "continuation"] },
+    "status": { "enum": ["reserved", "running", "succeeded", "retryable", "conflict", "unknown", "blocked", "cancelled"] },
+    "reason": { "type": "string", "minLength": 1, "maxLength": 96, "pattern": "^[A-Z][A-Z0-9_]*$" },
+    "hashes": { "type": "array", "maxItems": 128, "uniqueItems": true, "items": { "$ref": "#/$defs/hash" } },
+    "binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["incidentId", "repositoryHash", "campaignHash", "workflowHash"],
+      "properties": {
+        "incidentId": { "$ref": "#/$defs/id" }, "repositoryHash": { "$ref": "#/$defs/hash" },
+        "campaignHash": { "$ref": "#/$defs/hash" }, "workflowHash": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "actor": {
+      "type": "object", "additionalProperties": false,
+      "required": ["role", "selector", "model", "family", "provenance"],
+      "properties": {
+        "role": { "enum": ["worker", "doctor", "architect", "builder", "reviewer", "executor", "host"] },
+        "selector": { "type": "string", "minLength": 1, "maxLength": 193, "pattern": "^[a-z0-9][a-z0-9.:-]*$" },
+        "model": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+        "family": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 },
+        "provenance": { "enum": ["host-verified", "recorded", "unavailable"] }
+      }
+    },
+    "budget": {
+      "type": "object", "additionalProperties": false,
+      "required": ["maxAttempts", "maxSteps", "maxNoProgress", "maxElapsedMs"],
+      "properties": {
+        "maxAttempts": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "maxSteps": { "type": "integer", "minimum": 1, "maximum": 128 },
+        "maxNoProgress": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "maxElapsedMs": { "type": "integer", "minimum": 1000, "maximum": 86400000 }
+      }
+    },
+    "incident": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "attemptId", "state", "revision", "previousHash", "pendingActionHash", "authorityMode", "budget", "createdAt", "updatedAt", "reason", "inputHashes", "stepHashes", "cancelled"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-incident" },
+        "binding": { "$ref": "#/$defs/binding" }, "attemptId": { "$ref": "#/$defs/id" },
+        "state": { "$ref": "#/$defs/state" }, "revision": { "type": "integer", "minimum": 0, "maximum": 4096 },
+        "previousHash": { "$ref": "#/$defs/nullableHash" }, "authorityMode": { "$ref": "#/$defs/mode" },
+        "pendingActionHash": { "$ref": "#/$defs/nullableHash" },
+        "budget": { "$ref": "#/$defs/budget" }, "createdAt": { "$ref": "#/$defs/time" }, "updatedAt": { "$ref": "#/$defs/time" },
+        "reason": { "$ref": "#/$defs/reason" }, "inputHashes": { "$ref": "#/$defs/hashes" },
+        "stepHashes": { "$ref": "#/$defs/hashes" }, "cancelled": { "type": "boolean" }
+      }
+    },
+    "capability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "capabilityId", "actionId", "action", "expectedHash", "sessionHash", "authorityMode", "grantHash", "issuedAt", "expiresAt", "maxUses"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-capability" }, "binding": { "$ref": "#/$defs/binding" },
+        "capabilityId": { "$ref": "#/$defs/id" }, "actionId": { "$ref": "#/$defs/id" }, "action": { "$ref": "#/$defs/action" },
+        "expectedHash": { "$ref": "#/$defs/hash" }, "sessionHash": { "$ref": "#/$defs/hash" },
+        "authorityMode": { "$ref": "#/$defs/mode" }, "grantHash": { "$ref": "#/$defs/hash" },
+        "issuedAt": { "$ref": "#/$defs/time" }, "expiresAt": { "$ref": "#/$defs/time" }, "maxUses": { "const": 1 }
+      }
+    },
+    "step": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "attemptId", "actionId", "action", "expectedHash", "from", "to", "authorityMode", "actor", "startedAt", "completedAt", "inputHashes", "outputHashes", "effectClass", "status", "progressHash", "continuation"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-step" }, "binding": { "$ref": "#/$defs/binding" },
+        "attemptId": { "$ref": "#/$defs/id" }, "actionId": { "$ref": "#/$defs/id" }, "action": { "$ref": "#/$defs/action" },
+        "expectedHash": { "$ref": "#/$defs/hash" }, "from": { "$ref": "#/$defs/state" }, "to": { "$ref": "#/$defs/state" },
+        "authorityMode": { "$ref": "#/$defs/mode" }, "actor": { "$ref": "#/$defs/actor" },
+        "startedAt": { "$ref": "#/$defs/time" }, "completedAt": { "anyOf": [{ "$ref": "#/$defs/time" }, { "type": "null" }] },
+        "inputHashes": { "$ref": "#/$defs/hashes" }, "outputHashes": { "$ref": "#/$defs/hashes" },
+        "effectClass": { "$ref": "#/$defs/effect" }, "status": { "$ref": "#/$defs/status" },
+        "progressHash": { "$ref": "#/$defs/nullableHash" }, "continuation": { "enum": ["pending", "resume", "checkpoint-required", "blocked", "unknown"] }
+      }
+    },
+    "repairIntent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "attemptId", "actionId", "action", "capabilityHash", "expectedHash", "inputHashes"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-repair-intent" }, "binding": { "$ref": "#/$defs/binding" },
+        "attemptId": { "$ref": "#/$defs/id" }, "actionId": { "$ref": "#/$defs/id" }, "action": { "$ref": "#/$defs/action" },
+        "capabilityHash": { "$ref": "#/$defs/hash" }, "expectedHash": { "$ref": "#/$defs/hash" }, "inputHashes": { "$ref": "#/$defs/hashes" }
+      }
+    },
+    "repairOutcome": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "attemptId", "actionId", "intentHash", "capabilityHash", "status", "reason", "outputHashes", "completedAt"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-repair-outcome" }, "binding": { "$ref": "#/$defs/binding" },
+        "attemptId": { "$ref": "#/$defs/id" }, "actionId": { "$ref": "#/$defs/id" }, "intentHash": { "$ref": "#/$defs/hash" },
+        "capabilityHash": { "$ref": "#/$defs/hash" }, "status": { "$ref": "#/$defs/status" }, "reason": { "$ref": "#/$defs/reason" },
+        "outputHashes": { "$ref": "#/$defs/hashes" }, "completedAt": { "$ref": "#/$defs/time" }
+      }
+    },
+    "candidate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["commit", "tree", "sourceHash", "installRecordHash"],
+      "properties": {
+        "commit": { "$ref": "#/$defs/gitHash" }, "tree": { "$ref": "#/$defs/gitHash" },
+        "sourceHash": { "$ref": "#/$defs/hash" }, "installRecordHash": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "promotion": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "actionId", "candidate", "previous", "reviewHash", "testHash", "ciHash", "replayHash", "healthHash", "status"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-promotion" }, "binding": { "$ref": "#/$defs/binding" }, "actionId": { "$ref": "#/$defs/id" },
+        "candidate": { "$ref": "#/$defs/candidate" }, "previous": { "$ref": "#/$defs/candidate" },
+        "reviewHash": { "$ref": "#/$defs/hash" }, "testHash": { "$ref": "#/$defs/hash" }, "ciHash": { "$ref": "#/$defs/hash" },
+        "replayHash": { "$ref": "#/$defs/hash" }, "healthHash": { "$ref": "#/$defs/hash" },
+        "status": { "enum": ["prepared", "activated", "rolled-back", "blocked", "unknown"] }
+      }
+    },
+    "rollback": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "actionId", "promotionHash", "restored", "healthHash", "status"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-rollback" }, "binding": { "$ref": "#/$defs/binding" }, "actionId": { "$ref": "#/$defs/id" },
+        "promotionHash": { "$ref": "#/$defs/hash" }, "restored": { "$ref": "#/$defs/candidate" },
+        "healthHash": { "$ref": "#/$defs/hash" }, "status": { "enum": ["restored", "blocked", "unknown"] }
+      }
+    },
+    "continuation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "actionId", "stateHash", "interruptedActionHash", "reason", "status"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-continuation" }, "binding": { "$ref": "#/$defs/binding" }, "actionId": { "$ref": "#/$defs/id" },
+        "stateHash": { "$ref": "#/$defs/hash" }, "interruptedActionHash": { "$ref": "#/$defs/hash" }, "reason": { "$ref": "#/$defs/reason" },
+        "status": { "enum": ["resumed", "checkpoint-required", "blocked", "unknown"] }
+      }
+    },
+    "handoff": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "binding", "attemptId", "producedBy", "diagnosisHash", "intentHashes", "evidenceHashes", "continuation"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-handoff" }, "binding": { "$ref": "#/$defs/binding" }, "attemptId": { "$ref": "#/$defs/id" },
+        "producedBy": { "const": "seangalliher-supervised-doctor" }, "diagnosisHash": { "$ref": "#/$defs/hash" },
+        "intentHashes": { "$ref": "#/$defs/hashes" }, "evidenceHashes": { "$ref": "#/$defs/hashes" },
+        "continuation": { "enum": ["pending", "checkpoint-required", "blocked"] }
+      }
+    }
+  }
+}

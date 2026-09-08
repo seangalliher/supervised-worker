@@ -22,6 +22,12 @@ typed lifecycle helper. Hosts without the authority integration fail closed.
 See [Lifecycle Transitions](docs/lifecycle-transitions.md) for the startup
 contract, mutation table, journal boundary, and bounded rescue executor.
 
+The [Supervised Doctor](docs/doctor.md) is an on-demand incident responder with
+typed rescue, isolated repair, and immutable promotion/rollback contracts.
+It is distinct from `npm run doctor`, the repository validation command.
+Unattended activation still requires a genuine trusted-host integration; source
+tests do not establish operational readiness.
+
 ## Why It Exists
 
 Long-running coding sessions commonly fail between otherwise-correct steps:

@@ -41,6 +41,7 @@ const TOP_LEVEL_KEYS = new Set([
   "validation",
   "review",
   "filing",
+  "doctor",
 ]);
 const ROLE_KEYS = new Set(["architect", "builder", "reviewer"]);
 const WORKER_SELECTORS = new Set([
@@ -244,6 +245,14 @@ export function validateWorkflowValue(value) {
       errors.push("authority.mode must be supervised or delegated");
     }
     stringArray(value.authority.boundaries, "authority.boundaries", errors);
+  }
+
+  if (value.doctor !== undefined && requiredKeys(value.doctor, ["sourceRepository", "repairDirectory", "baseCommit"], "doctor", errors)) {
+    unknownKeys(value.doctor, new Set(["sourceRepository", "repairDirectory", "baseCommit"]), "doctor", errors);
+    for (const key of ["sourceRepository", "repairDirectory"]) {
+      if (typeof value.doctor[key] !== "string" || value.doctor[key].length < 1 || value.doctor[key].length > 4096 || /[\u0000-\u001f\u007f]/.test(value.doctor[key])) errors.push(`doctor.${key} is invalid`);
+    }
+    if (!/^[0-9a-f]{40}$/.test(value.doctor.baseCommit ?? "")) errors.push("doctor.baseCommit is invalid");
   }
 
   if (value.roles !== undefined) {
@@ -497,6 +506,8 @@ function loadWorkflowRoles(workspace = process.cwd(), reader = { lstatSync, read
       requiresAcceptance: true,
       workflowHash,
       roles,
+      authorityMode: workflow.authority.mode,
+      doctor: workflow.doctor ?? null,
       reviewPolicy: {
         requiredModel: workflow.review.requiredModel ?? null,
         requiredModelFamily: workflow.review.requiredModelFamily ?? null,

@@ -21,7 +21,7 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 
-import { parseWorkflowJson, WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
+import { parseWorkflowJson, resolveWorkflowRoles, WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
 import { captureHandoffValidation } from "./handoff.mjs";
 import { requireVerifiedWorkerAuthority, verifyWorkerAuthority } from "./authority.mjs";
 
@@ -104,6 +104,7 @@ const ATTACHMENT_V3_KEYS = new Set([...ATTACHMENT_KEYS, "claimGeneration", "chec
 const ATTACHMENT_STATUSES = new Set(["provisional", "active"]);
 const owningSessionCapabilities = new WeakSet();
 const transitionOwners = new WeakMap();
+const supervisorFailures = new WeakMap();
 const sessionRequestAuthorities = new WeakMap();
 export const CAMPAIGN_TRANSITIONS = Object.freeze({
   claim: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed"]),
@@ -114,6 +115,7 @@ export const CAMPAIGN_TRANSITIONS = Object.freeze({
   stop: Object.freeze(["provisional", "active", "resumed"]),
   release: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed", "recovery-fenced"]),
   recover: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed", "recovery-fenced"]),
+  doctor: Object.freeze(["active", "resumed"]),
 });
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const PLAN_WRITER_MATCHER =
@@ -888,6 +890,10 @@ export function lifecycleFailureDetails(error) {
   };
 }
 
+export function supervisorFailureFor(output) {
+  return supervisorFailures.get(output) ?? null;
+}
+
 function finalizeLifecycle(primaryResult, primaryError, releases) {
   const previous = primaryError instanceof LifecycleError ? primaryError : null;
   const diagnostics = [
@@ -1484,6 +1490,7 @@ function lifecycleShapeMatches(shape, value, schema = lifecycleSchema) {
   }
   if (shape.$ref) return lifecycleShapeMatches(schema.$defs[shape.$ref.slice("#/$defs/".length)], value, schema);
   if (shape.anyOf && !shape.anyOf.some((branch) => lifecycleShapeMatches(branch, value, schema))) return false;
+  if (shape.oneOf && shape.oneOf.filter((branch) => lifecycleShapeMatches(branch, value, schema)).length !== 1) return false;
   if (shape.allOf && !shape.allOf.every((branch) => lifecycleShapeMatches(branch, value, schema))) return false;
   if (shape.if && !lifecycleShapeMatches(
     lifecycleShapeMatches(shape.if, value, schema) ? shape.then ?? {} : shape.else ?? {}, value, schema,
@@ -1493,9 +1500,9 @@ function lifecycleShapeMatches(shape, value, schema = lifecycleSchema) {
   const object = value !== null && typeof value === "object" && !Array.isArray(value);
   const types = {
     object, array: Array.isArray(value), string: typeof value === "string",
-    integer: Number.isSafeInteger(value), null: value === null,
+    integer: Number.isSafeInteger(value), null: value === null, boolean: typeof value === "boolean",
   };
-  if (shape.type && !types[shape.type]) return false;
+  if (shape.type && !(Array.isArray(shape.type) ? shape.type.some((type) => types[type]) : types[shape.type])) return false;
   if (typeof value === "string") {
     const length = [...value].length;
     if (length < (shape.minLength ?? 0) || length > (shape.maxLength ?? Infinity) ||
@@ -1505,6 +1512,7 @@ function lifecycleShapeMatches(shape, value, schema = lifecycleSchema) {
   if (typeof value === "number" && (value < (shape.minimum ?? -Infinity) || value > (shape.maximum ?? Infinity))) return false;
   if (Array.isArray(value)) {
     if (value.length < (shape.minItems ?? 0) || value.length > (shape.maxItems ?? Infinity)) return false;
+    if (shape.uniqueItems && new Set(value.map((entry) => canonicalJson(entry))).size !== value.length) return false;
     if (shape.items && !value.every((entry) => lifecycleShapeMatches(shape.items, entry, schema))) return false;
   }
   if (object) {
@@ -1543,6 +1551,118 @@ export function validateTransition(value, definition = null) {
   } catch {
     return ["campaign transition value is invalid or exceeds its published bound"];
   }
+}
+
+let doctorSchema;
+
+export function validateDoctor(value, definition = null) {
+  try {
+    doctorSchema ??= parseWorkflowJson(readFileSync(new URL("../schemas/doctor.schema.json", import.meta.url)));
+    const shape = definition === null ? doctorSchema : doctorSchema.$defs[definition];
+    if (!shape || Buffer.byteLength(JSON.stringify(value)) > 65_536 || !lifecycleShapeMatches(shape, value, doctorSchema)) throw new Error();
+    return [];
+  } catch {
+    return ["Doctor record is invalid or exceeds its 65536-byte bound"];
+  }
+}
+
+export function withDoctorTransaction(cwd, input, incidentId, authority, action) {
+  if (validateDoctor(incidentId, "id").length > 0 || typeof action !== "function") throw new Error("DOCTOR_TRANSACTION_INVALID");
+  if (process.platform === "win32") resetWindowsPathChecks();
+  const capability = owningSessionCapability(cwd, input);
+  if (capability === null || attachmentFromSnapshot(capability.snapshot).workerAuthorityHash !== authority.grantHash) {
+    throw new Error("Doctor requires the current owning Worker grant");
+  }
+  const root = capability.root;
+  requireVerifiedWorkerAuthority(authority, root, input);
+  const doctorWorkflow = resolveWorkflowRoles(root, { requireAcceptance: true });
+  if (!doctorWorkflow.ok || !doctorWorkflow.configured || !doctorWorkflow.accepted) throw new Error("DOCTOR_ACCEPTED_WORKFLOW_REQUIRED");
+  const expected = observeCampaignTransition(root, input);
+  const directory = path.join(stateDirectory(root), "doctor", incidentId, "records");
+  const lockDirectory = path.join(stateDirectory(root), "doctor", incidentId, "transition");
+  let locks = [];
+  const releaseContext = createLifecycleReleaseContext(() => ({ roots: [root], input, session: null }), () => locks);
+  const guard = () => {
+    requireVerifiedWorkerAuthority(authority, root, input);
+    requireOwningSessionCapability(capability, input);
+    const workflow = resolveWorkflowRoles(root, { requireAcceptance: true });
+    if (!workflow.ok || !workflow.accepted || workflow.workflowHash !== doctorWorkflow.workflowHash) throw new Error("DOCTOR_POLICY_CHANGED");
+    for (const lock of locks) {
+      if (!lifecycleLockIdentityMatches(lock) || !lifecycleLockOwnerIdentityMatches(lock)) rejectRecoveryIdentity();
+    }
+  };
+  return withLifecycleCleanup(() => {
+    try {
+      locks = [acquireLifecycleLock(root, lockDirectory, "doctor")];
+    } catch (error) {
+      if (!(error instanceof LifecycleError) || !error.diagnostics.some((item) => item.code === "LIFECYCLE_OWNER_DEAD")) throw error;
+      const session = input.transcript_path === undefined ? {} : { session_id: input.session_id, transcript_path: input.transcript_path };
+      const inspected = inspectLifecycleLock(root, { scope: "doctor", incidentId, ...session });
+      if (inspected.status !== "inspected" || inspected.diagnostics[0]?.code !== "LIFECYCLE_OWNER_DEAD") throw error;
+      const recovered = recoverLifecycleLock(root, { expected: inspected.expected, ...session }, () => {
+        requireVerifiedWorkerAuthority(authority, root, input);
+        requireOwningSessionCapability(capability, input);
+        const workflow = resolveWorkflowRoles(root, { requireAcceptance: true });
+        if (!workflow.ok || workflow.workflowHash !== doctorWorkflow.workflowHash) throw new Error("DOCTOR_POLICY_CHANGED");
+      });
+      if (!["recovered", "already-recovered"].includes(recovered.status)) throw error;
+      locks = [acquireLifecycleLock(root, lockDirectory, "doctor")];
+    }
+    return withCampaignTransition("doctor", root, input, expected, guard, () => action({
+      root,
+      observation: expected,
+      authorize() {
+        guard();
+        if (canonicalJson(observeCampaignTransition(root, input)) !== canonicalJson(expected)) throw new Error("DOCTOR_CAMPAIGN_CHANGED");
+      },
+      artifact(value) {
+        guard();
+        if (validateDoctor(value).length > 0 && validateLifecycle(value).length > 0 && validateTransition(value).length > 0) throw new Error("DOCTOR_ARTIFACT_INVALID");
+        const bytes = Buffer.from(canonicalJson(value));
+        if (bytes.length > 65_536) throw new Error("DOCTOR_ARTIFACT_INVALID");
+        const hash = sha256(canonicalJson(value));
+        const filePath = path.join(stateDirectory(root), "doctor", incidentId, "artifacts", `${hash}.json`);
+        assertSafeStatePath(root, filePath);
+        if (existsSync(filePath)) {
+          if (!readBoundedStateBytes(root, filePath, 65_536).bytes.equals(bytes)) throw new Error("DOCTOR_ARTIFACT_CONFLICT");
+        } else transitionWriteBytes(guard, root, filePath, bytes, 65_536, true, guard);
+        return hash;
+      },
+      read() {
+        guard();
+        assertSafeStatePath(root, directory);
+        if (!existsSync(directory)) return [];
+        const names = readdirSync(directory).sort();
+        if (names.length > 4096) throw new Error("DOCTOR_HISTORY_BOUND_EXCEEDED");
+        let total = 0;
+        return names.map((name) => {
+          if (!/^[0-9a-f]{64}\.json$/.test(name)) throw new Error("DOCTOR_HISTORY_INVALID");
+          const bytes = readBoundedStateBytes(root, path.join(directory, name), 65_536).bytes;
+          total += bytes.length;
+          if (total > 16_777_216) throw new Error("DOCTOR_HISTORY_BOUND_EXCEEDED");
+          const value = parseWorkflowJson(bytes);
+          if (validateDoctor(value).length > 0 || value.binding.incidentId !== incidentId ||
+            `${sha256(canonicalJson(value))}.json` !== name) throw new Error("DOCTOR_HISTORY_INVALID");
+          return value;
+        });
+      },
+      append(value) {
+        guard();
+        if (validateDoctor(value).length > 0 || value.binding.incidentId !== incidentId ||
+          value.binding.repositoryHash !== expected.repositoryHash || value.binding.campaignHash !== expected.planHash) throw new Error("DOCTOR_RECORD_BINDING_CONFLICT");
+        const hash = sha256(canonicalJson(value));
+        const filePath = path.join(directory, `${hash}.json`);
+        assertSafeStatePath(root, filePath);
+        if (existsSync(filePath)) {
+          const current = parseWorkflowJson(readBoundedStateBytes(root, filePath, 65_536).bytes);
+          if (canonicalJson(current) !== canonicalJson(value)) throw new Error("DOCTOR_RECORD_CONFLICT");
+        } else {
+          transitionWriteBytes(guard, root, filePath, Buffer.from(canonicalJson(value)), 65_536, true, guard);
+        }
+        return hash;
+      },
+    }));
+  }, () => [...locks].reverse(), releaseContext);
 }
 
 function rejectRecoveryIdentity(code = "LIFECYCLE_IDENTITY_REJECTED") {
@@ -1585,6 +1705,8 @@ function recoveryContext(cwd, request, operation) {
   recoveryBoundary(root, root);
   const selector = operation === "inspect" ? request : request.expected;
   const scope = selector.scope;
+  const incidentId = scope === "doctor" ? selector.incidentId : null;
+  if ((scope === "doctor" && !uuid(incidentId)) || (scope !== "doctor" && selector.incidentId !== undefined)) rejectRecoveryIdentity();
   const location = selector.location ?? "canonical";
   const token = selector.token ?? null;
   const input = { session_id: request.session_id, transcript_path: request.transcript_path };
@@ -1599,9 +1721,10 @@ function recoveryContext(cwd, request, operation) {
   const storageRoot = scope === "session" ? session.storageRoot : root;
   const canonicalDirectory = scope === "session"
     ? path.join(storageRoot, "supervised-worker", "session-locks", sessionHash(input))
+    : scope === "doctor" ? path.join(stateDirectory(root), "doctor", incidentId, "transition")
     : path.join(stateDirectory(root), "locks", scope === "journal" ? "journal" : "lifecycle");
   const sourceDirectory = location === "canonical" ? canonicalDirectory : `${canonicalDirectory}.${token}.retired`;
-  return { root, storageRoot, canonicalDirectory, sourceDirectory, scope, location, token, input, session, operation };
+  return { root, storageRoot, canonicalDirectory, sourceDirectory, scope, incidentId, location, token, input, session, operation };
 }
 
 function recoveryOwner(context, directory) {
@@ -1689,7 +1812,8 @@ function recoverySnapshot(context, directory = context.sourceDirectory) {
   const attachment = recoveryAttachment(context.root);
   const routing = recoveryRouting(context, attachment);
   if (context.scope === "session" && attachment.state === "absent" && routing.state !== "routed") rejectRecoveryIdentity();
-  const snapshot = { scope: context.scope, location: context.location, ...owner, ...boundaries, attachment, routing };
+  const snapshot = { scope: context.scope, location: context.location,
+    ...(context.scope === "doctor" ? { incidentId: context.incidentId } : {}), ...owner, ...boundaries, attachment, routing };
   if (validateLifecycle(snapshot, "snapshot").length > 0) rejectRecoveryIdentity();
   return snapshot;
 }
@@ -4624,6 +4748,13 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
     return withLifecycleCleanup(action, heldLocks, releaseContext);
   } catch (error) {
     const lifecycleError = error instanceof LifecycleError ? error : null;
+    const report = (output) => {
+      if (lifecycleError !== null && lifecycleError.diagnostics.length > 0 && lifecycleError.diagnostics.length <= 16 &&
+        lifecycleError.diagnostics.every((diagnostic) => validateLifecycle(diagnostic, "diagnostic").length === 0)) {
+        supervisorFailures.set(output, Object.freeze({ diagnostics: structuredClone(lifecycleError.diagnostics) }));
+      }
+      return output;
+    };
     const primaryOutput = lifecycleError?.primaryResult ?? error?.transitionResult;
     const primaryContext = primaryOutput?.permissionDecisionReason ?? primaryOutput?.reason ?? primaryOutput?.additionalContext;
     const detail = lifecycleError === null ? (error?.transitionCode
@@ -4632,23 +4763,23 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
       `${lifecycleError.primaryError === null ? "" : " The primary hook operation also failed."}` +
       " Any prior state changes have not been rolled back; do not replay side effects automatically.";
     if (eventName === "PreToolUse") {
-      return preToolDecision(
+      return report(preToolDecision(
         input,
         "deny",
         `Supervised Worker could not verify local lifecycle state, so the invocation was denied.${detail} Denial journaling is unconfirmed; no retry permit is available.`,
-      );
+      ));
     }
     if (eventName === "Stop" && primaryOutput?.decision === "block" && lifecycleError.primaryError === null) {
       const reason = "Supervised Worker preserved the recorded Stop block, but lifecycle lock cleanup was not confirmed. Do not rely on this run as queue completion." + detail;
-      return { ...blockOutput(input, "Stop", reason), systemMessage: reason };
+      return report({ ...blockOutput(input, "Stop", reason), systemMessage: reason });
     }
     const reason = "Supervised Worker could not verify its local state and allowed this hook to fail open visibly. Do not rely on this run as queue completion." + detail;
-    return eventName === "Stop"
+    return report(eventName === "Stop"
       ? allowStopOutput(input, reason)
       : {
           ...contextOutput(input, eventName, reason),
           systemMessage: reason,
-        };
+        });
   }
 }
 

@@ -632,7 +632,8 @@ function reviewAttemptLocator(itemId) {
 function validateReviewAttemptValue(value) {
   const errors = [];
   if (!requiredKeys(value, [...REVIEW_ATTEMPT_KEYS], "review attempt", errors)) return errors;
-  unknownKeys(value, REVIEW_ATTEMPT_KEYS, "review attempt", errors);
+  unknownKeys(value, new Set([...REVIEW_ATTEMPT_KEYS, "sourceBinding"]), "review attempt", errors);
+  if (value.sourceBinding !== undefined && !HASH_RE.test(value.sourceBinding ?? "")) errors.push("review attempt sourceBinding is invalid");
   if (value.schemaVersion !== 1) errors.push("review attempt schemaVersion must be 1");
   if (!nonBlank(value.itemId)) errors.push("review attempt itemId must be non-empty");
   if (
@@ -1097,7 +1098,7 @@ function resolveGitExecutable(workspace) {
   throw new Error("trusted Git executable is unavailable outside the workspace");
 }
 
-function runGit(workspace, args, encoding) {
+export function runTrustedGit(workspace, args, encoding = "utf8") {
   const workspaceReal = realpathSync(path.resolve(workspace));
   const executable = resolveGitExecutable(workspaceReal);
   return execFileSync(
@@ -1107,12 +1108,19 @@ function runGit(workspace, args, encoding) {
       "core.fsmonitor=false",
       "-c",
       "core.untrackedCache=false",
+      "-c",
+      "core.hooksPath=/dev/null",
       "-C",
       workspaceReal,
       ...args,
     ],
-    { cwd: path.dirname(executable), encoding },
+    { cwd: path.dirname(executable), encoding, timeout: 30_000, maxBuffer: 8_388_608,
+      env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith("GIT_") && key.toUpperCase() !== "NODE_OPTIONS")) },
   );
+}
+
+function runGit(workspace, args, encoding) {
+  return runTrustedGit(workspace, args, encoding);
 }
 
 function gitPaths(workspace, args) {
@@ -1120,7 +1128,7 @@ function gitPaths(workspace, args) {
   return output.toString("utf8").split("\0").filter(Boolean).map((value) => value.replaceAll("\\", "/"));
 }
 
-function verifyBuildContext(workspace, contractPath, buildReportPath) {
+function verifyBuildContext(workspace, contractPath, buildReportPath, source = null) {
   const errors = [];
   let contract;
   let build;
@@ -1157,13 +1165,28 @@ function verifyBuildContext(workspace, contractPath, buildReportPath) {
   }
 
   let stagedTreeHash = null;
+  let sourceBinding = null;
   try {
-    stagedTreeHash = runGit(workspace, ["write-tree"], "utf8").trim();
+    let sourceRoot = workspace;
+    if (source !== null) {
+      if (!isRecord(source) || Object.keys(source).sort().join(",") !== "baseCommit,sourceRoot" ||
+        !TREE_HASH_RE.test(source.baseCommit ?? "") || typeof source.sourceRoot !== "string" || !path.isAbsolute(source.sourceRoot)) throw new Error("invalid source context");
+      sourceRoot = realpathSync(source.sourceRoot);
+      const artifactRoot = realpathSync(workspace);
+      if (isContained(artifactRoot, sourceRoot) || isContained(sourceRoot, artifactRoot) ||
+        pathKey(realpathSync(runGit(sourceRoot, ["rev-parse", "--show-toplevel"], "utf8").trim())) !== pathKey(sourceRoot)) throw new Error("repair requires separate canonical roots");
+      runGit(sourceRoot, ["merge-base", "--is-ancestor", source.baseCommit, "HEAD"], "utf8");
+      sourceBinding = sha256(JSON.stringify({ artifactRoot: pathKey(artifactRoot), sourceRoot: pathKey(sourceRoot), baseCommit: source.baseCommit }));
+      for (const target of new Set([...contract.value.targetFiles, ...build.value.changedFiles])) {
+        errors.push(...validateRepositoryPath(sourceRoot, target).map((error) => `repair source: ${error}`));
+      }
+    }
+    stagedTreeHash = runGit(sourceRoot, ["write-tree"], "utf8").trim();
     if (build.value.testedTreeHash !== stagedTreeHash) {
       errors.push("build report testedTreeHash does not match the current Git index");
     }
     const staged = new Set(
-      gitPaths(workspace, [
+      gitPaths(sourceRoot, [
         "diff",
         "--no-ext-diff",
         "--no-textconv",
@@ -1171,10 +1194,11 @@ function verifyBuildContext(workspace, contractPath, buildReportPath) {
         "--no-renames",
         "--name-only",
         "-z",
+        ...(source === null ? [] : [source.baseCommit]),
       ]).map(pathKey),
     );
     if (!setEquals(staged, changed)) errors.push("staged paths do not exactly match build report changedFiles");
-    const unstaged = new Set(gitPaths(workspace, [
+    const unstaged = new Set(gitPaths(sourceRoot, [
       "diff",
       "--no-ext-diff",
       "--no-textconv",
@@ -1182,11 +1206,11 @@ function verifyBuildContext(workspace, contractPath, buildReportPath) {
       "-z",
     ]).map(pathKey));
     if (unstaged.size > 0) errors.push("worktree contains unstaged tracked changes");
-    const untracked = gitPaths(workspace, ["ls-files", "--others", "--exclude-standard", "-z"])
+    const untracked = gitPaths(sourceRoot, ["ls-files", "--others", "--exclude-standard", "-z"])
       .map(pathKey)
-      .filter((file) => file !== ".supervised-worker" && !file.startsWith(".supervised-worker/"));
+      .filter((file) => source !== null || (file !== ".supervised-worker" && !file.startsWith(".supervised-worker/")));
     if (untracked.length > 0) {
-      errors.push("worktree contains untracked files outside .supervised-worker");
+      errors.push(source === null ? "worktree contains untracked files outside .supervised-worker" : "repair worktree contains untracked files");
     }
   } catch {
     errors.push("Git staged state could not be verified");
@@ -1198,14 +1222,15 @@ function verifyBuildContext(workspace, contractPath, buildReportPath) {
     contractHash: contract.hash,
     buildReportHash: build.hash,
     stagedTreeHash,
+    sourceBinding,
     errors,
     contract,
     build,
   };
 }
 
-export function verifyBuildHandoff(workspace, contractPath, buildReportPath) {
-  const result = verifyBuildContext(workspace, contractPath, buildReportPath);
+export function verifyBuildHandoff(workspace, contractPath, buildReportPath, source = null) {
+  const result = verifyBuildContext(workspace, contractPath, buildReportPath, source);
   return {
     ok: result.ok,
     itemId: result.itemId ?? null,
@@ -1216,8 +1241,8 @@ export function verifyBuildHandoff(workspace, contractPath, buildReportPath) {
   };
 }
 
-export function issueReviewAttempt(workspace, contractPath, buildReportPath) {
-  const result = verifyBuildContext(workspace, contractPath, buildReportPath);
+export function issueReviewAttempt(workspace, contractPath, buildReportPath, source = null) {
+  const result = verifyBuildContext(workspace, contractPath, buildReportPath, source);
   if (!result.ok) {
     return {
       ok: false,
@@ -1239,6 +1264,7 @@ export function issueReviewAttempt(workspace, contractPath, buildReportPath) {
     contractHash: result.contractHash,
     buildReportHash: result.buildReportHash,
     stagedTreeHash: result.stagedTreeHash,
+    ...(result.sourceBinding === null ? {} : { sourceBinding: result.sourceBinding }),
   };
   const locator = reviewAttemptLocator(result.itemId);
   try {
@@ -1253,8 +1279,8 @@ export function issueReviewAttempt(workspace, contractPath, buildReportPath) {
   return { ok: true, ...attempt, locator, errors: [] };
 }
 
-export function verifyHandoffChain(workspace, contractPath, buildReportPath, reviewReportPath) {
-  const buildContext = verifyBuildContext(workspace, contractPath, buildReportPath);
+export function verifyHandoffChain(workspace, contractPath, buildReportPath, reviewReportPath, source = null) {
+  const buildContext = verifyBuildContext(workspace, contractPath, buildReportPath, source);
   const errors = [...buildContext.errors];
   let review;
   try {
@@ -1290,6 +1316,7 @@ export function verifyHandoffChain(workspace, contractPath, buildReportPath, rev
   if (review.value.schemaVersion === 2) {
     try {
       attempt = loadReviewAttempt(workspace, review.value.itemId);
+      if ((attempt.sourceBinding ?? null) !== buildContext.sourceBinding) errors.push("review attempt source binding does not match the repair worktree and base");
       if (attempt.itemId !== review.value.itemId) {
         errors.push("review attempt itemId does not match the review report");
       }
@@ -1347,6 +1374,7 @@ export function verifyHandoffChain(workspace, contractPath, buildReportPath, rev
     itemId: contract.value.itemId,
     contractHash: contract.hash,
     buildReportHash: build.hash,
+    reviewReportHash: review.hash,
     stagedTreeHash: buildContext.stagedTreeHash,
     verdict: review.value.verdict,
     errors,

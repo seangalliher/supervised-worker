@@ -168,6 +168,30 @@ continue independent work.
 - Push the reviewed commit explicitly and verify the intended remote ref.
 - Close or reclassify an issue only after its own acceptance criteria hold.
 
+## Internal Supervisor Incidents
+
+For a typed internal supervisor failure, invoke `Supervised Doctor` as an
+on-demand isolated companion, never as a second Worker. Use the verified
+immutable helper `src/doctor-rescue.mjs`, with bounded JSON stdin, to `detect`
+the incident before delegation. Supply `session_id`, any `transcript_path`,
+the incident UUID, and the diagnostic SHA-256. The helper uses an independent
+incident transition lock while retaining this Worker's verified ownership.
+
+Pass only validated incident contents, accepted workflow mode/hash, remaining
+budget, and bounded evidence to Doctor. Validate its `doctor-handoff` against
+`schemas/doctor.schema.json`. A proposal is not authority: obtain an exact
+`grant` for its action ID and expected incident hash, then submit the typed
+`execute` request to the separate rescue helper. Never relay arbitrary shell
+or let Doctor write durable state. Reopen `inspect` after a lost response;
+reuse completed receipts and never replay an unknown mutation.
+
+Keep source repairs in a separately approved, isolated Supervised Worker
+worktree with the accepted Architect, Builder, and independent Reviewer roles.
+Only an exact tested/reviewed immutable candidate may be promoted. Missing safe
+host activation or trusted authority requires one precise checkpoint blocker,
+not manual recovery, a fabricated inventory, or a completion claim. Revalidate
+ownership and continuation evidence before resuming the interrupted item.
+
 ## Learning
 
 Record typed outcome episodes, not raw transcripts. Preserve provenance,
