@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -12,7 +13,7 @@ import { acceptDoctorHandoff, detectDoctorIncident, executeDoctorIntent, grantDo
 import { doctorHash } from "../src/doctor-state.mjs";
 import { acceptWorkflowRoles, resolveWorkflowRoles } from "../src/workflow.mjs";
 import { createWorkerAuthorityFixture } from "./worker-authority-fixture.mjs";
-import { handlePluginHook, sha256 } from "../src/core.mjs";
+import { handlePluginHook, observeCampaignTransition, sha256, withDoctorTransaction } from "../src/core.mjs";
 import { routeDoctorFromHook } from "../src/doctor-routing.mjs";
 
 function withFixture(action) {
@@ -38,6 +39,39 @@ function intentFor(cwd, input, authority, incident, action, inputHashes = []) {
   return { schemaVersion: 1, kind: "doctor-repair-intent", binding: incident.binding, attemptId: incident.attemptId,
     actionId: grant.capability.actionId, action, capabilityHash: grant.hash, expectedHash: doctorHash(incident), inputHashes };
 }
+
+test("Doctor authorization snapshots retain locality preflight under the incident lock", { skip: process.platform !== "win32" }, (context) => {
+  withFixture(({ cwd, input, authority }) => {
+    const incidentId = randomUUID();
+    const lockDirectory = path.join(cwd, ".supervised-worker", "doctor", incidentId, "transition");
+    const originalSpawn = childProcess.spawnSync;
+    const calls = [];
+    let authorizations = 0;
+    context.mock.method(childProcess, "spawnSync", (executable, args, options) => {
+      const name = path.basename(String(executable)).toLowerCase();
+      if (!["net.exe", "subst.exe"].includes(name)) return originalSpawn(executable, args, options);
+      calls.push({ name, underLock: existsSync(lockDirectory) });
+      return { status: name === "net.exe" ? 2 : 0, stdout: "", stderr: "" };
+    });
+    syncBuiltinESMExports();
+    try {
+      const result = withDoctorTransaction(cwd, input, incidentId, authority, (store) => {
+        assert.equal(existsSync(lockDirectory), true, "authorization must execute with the incident lock held");
+        assert.throws(() => observeCampaignTransition("relative-root"), /local absolute repository root/);
+        store.authorize();
+        authorizations += 1;
+        return store.observation.state;
+      });
+      assert.equal(result, "active");
+      assert.equal(authorizations, 1);
+      assert.deepEqual(calls, [{ name: "subst.exe", underLock: false }, { name: "net.exe", underLock: false }]);
+      assert.equal(existsSync(lockDirectory), false);
+    } finally {
+      context.mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+  });
+});
 
 test("Doctor persists an incident and deduplicates a completed read across reload", () => {
   withFixture(({ cwd, input, authority }) => {

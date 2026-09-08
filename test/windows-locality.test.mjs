@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
+import fs from "node:fs";
 import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { handleHook } from "../src/core.mjs";
+import { handleHook, observeCampaignTransition } from "../src/core.mjs";
 
 function probeFixture(context, responses, check) {
   const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "windows-locality-")));
@@ -32,7 +33,7 @@ function probeFixture(context, responses, check) {
   try {
     const result = handleHook({ cwd: root, session_id: "locality-fixture", tool_name: "Read",
       tool_input: { file_path: path.join(root, "readme.txt") } }, "PreToolUse");
-    check(result, calls);
+    check(result, calls, root);
     assert.equal(existsSync(path.join(root, ".supervised-worker")), false);
   } finally {
     context.mock.restoreAll();
@@ -89,4 +90,56 @@ test("Windows locality rejects a successful but over-budget probe", { skip: proc
     assert.deepEqual(calls.map((call) => [call.name, call.timeout]), [["subst.exe", 500], ["net.exe", 500]],
       "the final local-drive success must arrive at the total deadline, with no later probe to mask the rejection");
   });
+});
+
+test("standalone campaign observation does not reuse a prior operation's exhausted locality result", { skip: process.platform !== "win32" }, (context) => {
+  probeFixture(context, (name, count, timeout) => name === "subst.exe" && count <= 2
+    ? { timeout: true, elapsedMs: timeout } : {}, (result, calls, root) => {
+    assert.equal(result.permissionDecision, "deny", "the preceding hook must exhaust its own locality checks");
+    assert.deepEqual(calls.map((call) => call.name), ["subst.exe", "subst.exe"]);
+    assert.equal(observeCampaignTransition(root).state, "released");
+    assert.deepEqual(calls.map((call) => call.name), ["subst.exe", "subst.exe", "subst.exe", "net.exe"]);
+  });
+});
+
+test("standalone campaign observation rechecks a prior local drive before accepting it", { skip: process.platform !== "win32" }, (context) => {
+  probeFixture(context, (name, count) => name === "net.exe" && count > 1 ? { status: 0 } : {}, (result, calls, root) => {
+    assert.deepEqual(result, {}, "the preceding hook must observe the original local drive");
+    assert.deepEqual(calls.map((call) => call.name), ["subst.exe", "net.exe"]);
+    assert.throws(() => observeCampaignTransition(root), /local absolute repository root/);
+    assert.deepEqual(calls.map((call) => call.name), ["subst.exe", "net.exe", "subst.exe", "net.exe"]);
+  });
+});
+
+test("hook transition snapshots retain preflight locality checks under the lifecycle lock", { skip: process.platform !== "win32" }, (context) => {
+  const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "windows-locality-hook-")));
+  const originalSpawn = childProcess.spawnSync;
+  const originalLstat = fs.lstatSync;
+  const lockDirectory = path.join(root, ".supervised-worker", "locks", "lifecycle");
+  const planFile = path.join(root, ".supervised-worker", "plan.json");
+  const calls = [];
+  let lockedPlanChecks = 0;
+  context.mock.method(childProcess, "spawnSync", (executable, args, options) => {
+    const name = path.basename(String(executable)).toLowerCase();
+    if (!["net.exe", "subst.exe"].includes(name)) return originalSpawn(executable, args, options);
+    calls.push({ name, underLock: existsSync(lockDirectory) });
+    return { status: name === "net.exe" ? 2 : 0, stdout: "", stderr: "" };
+  });
+  context.mock.method(fs, "lstatSync", (target, ...args) => {
+    if (target === planFile && existsSync(lockDirectory)) lockedPlanChecks += 1;
+    return originalLstat(target, ...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const result = handleHook({ cwd: root, session_id: "locked-locality-fixture", tool_name: "Write",
+      tool_input: { file_path: planFile } }, "PreToolUse");
+    assert.deepEqual(result, {});
+    assert.ok(lockedPlanChecks > 0, "the protected hook must read transition state with its lifecycle lock held");
+    assert.deepEqual(calls, [{ name: "subst.exe", underLock: false }, { name: "net.exe", underLock: false }]);
+    assert.equal(existsSync(lockDirectory), false);
+  } finally {
+    context.mock.restoreAll();
+    syncBuiltinESMExports();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

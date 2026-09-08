@@ -681,6 +681,11 @@ function transitionFileHash(root, filePath, maximum = MAX_SESSION_LOCATOR_BYTES)
 }
 
 export function observeCampaignTransition(cwd, input = {}) {
+  if (process.platform === "win32" && isFullyQualifiedRepositoryCwd(cwd)) resetWindowsPathChecks();
+  return readCampaignTransition(cwd, input);
+}
+
+function readCampaignTransition(cwd, input) {
   if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd)) {
     throw new Error("campaign observation requires a local absolute repository root");
   }
@@ -723,7 +728,7 @@ function withCampaignTransition(operation, cwd, input, expected, guard, action) 
   let uncertain = false;
   const requireCurrent = () => {
     guard(cwd);
-    if (uncertain || canonicalJson(observeCampaignTransition(cwd, input)) !== canonicalJson(current)) {
+    if (uncertain || canonicalJson(readCampaignTransition(cwd, input)) !== canonicalJson(current)) {
       throw Object.assign(new Error("campaign transition compare-and-set rejected changed expected state"), {
         transitionCode: "CAMPAIGN_COMPARE_AND_SET_CONFLICT",
       });
@@ -735,11 +740,11 @@ function withCampaignTransition(operation, cwd, input, expected, guard, action) 
       requireCurrent();
       try {
         const result = mutation(requireCurrent);
-        current = observeCampaignTransition(cwd, input);
+        current = readCampaignTransition(cwd, input);
         return result;
       } catch (error) {
         try {
-          uncertain = canonicalJson(observeCampaignTransition(cwd, input)) !== canonicalJson(current);
+          uncertain = canonicalJson(readCampaignTransition(cwd, input)) !== canonicalJson(current);
         } catch {
           uncertain = true;
         }
@@ -1573,11 +1578,11 @@ export function withWorkerEvidenceRead(cwd, input, authority, action) {
   if (capability === null || attachmentFromSnapshot(capability.snapshot).workerAuthorityHash !== authority?.grantHash) throw new Error("RELEASE_OWNING_WORKER_REQUIRED");
   const root = capability.root;
   requireVerifiedWorkerAuthority(authority, root, input);
-  const observation = observeCampaignTransition(root, input);
+  const observation = readCampaignTransition(root, input);
   const authorize = () => {
     requireVerifiedWorkerAuthority(authority, root, input);
     requireOwningSessionCapability(capability, input);
-    if (canonicalJson(observeCampaignTransition(root, input)) !== canonicalJson(observation)) throw new Error("RELEASE_OWNER_CHANGED");
+    if (canonicalJson(readCampaignTransition(root, input)) !== canonicalJson(observation)) throw new Error("RELEASE_OWNER_CHANGED");
   };
   authorize();
   const result = action({ root, observation, authorize });
@@ -1607,7 +1612,7 @@ export function withDoctorTransaction(cwd, input, incidentId, authority, action)
   requireVerifiedWorkerAuthority(authority, root, input);
   const doctorWorkflow = resolveWorkflowRoles(root, { requireAcceptance: true });
   if (!doctorWorkflow.ok || !doctorWorkflow.configured || !doctorWorkflow.accepted) throw new Error("DOCTOR_ACCEPTED_WORKFLOW_REQUIRED");
-  const expected = observeCampaignTransition(root, input);
+  const expected = readCampaignTransition(root, input);
   const directory = path.join(stateDirectory(root), "doctor", incidentId, "records");
   const lockDirectory = path.join(stateDirectory(root), "doctor", incidentId, "transition");
   let locks = [];
@@ -1643,7 +1648,7 @@ export function withDoctorTransaction(cwd, input, incidentId, authority, action)
       observation: expected,
       authorize() {
         guard();
-        if (canonicalJson(observeCampaignTransition(root, input)) !== canonicalJson(expected)) throw new Error("DOCTOR_CAMPAIGN_CHANGED");
+        if (canonicalJson(readCampaignTransition(root, input)) !== canonicalJson(expected)) throw new Error("DOCTOR_CAMPAIGN_CHANGED");
       },
       artifact(value) {
         guard();
@@ -1968,7 +1973,7 @@ export function recoverLifecycleLock(cwd, request, authorize = () => {}) {
         canonicalJson(recoveryBoundary(context.root, evidenceDirectory)) !== canonicalJson(evidenceIdentity)) rejectRecoveryIdentity();
     };
     const transitionGuard = () => requireRepository();
-    const transitionExpected = observeCampaignTransition(context.root, context.input);
+    const transitionExpected = readCampaignTransition(context.root, context.input);
     const publishOutcome = (status, diagnostics) => {
       requireIntent();
       const outcome = { schemaVersion: 1, kind: "lifecycle-recovery-outcome", intentHash, status, diagnostics };
@@ -2067,7 +2072,7 @@ export function issueRescueCapability(cwd, request, authority) {
   }
   const expected = inspection.expected;
   const context = recoveryContext(cwd, { ...selector, expected }, "recover");
-  const observation = observeCampaignTransition(cwd, request);
+  const observation = readCampaignTransition(cwd, request);
   const token = randomBytes(32).toString("hex");
   const snapshotHash = sha256(canonicalJson({ expected, observation }));
   const record = {
@@ -2125,7 +2130,7 @@ export function rescueLifecycle(cwd, request) {
       if (current === null || canonicalJson(current.file) !== canonicalJson(snapshot.file) ||
         Date.parse(record.expiresAt) <= Date.now() ||
         record.snapshotHash !== sha256(canonicalJson({ expected: record.expected, observation: record.observation })) ||
-        canonicalJson(observeCampaignTransition(cwd, input)) !== canonicalJson(record.observation)) rejectRecoveryIdentity();
+        canonicalJson(readCampaignTransition(cwd, input)) !== canonicalJson(record.observation)) rejectRecoveryIdentity();
     };
     requireGrant();
     if (request.action === "recover") {
@@ -3649,7 +3654,7 @@ function withSessionLifecycle(cwd, request, operation, action) {
     preflightSessionLocatorLocality(input);
     context = sessionLocatorContext(input);
     const transitionExpected = ["observe-handoff", "retry-denied"].includes(operation)
-      ? null : request.expected ?? observeCampaignTransition(root, input);
+      ? null : request.expected ?? readCampaignTransition(root, input);
     if (Object.hasOwn(request, "transcript_path")) {
       if (context === null || !pathEquals(context.storageRoot, realpathSync(context.storageRoot))) {
         checkpointFailure(`${operation} requires a valid canonical transcript anchor`);
@@ -4231,7 +4236,7 @@ export function applyCampaignPlan(cwd, request, authority) {
     transitionWriteBytes(journalGuard, root, planPath(root), bytes, MAX_PLAN_BYTES, false, requireGuards);
     const attachment = readAttachment(root);
     promoteSessionClaim(root, input, attachment.routeGeneration, journalGuard);
-    const observation = observeCampaignTransition(root, input);
+    const observation = readCampaignTransition(root, input);
     appendDurableLedger(root, input, "plan_transitioned", {
       planHash: observation.planHash, priorPlanHash: request.expected.planHash,
       authorityHash: authority.grantHash, routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration,
@@ -4687,7 +4692,7 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
     }
     const initialRouting = readSessionLocator(input, false, true);
     const transitionRoot = protectedRouting.roots[0] ?? initialRouting.locator?.repositoryRoot ?? cwd;
-    let transitionExpected = observeCampaignTransition(transitionRoot, input);
+    let transitionExpected = readCampaignTransition(transitionRoot, input);
     sessionLock = acquireSessionLock(input, sessionContext);
     windowsPathChecksMaySpawn = false;
     const observation = routineHookObservation(input, eventName, preparedTargets, cwd);
@@ -4723,7 +4728,7 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
       };
       effectiveCwd = repositoryLocks.length === 0 ? resolve()
         : withCampaignTransition("release", transitionRoot, input, transitionExpected, journalGuard, resolve);
-      transitionExpected = observeCampaignTransition(effectiveCwd, input);
+      transitionExpected = readCampaignTransition(effectiveCwd, input);
     } else {
       journalGuard(observation.root);
       effectiveCwd = observation.root;
@@ -4843,7 +4848,7 @@ export function releaseAttachment(cwd, expected = undefined, request = {}, autho
   assertSafeStatePath(cwd, filePath);
   const intended = readAttachmentSnapshot(cwd);
   if (intended === null) return { released: false, message: "No attachment found." };
-  const transitionExpected = expected ?? observeCampaignTransition(cwd, request);
+  const transitionExpected = expected ?? readCampaignTransition(cwd, request);
   windowsPathChecksMaySpawn = false;
   const releaseContext = createLifecycleReleaseContext(() => ({ roots: [resolvedCwd], session: null }));
   const locks = acquireRepositoryLocks([resolvedCwd], releaseContext);
