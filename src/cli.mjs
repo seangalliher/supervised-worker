@@ -131,6 +131,7 @@ async function validateRepository() {
     "examples/plan.complete.json",
     "examples/workflow.json",
     "examples/workflow.specialized.json",
+    "examples/workflow.vscode-local.json",
     "examples/handoff.build-contract.json",
     "examples/handoff.build-report.json",
     "examples/handoff.review-report.json",
@@ -575,6 +576,13 @@ async function main() {
   if (command === "status" && hasNoArguments) {
     try {
       const report = summarizePlan(process.cwd());
+      const workflow = resolveWorkflowRoles(process.cwd());
+      report.assurance = {
+        requested: workflow.authorityAssurance ?? "host-attested",
+        workflowAcceptance: !workflow.ok ? "invalid" : !workflow.configured ? "not-required" : workflow.accepted ? "accepted" : "required",
+        hostInventory: "not-checked",
+        providerCompletion: "not-checked",
+      };
       process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
       if (report.valid === false) process.exitCode = 1;
     } catch {
@@ -622,7 +630,7 @@ async function main() {
         } catch {
           report = {
             ok: false, status: "denied", outcome: "not-evaluated", code: "WORKER_AUTHORITY_UNCONFIRMED",
-            errors: ["Observed handoff validation requires a verified immutable installation and owning-session host authority."],
+            errors: ["Observed handoff validation requires a verified immutable installation and accepted owning-session authority."],
           };
         }
       }

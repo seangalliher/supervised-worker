@@ -11,7 +11,16 @@ This also applies to a sibling Git worktree and to a checkpointed source session
 Protected edits still fail closed. Direct lifecycle-file edits are denied even
 for an owner; bounded handoff artifacts retain their existing ownership guard.
 
-The trusted host must supply `SUPERVISED_WORKER_HOST_AUTHORITY`, an absolute path
+The explicitly accepted `local-scoped` profile is the VS Code/Copilot path. It
+validates immutable source, exact workflow acceptance and a real matching VS Code
+session locator, and retains the same campaign ownership and transition kernel.
+Its grant is labeled `accepted-plugin-session`, not host-wide attestation. See
+[Host Profiles](host-profiles.md) for the trust limits and initial host setup checks.
+Changed local authority makes an admitted session's next tool invocation fail
+closed; a forced Stop reports unconfirmed supervision rather than completion.
+
+For the default `host-attested` profile, the trusted host must supply
+`SUPERVISED_WORKER_HOST_AUTHORITY`, an absolute path
 to a bounded, canonical inventory outside the target repository. Its closed
 `worker-host-authority` record contains `schemaVersion: 1`, `host` (`vscode` or
 `copilot-cli`), `complete: true`, `sessionHash`, canonical-path `repositoryHash`,
@@ -22,7 +31,7 @@ belong to the same verified immutable installation that executes the command.
 The Worker grant binds the session, repository, immutable source, Worker bytes,
 and hook bytes. Inventory drift during a transition invalidates the grant.
 
-This inventory is a trusted host integration input, not an agent-authored
+For that strict profile, this inventory is a trusted host integration input, not an agent-authored
 attestation or a discovery heuristic. Selector text, `/env` prose, repository
 files, and tool output cannot substitute for it. Missing inventory, a checkout
 runtime, competing Worker/Stop authorities, dead or unknown host ownership, or

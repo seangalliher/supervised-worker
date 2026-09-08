@@ -15,18 +15,25 @@ metadata-only lifecycle records, and a bounded completion gate.
 > repositories. It is not yet a security boundary or an unattended production
 > scheduler.
 
-Worker ownership now requires a verified immutable installation and a trusted
-host-supplied authority inventory. Ordinary chats remain inert even in a
-checkpointed repository. Direct plan-file edits cannot start a campaign; use the
-typed lifecycle helper. Hosts without the authority integration fail closed.
+Worker ownership requires a verified immutable installation and an explicitly
+selected assurance profile. For GitHub Copilot in VS Code, accept a workflow with
+`authority.assurance: "local-scoped"` to bind this plugin's campaign to its exact
+workflow and real session locator without inventing whole-host attestation.
+An omitted assurance retains the strict host-inventory requirement; there is no
+automatic fallback. Ordinary chats remain inert even in a checkpointed repository.
+Direct plan-file edits cannot start a campaign; use the typed lifecycle helper.
+See [Host Profiles](docs/host-profiles.md) and the complete
+[VS Code-local workflow example](examples/workflow.vscode-local.json).
 See [Lifecycle Transitions](docs/lifecycle-transitions.md) for the startup
 contract, mutation table, journal boundary, and bounded rescue executor.
 
 The [Supervised Doctor](docs/doctor.md) is an on-demand incident responder with
 typed rescue, isolated repair, and immutable promotion/rollback contracts.
 It is distinct from `npm run doctor`, the repository validation command.
-Unattended activation still requires a genuine trusted-host integration; source
-tests do not establish operational readiness.
+Exact dead-lock recovery is available through the owning Worker's accepted local
+authority. Automatic host activation still requires a supported host integration;
+local installation upgrades are checkpoint-and-restart handoffs. Source tests do
+not establish operational readiness or guarantee uninterrupted host availability.
 
 ## Why It Exists
 
@@ -270,13 +277,15 @@ Handoff files contain typed summaries, source paths, commands, and evidence
 locators. They must not contain raw issue bodies, prompts, tool payloads,
 credentials, or source contents.
 
-The session that creates or updates `plan.json` through a file-editing tool is
-attached to the plan. Other Copilot sessions in the repository remain inert:
-they are not logged and their Stop events are not blocked.
+The session admitted by the immutable helper's `lifecycle plan` transition is
+attached to the plan. Direct plan-file edits are denied. Other Copilot sessions
+in the repository remain inert: they are not logged and their Stop events are
+not blocked.
 
-Protected edit targets must be fully qualified. When VS Code reports the plugin
-root as the hook cwd, the first absolute plan edit writes a metadata-only
-session locator beneath that window's `workspaceStorage` directory. Later
+Protected edit targets must be fully qualified. Initial typed admission supplies
+the real session ID and transcript locator from the target repository and writes
+a metadata-only session route beneath that window's `workspaceStorage` directory.
+When VS Code reports the plugin root as the hook cwd, later
 targetless hooks use the locator only when its session hash and random claim
 route generation match the repository's own attachment. Version 3 attachments
 also carry a separate UUID claim generation, including repository-local sessions
@@ -301,7 +310,9 @@ network-mapped, and `subst` repository roots fail closed before filesystem
 inspection. Locality checks share a 1.5-second budget and allow at most three
 distinct drive letters per operation.
 
-Session and repository lifecycle locks are never reclaimed automatically.
+Ordinary hooks never reclaim session or repository lifecycle locks automatically.
+The owning Worker may use the Doctor's capability- and snapshot-bound recovery
+path for an exact dead owner under the accepted assurance profile.
 Owned release retries a verified `EBUSY` or Windows-only `EPERM` retirement
 failure, at most three attempts within a 100 ms monotonic retry budget, with
 polls capped at 25 ms. Each retry revalidates the owner, directory identities,

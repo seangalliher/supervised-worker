@@ -3,13 +3,14 @@ import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 import { resolvePluginSourceIdentity } from "./install.mjs";
-import { parseWorkflowJson } from "./workflow.mjs";
+import { parseWorkflowJson, resolveWorkflowRoles } from "./workflow.mjs";
 
 const verifiedAuthorities = new WeakMap();
 const MAX_AUTHORITY_BYTES = 16_384;
 const MAX_AUTHORITY_LIFETIME_MS = 86_400_000;
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const pathKey = (value) => process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value);
+const pathNameEquals = (left, right) => process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
 
 function exactKeys(value, keys) {
   return value !== null && typeof value === "object" && !Array.isArray(value) &&
@@ -75,7 +76,69 @@ function authorityBinding(cwd, input, pluginRoot, inventoryPath) {
   return { authority, grantHash: hash(JSON.stringify(authority)), inventoryHash: hash(inventoryBytes) };
 }
 
+function localAuthorityBinding(cwd, input, pluginRoot, workflow = resolveWorkflowRoles(cwd, { requireAcceptance: true })) {
+  if (!workflow.ok || !workflow.configured || !workflow.accepted ||
+      workflow.authorityAssurance !== "local-scoped") {
+    throw new Error("local-scoped authority requires an explicitly accepted workflow hash");
+  }
+  const repositoryRoot = realpathSync(cwd);
+  const source = resolvePluginSourceIdentity(pluginRoot);
+  if (source.sourceKind !== "immutable-install-record") throw new Error("local-scoped authority requires an immutable installation");
+  const sessionId = input?.session_id ?? input?.sessionId;
+  const transcriptPath = input?.transcript_path ?? input?.transcriptPath;
+  if (typeof sessionId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId) ||
+      typeof transcriptPath !== "string" || !path.isAbsolute(transcriptPath) ||
+      !pathNameEquals(path.basename(transcriptPath), `${sessionId}.jsonl`)) {
+    throw new Error("local-scoped authority requires a matching VS Code session transcript locator");
+  }
+  const transcriptDirectory = path.dirname(transcriptPath);
+  const copilotDirectory = path.dirname(transcriptDirectory);
+  const storageRoot = path.dirname(copilotDirectory);
+    if (!pathNameEquals(path.basename(transcriptDirectory), "transcripts") ||
+      !pathNameEquals(path.basename(copilotDirectory), "GitHub.copilot-chat")) {
+    throw new Error("local-scoped authority requires the VS Code transcript location");
+  }
+  const relative = path.relative(repositoryRoot, storageRoot);
+  if (relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))) {
+    throw new Error("local-scoped session storage must be outside the campaign repository");
+  }
+  for (const directory of [transcriptDirectory, copilotDirectory, storageRoot]) {
+    const stats = lstatSync(directory);
+    if (stats.isSymbolicLink() || !stats.isDirectory() || pathKey(directory) !== pathKey(realpathSync(directory))) {
+      throw new Error("local-scoped session directories must be canonical and unlinked");
+    }
+  }
+  const transcript = lstatSync(transcriptPath);
+  if (!transcript.isFile() || transcript.isSymbolicLink() || transcript.nlink !== 1) {
+    throw new Error("local-scoped session transcript must be a single-link regular file");
+  }
+  const workspaceBytes = readAuthorityFile(path.join(storageRoot, "workspace.json"));
+  const workerPath = path.join(pluginRoot, "com.github.copilot", "agents", "seangalliher-supervised-worker.agent.md");
+  const hooksPath = path.join(pluginRoot, "com.github.copilot", "hooks", "hooks.json");
+  const authority = {
+    schemaVersion: 1, kind: "verified-worker-authority", assurance: "local-scoped",
+    provenance: "accepted-plugin-session", host: "vscode",
+    sessionHash: hash(sessionId), repositoryHash: hash(pathKey(repositoryRoot)),
+    sourceHash: source.sourceHash, workflowHash: workflow.workflowHash,
+    workerHash: hash(readAuthorityFile(workerPath, 1_048_576)),
+    hooksHash: hash(readAuthorityFile(hooksPath, 1_048_576)),
+    sessionLocatorHash: hash(JSON.stringify([pathKey(transcriptPath), hash(workspaceBytes)])),
+  };
+  return { authority, grantHash: hash(JSON.stringify(authority)) };
+}
+
 export function verifyWorkerAuthority(cwd, input, pluginRoot, inventoryPath = process.env.SUPERVISED_WORKER_HOST_AUTHORITY) {
+  const workflow = resolveWorkflowRoles(cwd);
+  if (workflow.authorityAssurance === "local-scoped") {
+    const binding = localAuthorityBinding(cwd, input, pluginRoot, workflow);
+    const authority = Object.freeze({ ...binding.authority, grantHash: binding.grantHash });
+    verifiedAuthorities.set(authority, () => {
+      if (localAuthorityBinding(cwd, input, pluginRoot).grantHash !== binding.grantHash) {
+        throw new Error("accepted local-scoped authority changed during the transition");
+      }
+    });
+    return authority;
+  }
   if (typeof inventoryPath !== "string" || !path.isAbsolute(inventoryPath)) {
     throw new Error("trusted host authority inventory is unavailable; Worker ownership is disabled");
   }

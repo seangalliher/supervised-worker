@@ -94,7 +94,9 @@ test("production hooks require a verified session grant and plans use exact CAS 
       assert.throws(() => applyCampaignPlan(cwd, { session_id: input.session_id, expected, plan }, authority), /compare-and-set/);
       assert.equal(summarizeRunLedger(cwd).status, "available");
       delete process.env.SUPERVISED_WORKER_HOST_AUTHORITY;
-      assert.deepEqual(handlePluginHook(input, "Stop", installRoot), {});
+      const unconfirmed = handlePluginHook(input, "Stop", installRoot);
+      assert.equal(unconfirmed.decision, "allow");
+      assert.match(unconfirmed.systemMessage, /could not revalidate/);
     } finally {
       if (previousInventory === undefined) delete process.env.SUPERVISED_WORKER_HOST_AUTHORITY;
       else process.env.SUPERVISED_WORKER_HOST_AUTHORITY = previousInventory;

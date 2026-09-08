@@ -238,6 +238,19 @@ test("workflow accepts specialized role selectors", () => {
   }
 });
 
+test("standards validation checks the local workflow example assurance", () => {
+  const target = fixture();
+  try {
+    assert.deepEqual(validateStandards(target), []);
+    mutateJson(target, "examples/workflow.vscode-local.json", (workflow) => {
+      workflow.authority.assurance = "implicitly-trusted";
+    });
+    assert.match(validateStandards(target).join("\n"), /examples\/workflow\.vscode-local\.json/);
+  } finally {
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
 test("workflow rejects incomplete or unsafe role selectors", () => {
   for (const mutate of [
     (workflow) => { delete workflow.roles.builder; },

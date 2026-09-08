@@ -1,5 +1,22 @@
 # Roadmap
 
+## Accepted Host Split (2026-09-08)
+
+Immediate: make the Agent Plugin usable with GitHub Copilot in VS Code through
+explicitly accepted `local-scoped` assurance. Preserve immutable source, exact-byte
+workflow acceptance, sole campaign ownership, independent review, durable evidence,
+unknown-outcome handling and bounded checkpoint/resume. Local assurance does not
+certify the entire host or promise to override its limits. See
+[Host Profiles](host-profiles.md) for the supported contract.
+
+Future: retain the original strong requirements in
+[Supervised Worker #11](https://github.com/seangalliher/supervised-worker/issues/11)
+and [ProbOS AD-1314/#1379](https://github.com/seangalliher/ProbOS/issues/1379).
+AD-1315 through AD-1317 deliver protected host authority/witness, governed effects,
+and immutable lifecycle recovery; AD-1318 optionally exposes that harness in VS Code
+or alongside Copilot. No local gate counts as strong-host acceptance. The native
+VS Code/CLI probes remain evidence of limitations, not a changed result.
+
 ## v0.1 - Portable Governance
 
 ### Implemented

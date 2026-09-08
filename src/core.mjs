@@ -4250,6 +4250,7 @@ export function handlePluginHook(input, eventName, pluginRoot) {
   let cwd = input?.cwd;
   let inspectedTargets;
   let protectedMutation = true;
+  let ownedSessionObserved = false;
   try {
     if (process.platform === "win32") resetWindowsPathChecks();
     if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd)) {
@@ -4271,6 +4272,7 @@ export function handlePluginHook(input, eventName, pluginRoot) {
       return eventName === "PreToolUse" && protectedMutation
         ? preToolDecision(input, "deny", "Protected lifecycle and authority files require a validated owning Worker capability and their typed transition entry point.") : {};
     }
+    ownedSessionObserved = true;
     const authority = verifyWorkerAuthority(capability.root, input, pluginRoot);
     const attachment = attachmentFromSnapshot(capability.snapshot);
     if (attachment.workerAuthorityHash !== authority.grantHash) throw new Error("attachment has no matching immutable Worker grant");
@@ -4279,8 +4281,14 @@ export function handlePluginHook(input, eventName, pluginRoot) {
     return handleHook(input, eventName, input.cwd, lifecycleEdit
       ? "Protected lifecycle files require their typed transition entry point; direct file edits are denied." : null, authority);
   } catch {
-    return eventName === "PreToolUse" && protectedMutation
-      ? preToolDecision(input, "deny", "Protected campaign mutation requires verified ownership and immutable Worker provenance.") : {};
+    if (eventName === "PreToolUse" && (protectedMutation || ownedSessionObserved)) {
+      return preToolDecision(input, "deny", "Campaign execution requires unchanged accepted authority, verified ownership, and immutable plugin provenance.");
+    }
+    if (ownedSessionObserved) {
+      const reason = "Supervised Worker could not revalidate this campaign's authority. No campaign completion or recovery is confirmed; restore the accepted configuration or checkpoint through a valid owning session.";
+      return eventName === "Stop" ? allowStopOutput(input, reason) : contextOutput(input, eventName, reason);
+    }
+    return {};
   }
 }
 

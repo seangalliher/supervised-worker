@@ -6,9 +6,12 @@ authorize itself, run a daemon, or replace the existing build and review roles.
 
 ## Authority And Routing
 
-Production still requires the immutable installation's genuine host-provided
-Worker authority and the current repository/session owner. An explicitly
-accepted workflow chooses `authority.mode`. Doctor cannot change that mode,
+Production requires the immutable installation's accepted Worker authority and
+the current repository/session owner. The explicit VS Code `local-scoped` profile
+uses plugin-session binding; the default `host-attested` profile still requires
+genuine host-provided evidence. Neither mode manufactures a host inventory.
+An explicitly accepted workflow chooses `authority.mode` and `authority.assurance`.
+Doctor cannot change either selection,
 the accepted configuration, policy, review rules, or completion criteria.
 
 The hook-to-Doctor route accepts an in-process typed kernel failure, not text
@@ -119,10 +122,20 @@ the adapter contract with explicitly temporary fixtures only.
 
 ## Operational Acceptance
 
-Passing source tests and CI does not pass issue #6. The operational canary still
-requires a separately installed immutable candidate, genuine host authority,
-verified active hook provenance, exactly one Worker authority, a fresh host
-session, and no legacy plugin. Any operator command relay, manual recovery,
-ownership edit, or lifecycle intervention fails that canary. Preserve its evidence
-and leave it open on failure; the tracking epic remains open until every exit
-criterion and the real canary pass.
+Passing source tests and CI does not pass issue #6. The revised Copilot-local
+canary requires a separately installed immutable candidate, explicitly accepted
+local workflow, a fresh VS Code session, an operationally checked selected agent
+and hooks, and exactly one campaign owner. It must demonstrate real queued work,
+checkpoint/resume and supported Doctor recovery without operator command relay,
+manual lock editing or ownership intervention. Host-forced stops remain visible
+and cannot be called an uninterrupted pass.
+
+Local dead-lock recovery does not need the promotion adapter: the Worker inspects
+the committed result, revalidates the current owner, and verifies the next governed
+action. It must not call a successful recovery alone a completed continuation or
+resolved incident. A source upgrade requires an explicit checkpoint-and-restart
+handoff; no automatic in-session plugin replacement is claimed. The original
+strong host-activation/rollback/continuation acceptance is retained separately in
+Supervised Worker #11 and the linked ProbOS-host program. See
+[Host Profiles](host-profiles.md). Preserve unsuccessful evidence and leave the
+corresponding criteria open; do not claim a real canary passed from source tests.

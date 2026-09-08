@@ -32,6 +32,7 @@
       "required": ["mode", "boundaries"],
       "properties": {
         "mode": { "enum": ["supervised", "delegated"] },
+        "assurance": { "enum": ["host-attested", "local-scoped"], "default": "host-attested" },
         "boundaries": {
           "type": "array",
           "items": { "$ref": "#/$defs/nonBlank" },

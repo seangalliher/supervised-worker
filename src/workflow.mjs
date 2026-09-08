@@ -240,9 +240,13 @@ export function validateWorkflowValue(value) {
   }
 
   if (requiredKeys(value.authority, ["mode", "boundaries"], "authority", errors)) {
-    unknownKeys(value.authority, new Set(["mode", "boundaries"]), "authority", errors);
+    unknownKeys(value.authority, new Set(["mode", "boundaries", "assurance"]), "authority", errors);
     if (!["supervised", "delegated"].includes(value.authority.mode)) {
       errors.push("authority.mode must be supervised or delegated");
+    }
+    if (Object.hasOwn(value.authority, "assurance") &&
+        !["host-attested", "local-scoped"].includes(value.authority.assurance)) {
+      errors.push("authority.assurance must be host-attested or local-scoped");
     }
     stringArray(value.authority.boundaries, "authority.boundaries", errors);
   }
@@ -507,6 +511,7 @@ function loadWorkflowRoles(workspace = process.cwd(), reader = { lstatSync, read
       workflowHash,
       roles,
       authorityMode: workflow.authority.mode,
+      authorityAssurance: workflow.authority.assurance ?? "host-attested",
       doctor: workflow.doctor ?? null,
       reviewPolicy: {
         requiredModel: workflow.review.requiredModel ?? null,

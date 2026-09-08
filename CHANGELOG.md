@@ -2,6 +2,13 @@
 
 ## 0.1.2-alpha.1 - Unreleased
 
+- Added explicitly accepted `local-scoped` authority for the VS Code Agent
+	Plugin, binding immutable source, workflow bytes and the real session locator.
+	Existing workflows retain the strict host-inventory profile. Local admission,
+	incomplete-plan Stop, checkpoint/resume and exact dead-lock Doctor recovery
+	use the existing single-owner kernel; admitted calls fail closed after authority
+	drift. Status distinguishes configured assurance from evidence not checked.
+	Whole-host assurance and automatic host replacement remain separately planned.
 - Centralized lifecycle writes behind one generation-bound compare-and-set
 	owner while preserving #8's separate metadata journal boundary. Added typed
 	plan observation/publication and capability-bound out-of-band rescue.

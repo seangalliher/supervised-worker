@@ -49,6 +49,7 @@ const SCHEMA_FILES = [
 const EXAMPLE_SCHEMAS = [
   ["examples/workflow.json", "workflow.schema.json"],
   ["examples/workflow.specialized.json", "workflow.schema.json"],
+  ["examples/workflow.vscode-local.json", "workflow.schema.json"],
   ["examples/plan.active.json", "plan.schema.json"],
   ["examples/plan.complete.json", "plan.schema.json"],
   ["examples/handoff.build-contract.json", "role-handoff.schema.json"],

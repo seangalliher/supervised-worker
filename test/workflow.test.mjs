@@ -129,6 +129,20 @@ test("conflicting reviewer selectors fail closed", () => {
   assert.match(validateWorkflowValue(workflow).join("\n"), /must match/);
 });
 
+test("workflow authority accepts only explicit supported assurance values", () => {
+  const workflow = example();
+  assert.deepEqual(validateWorkflowValue(workflow), []);
+  assert.equal(Object.hasOwn(workflow.authority, "assurance"), false);
+  for (const assurance of ["host-attested", "local-scoped"]) {
+    workflow.authority.assurance = assurance;
+    assert.deepEqual(validateWorkflowValue(workflow), []);
+  }
+  for (const assurance of [null, "", "local", "provider-verified", true, {}]) {
+    workflow.authority.assurance = assurance;
+    assert.match(validateWorkflowValue(workflow).join("\n"), /authority\.assurance/);
+  }
+});
+
 test("companion role selectors are distinct and cannot impersonate the Worker", () => {
   const duplicate = example();
   duplicate.roles.builder = duplicate.roles.architect;

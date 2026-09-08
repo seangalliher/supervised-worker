@@ -155,6 +155,12 @@ test("main worker is the sole durable-plan owner and names every handoff", () =>
     assert.match(worker.body, /host\s+fallback is a failed review precondition/i);
     assert.match(worker.body, /`campaign inventory` and `campaign compile`/);
     assert.match(worker.body, /Doctor must not author the canonical receipt/);
+    assert.match(worker.body, /authority\.assurance: "local-scoped"/);
+    assert.match(worker.body, /does not require `SUPERVISED_WORKER_HOST_AUTHORITY`/);
+    assert.match(worker.body, /never create a fake\s+transcript/);
+    assert.match(worker.body, /An omitted assurance or `host-attested` keeps the strict inventory requirement/);
+    assert.match(worker.body, /checkpoint-and-restart boundary/);
+    assert.match(worker.body, /not a guarantee against\s+host cancellation/);
   }
 });
 

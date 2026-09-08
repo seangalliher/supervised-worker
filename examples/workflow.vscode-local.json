@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "tracker": {
+    "kind": "github",
+    "scope": "owner/repository",
+    "query": "is:issue is:open"
+  },
+  "wip": { "maxActive": 1, "maxCoupled": 3 },
+  "authority": {
+    "mode": "delegated",
+    "assurance": "local-scoped",
+    "boundaries": [
+      "live production access",
+      "destructive production data",
+      "security or privacy weakening",
+      "unmigrated compatibility break",
+      "new spending or credentials",
+      "unresolved critical or high risk"
+    ]
+  },
+  "roles": {
+    "architect": "seangalliher-supervised-architect",
+    "builder": "seangalliher-supervised-builder",
+    "reviewer": "seangalliher-supervised-diff-reviewer"
+  },
+  "validation": {
+    "focused": "replace with the repository's focused test command",
+    "broad": "replace with the repository's frozen broad gate",
+    "receiptGlobs": []
+  },
+  "review": { "required": true, "independent": true },
+  "filing": { "maximumNewPerClosures": 1, "closureDenominator": 3 }
+}

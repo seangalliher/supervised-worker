@@ -39,10 +39,13 @@ Allowed item states are `pending`, `in_progress`, `banked`, and `parked`.
 Exactly one item should normally be `in_progress`. Never turn a failed queue
 enumeration into an empty `items` array.
 
-The trusted host must provide `SUPERVISED_WORKER_HOST_AUTHORITY` for exactly one
-Worker and hook from the selected immutable installation. Do not create that
-inventory yourself or infer authority from a selector. Missing or unverifiable
-host authority is a blocker, not permission to initialize state another way.
+Check `workflow roles` for the accepted `authorityAssurance`. The opt-in
+`local-scoped` profile uses the immutable plugin and a matching real VS Code
+session transcript; it does not require or invent host-wide inventory. Use it
+only after the user explicitly accepts the workflow hash. An omitted assurance
+or `host-attested` still requires `SUPERVISED_WORKER_HOST_AUTHORITY`; never fall
+back to local mode after an authority failure. Local assurance covers this
+plugin's governed campaign, not all host processes, agents, or hooks.
 Run `node <immutable-plugin-root>/src/cli.mjs lifecycle observe` with JSON stdin
 containing `session_id` and any `transcript_path`. Pass that exact observation as
 `expected`, plus the session fields and `plan`, to `lifecycle plan`. Direct file
@@ -136,7 +139,11 @@ Only after a successful final enumeration, set `mode` to `complete` and add:
 ```
 
 The Stop hook validates structure and queue state, but it is not a security
-boundary against a malicious process running as the same user.
+boundary against a malicious process running as the same user. Continue between
+items without status-only stops while the host permits it. Quotas, approvals,
+network loss, editor shutdown, and host continuation limits can still interrupt
+the session; checkpoint and provide the exact resume reference instead of
+claiming the queue is complete. Do not bypass host controls or create a daemon.
 
 ## Memory Discipline
 
