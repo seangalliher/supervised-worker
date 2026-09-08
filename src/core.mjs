@@ -2690,6 +2690,23 @@ function windowsPathCheckTimeout() {
   );
 }
 
+function windowsDriveProbe(executable, args) {
+  if (!windowsPathChecksMaySpawn) return null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const timeout = windowsPathCheckTimeout();
+    if (timeout === 0) return null;
+    const result = spawnSync(executable, args, {
+      encoding: "utf8",
+      env: scrubbedChildEnvironment(),
+      timeout,
+      windowsHide: true,
+    });
+    if (windowsPathCheckTimeout() === 0) return null;
+    if (result.error?.code !== "ETIMEDOUT") return result;
+  }
+  return null;
+}
+
 function windowsSubstDrives() {
   if (windowsSubstDrivesCache !== undefined) return windowsSubstDrivesCache;
   const executable = windowsSystemExecutable("subst.exe");
@@ -2697,18 +2714,8 @@ function windowsSubstDrives() {
     windowsSubstDrivesCache = null;
     return windowsSubstDrivesCache;
   }
-  const timeout = windowsPathCheckTimeout();
-  if (timeout === 0) {
-    windowsSubstDrivesCache = null;
-    return windowsSubstDrivesCache;
-  }
-  const result = spawnSync(executable, [], {
-    encoding: "utf8",
-    env: scrubbedChildEnvironment(),
-    timeout,
-    windowsHide: true,
-  });
-  if (result.error || result.status !== 0) {
+  const result = windowsDriveProbe(executable, []);
+  if (result === null || result.error || result.status !== 0) {
     windowsSubstDrivesCache = null;
     return windowsSubstDrivesCache;
   }
@@ -2735,15 +2742,8 @@ function isLocalRepositoryPath(value) {
   windowsCheckedDrives.add(drive);
   const executable = windowsSystemExecutable("net.exe");
   if (executable === null) return false;
-  const timeout = windowsPathCheckTimeout();
-  if (timeout === 0) return false;
-  const result = spawnSync(executable, ["use", `${drive}:`], {
-    encoding: "utf8",
-    env: scrubbedChildEnvironment(),
-    timeout,
-    windowsHide: true,
-  });
-  const local = !result.error && result.status === 2;
+  const result = windowsDriveProbe(executable, ["use", `${drive}:`]);
+  const local = result !== null && !result.error && result.status === 2;
   windowsLocalDriveCache.set(drive, local);
   return local;
 }
