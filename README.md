@@ -55,6 +55,11 @@ workspace's plan and metadata-only run ledger. That artifact reports every
 provider fact as unavailable and is explicitly **local-only, not
 Provider-Verified Completion**.
 
+The [canonical release compiler](docs/campaign-release.md) additionally links
+Worker-opened, hash-validated handoff, checkpoint, provider-observation, timing,
+and Doctor evidence. Its canonical JSON and Markdown grant no authority; unsealed
+provider observations remain recorded, and missing proof remains unavailable.
+
 ## What It Provides
 
 - A preferred `seangalliher-supervised-worker` agent that owns queue and release

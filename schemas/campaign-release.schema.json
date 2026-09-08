@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervised-worker.dev/schemas/campaign-release.schema.json",
+  "title": "Canonical Campaign Release Evidence",
+  "oneOf": [
+    { "$ref": "#/$defs/input" }, { "$ref": "#/$defs/receipt" },
+    { "$ref": "#/$defs/provider" }, { "$ref": "#/$defs/timing" }
+  ],
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nullableHash": { "anyOf": [{ "$ref": "#/$defs/hash" }, { "type": "null" }] },
+    "gitHash": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "time": { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" },
+    "ref": { "type": "string", "minLength": 12, "maxLength": 256, "pattern": "^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$" },
+    "role": { "enum": ["plan", "checkpoint", "local-receipt", "queue-start", "queue-final", "build-contract", "build-report", "review-report", "model-builder", "model-reviewer", "provider", "timing"] },
+    "link": {
+      "type": "object", "additionalProperties": false, "required": ["locator", "sha256"],
+      "properties": {
+        "locator": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^\\.supervised-worker/[a-zA-Z0-9./_-]+$" },
+        "sha256": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "artifact": {
+      "type": "object", "additionalProperties": false, "required": ["role", "reference"],
+      "properties": { "role": { "$ref": "#/$defs/role" }, "reference": { "$ref": "#/$defs/link" } }
+    },
+    "candidate": {
+      "type": "object", "additionalProperties": false, "required": ["commit", "tree", "baseCommit", "ref"],
+      "properties": {
+        "commit": { "$ref": "#/$defs/gitHash" }, "tree": { "$ref": "#/$defs/gitHash" },
+        "baseCommit": { "$ref": "#/$defs/gitHash" }, "ref": { "$ref": "#/$defs/ref" }
+      }
+    },
+    "input": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "candidate", "artifacts", "doctorInventoryHash"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "campaign-release-input" },
+        "candidate": { "$ref": "#/$defs/candidate" },
+        "artifacts": { "type": "array", "minItems": 1, "maxItems": 12, "items": { "$ref": "#/$defs/artifact" } },
+        "doctorInventoryHash": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "fact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "status", "provenance", "references"],
+      "properties": {
+        "name": { "enum": ["plan", "checkpoint", "local-receipt", "queue-start", "queue-final", "handoff", "models", "commit", "ref", "remote", "ci", "closures", "recovery", "provider-verification"] },
+        "status": { "enum": ["verified", "recorded", "unavailable", "inapplicable"] },
+        "provenance": { "enum": ["plugin-verified-local", "worker-recorded", "unattested-provider-observation", "unavailable", "inapplicable"] },
+        "references": { "type": "array", "maxItems": 8192, "items": { "$ref": "#/$defs/link" } }
+      }
+    },
+    "doctor": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "provenance", "inventoryHash", "incidents", "references"],
+      "properties": {
+        "status": { "enum": ["recorded", "inapplicable"] },
+        "provenance": { "enum": ["worker-recorded", "inapplicable"] }, "inventoryHash": { "$ref": "#/$defs/hash" },
+        "incidents": { "type": "array", "maxItems": 128, "items": {
+          "type": "object", "additionalProperties": false, "required": ["incidentId", "stateHash", "state", "authorityMode", "capabilityHashes", "coverage", "dependencies"],
+          "properties": {
+            "incidentId": { "type": "string", "pattern": "^[0-9a-f-]{36}$" }, "stateHash": { "$ref": "#/$defs/hash" },
+            "state": { "enum": ["detected", "diagnosing", "stabilizing", "repairing", "validating", "reviewing", "promoting", "resuming", "resolved", "blocked"] },
+            "authorityMode": { "enum": ["supervised", "delegated"] },
+            "capabilityHashes": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/hash" } },
+            "coverage": { "enum": ["complete", "partial"] },
+            "dependencies": { "type": "array", "maxItems": 4096, "items": {
+              "type": "object", "additionalProperties": false, "required": ["name", "sha256", "status", "reference"],
+              "properties": {
+                "name": { "enum": ["diagnosis", "contract", "build-report", "review-report", "ci", "history-replay", "health", "repair-attempt", "validation", "promotion", "interrupted-action", "input", "evidence", "repair-intent"] },
+                "sha256": { "$ref": "#/$defs/hash" }, "status": { "enum": ["recorded", "unavailable"] },
+                "reference": { "anyOf": [{ "$ref": "#/$defs/link" }, { "type": "null" }] }
+              }
+            } }
+          }
+        } },
+        "references": { "type": "array", "maxItems": 8192, "items": { "$ref": "#/$defs/link" } }
+      }
+    },
+    "durations": {
+      "type": "object", "additionalProperties": false,
+      "required": ["productiveWorker", "productiveModel", "hookContention", "retries", "recovery", "doctor", "evidenceCompilation", "formalReview", "broadGates"],
+      "properties": {
+        "productiveWorker": { "$ref": "#/$defs/duration" }, "productiveModel": { "$ref": "#/$defs/duration" },
+        "hookContention": { "$ref": "#/$defs/duration" }, "retries": { "$ref": "#/$defs/duration" }, "recovery": { "$ref": "#/$defs/duration" },
+        "doctor": { "$ref": "#/$defs/duration" }, "evidenceCompilation": { "$ref": "#/$defs/duration" },
+        "formalReview": { "$ref": "#/$defs/duration" }, "broadGates": { "$ref": "#/$defs/duration" }
+      }
+    },
+    "duration": { "type": "integer", "minimum": 0, "maximum": 31536000000 },
+    "timing": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "planHash", "commit", "complete", "doctorIncluded", "basis", "durationsMs"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "release-timing-observation" }, "planHash": { "$ref": "#/$defs/hash" },
+        "commit": { "$ref": "#/$defs/gitHash" }, "complete": { "type": "boolean" }, "doctorIncluded": { "type": "boolean" },
+        "basis": { "const": "measured-activity-durations" }, "durationsMs": { "anyOf": [{ "$ref": "#/$defs/durations" }, { "type": "null" }] }
+      }
+    },
+    "provider": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "integrity", "actorHash", "repositoryHash", "commit", "ref", "observedAt", "complete", "remoteCommit", "ci", "closures"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "release-provider-observation" }, "integrity": { "const": "unattested" },
+        "actorHash": { "$ref": "#/$defs/hash" }, "repositoryHash": { "$ref": "#/$defs/hash" },
+        "commit": { "$ref": "#/$defs/gitHash" }, "ref": { "$ref": "#/$defs/ref" }, "observedAt": { "$ref": "#/$defs/time" },
+        "complete": { "type": "boolean" }, "remoteCommit": { "anyOf": [{ "$ref": "#/$defs/gitHash" }, { "type": "null" }] },
+        "ci": { "anyOf": [{ "type": "null" }, {
+          "type": "object", "additionalProperties": false, "required": ["runId", "commit", "complete", "conclusion", "jobs"],
+          "properties": {
+            "runId": { "type": "integer", "minimum": 1 }, "commit": { "$ref": "#/$defs/gitHash" }, "complete": { "const": true }, "conclusion": { "const": "success" },
+            "jobs": { "type": "array", "minItems": 9, "maxItems": 9, "items": {
+              "type": "object", "additionalProperties": false, "required": ["name", "commit", "conclusion", "steps"],
+              "properties": {
+                "name": { "type": "string", "pattern": "^test \\((ubuntu|macos|windows)-latest, (20|22|24)\\)$" },
+                "commit": { "$ref": "#/$defs/gitHash" }, "conclusion": { "const": "success" },
+                "steps": { "type": "array", "minItems": 2, "maxItems": 2, "items": {
+                  "type": "object", "additionalProperties": false, "required": ["name", "status", "conclusion"],
+                  "properties": { "name": { "enum": ["Run npm test", "Run npm run validate"] }, "status": { "const": "completed" }, "conclusion": { "const": "success" } }
+                } }
+              }
+            } }
+          }
+        }] },
+        "closures": { "type": "array", "maxItems": 4096, "items": {
+          "type": "object", "additionalProperties": false, "required": ["itemHash", "state", "stateReason"],
+          "properties": { "itemHash": { "$ref": "#/$defs/hash" }, "state": { "const": "CLOSED" }, "stateReason": { "enum": ["COMPLETED", "NOT_PLANNED", "DUPLICATE"] } }
+        } }
+      }
+    },
+    "receipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "scope", "inputHash", "candidate", "planHash", "itemHash", "workflowHash", "facts", "doctor", "dispositions", "timing", "authority"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "campaign-release-receipt" }, "scope": { "const": "compiled-local-evidence" },
+        "inputHash": { "$ref": "#/$defs/hash" }, "candidate": { "$ref": "#/$defs/candidate" }, "planHash": { "$ref": "#/$defs/hash" },
+        "itemHash": { "$ref": "#/$defs/nullableHash" }, "workflowHash": { "$ref": "#/$defs/nullableHash" },
+        "facts": { "type": "array", "minItems": 14, "maxItems": 14, "items": { "$ref": "#/$defs/fact" } },
+        "doctor": { "$ref": "#/$defs/doctor" },
+        "dispositions": {
+          "type": "object", "additionalProperties": false, "required": ["item", "hostSession", "campaign", "doctor", "provider"],
+          "properties": {
+            "item": { "enum": ["recorded-complete", "incomplete", "inapplicable"] },
+            "hostSession": { "enum": ["checkpoint-recorded", "unavailable"] }, "campaign": { "enum": ["recorded-complete", "incomplete"] },
+            "doctor": { "enum": ["recorded-resolved", "unresolved", "inapplicable"] }, "provider": { "const": "unavailable" }
+          }
+        },
+        "timing": {
+          "type": "object", "additionalProperties": false, "required": ["status", "provenance", "basis", "durationsMs", "references"],
+          "properties": {
+            "status": { "enum": ["recorded", "unavailable"] }, "provenance": { "enum": ["worker-recorded", "unavailable"] },
+            "basis": { "const": "measured-activity-durations-not-wall-time" }, "durationsMs": { "anyOf": [{ "$ref": "#/$defs/durations" }, { "type": "null" }] },
+            "references": { "type": "array", "maxItems": 1, "items": { "$ref": "#/$defs/link" } }
+          }
+        },
+        "authority": { "type": "object", "additionalProperties": false, "required": ["grantsPermissions", "satisfiesStop", "providerSealed"],
+          "properties": { "grantsPermissions": { "const": false }, "satisfiesStop": { "const": false }, "providerSealed": { "const": false } } }
+      }
+    }
+  }
+}

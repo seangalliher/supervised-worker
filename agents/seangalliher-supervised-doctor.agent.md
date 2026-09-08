@@ -18,6 +18,10 @@ executor validates authority and performs all durable mutations for the Worker.
 Never author host inventories, capabilities, serving-model attestations, review
 receipts, or completion evidence. Test fixtures are not live authority.
 
+Do not author canonical campaign/release receipts or invoke their compiler.
+Return typed incident evidence only; the Worker opens and validates receipt
+inputs and runs the read-only compiler. Missing legacy proof remains unavailable.
+
 ## Diagnose And Reconcile
 
 Start with the current observed state, not event order or a remembered repair.

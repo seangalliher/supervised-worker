@@ -123,6 +123,7 @@ async function validateRepository() {
     "com.github.copilot/hooks/hooks.json",
     "docs/architecture.md",
     "docs/doctor.md",
+    "docs/campaign-release.md",
     "docs/customizing-roles.md",
     "docs/evaluation.md",
     "docs/roadmap.md",
@@ -136,6 +137,7 @@ async function validateRepository() {
     "examples/local-campaign-receipt.json",
     "policy/constitution.json",
     "schemas/checkpoint.schema.json",
+    "schemas/campaign-release.schema.json",
     "schemas/doctor.schema.json",
     "schemas/episode.schema.json",
     "schemas/lifecycle.schema.json",
@@ -495,6 +497,28 @@ async function main() {
     return;
   }
   if (command === "campaign") {
+    if (["compile", "inventory"].includes(argument) && (argumentsAfter.length === 0 ||
+      (argument === "compile" && argumentsAfter.length === 2 && argumentsAfter[0] === "--format" && ["json", "markdown"].includes(argumentsAfter[1])))) {
+      try {
+        const request = parseWorkflowJson(await readStdin(65_536));
+        if (!request || typeof request !== "object" || Array.isArray(request) ||
+          Object.keys(request).some((key) => !["session_id", "transcript_path", ...(argument === "compile" ? ["manifest"] : [])].includes(key))) throw new Error("RELEASE_REQUEST_INVALID");
+        const input = { session_id: request.session_id, ...(request.transcript_path === undefined ? {} : { transcript_path: request.transcript_path }) };
+        const authority = verifyWorkerAuthority(process.cwd(), input, root);
+        if (argument === "inventory") {
+          const { observeReleaseDoctorInventory } = await import("./release-inputs.mjs");
+          process.stdout.write(`${JSON.stringify(observeReleaseDoctorInventory(process.cwd(), input, authority))}\n`);
+        } else {
+          const { compileCampaignRelease, renderCampaignReleaseMarkdown, serializeCampaignRelease } = await import("./campaign-release.mjs");
+          const receipt = compileCampaignRelease(process.cwd(), input, request.manifest, authority);
+          process.stdout.write(argumentsAfter[1] === "markdown" ? renderCampaignReleaseMarkdown(receipt) : serializeCampaignRelease(receipt));
+        }
+      } catch (error) {
+        process.stdout.write(`${JSON.stringify({ ok: false, code: /^RELEASE_[A-Z_]+$/.test(error.message) ? error.message : "RELEASE_AUTHORITY_OR_INPUT_UNCONFIRMED" })}\n`);
+        process.exitCode = 1;
+      }
+      return;
+    }
     const exportFormat = argument === "export" && argumentsAfter.length === 0
       ? "json"
       : argument === "export" &&

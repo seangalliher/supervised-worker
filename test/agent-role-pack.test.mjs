@@ -153,6 +153,8 @@ test("main worker is the sole durable-plan owner and names every handoff", () =>
     assert.match(worker.body, /handoff\s+verify/is);
     assert.match(worker.body, /host-reported Builder and Reviewer model IDs/i);
     assert.match(worker.body, /host\s+fallback is a failed review precondition/i);
+    assert.match(worker.body, /`campaign inventory` and `campaign compile`/);
+    assert.match(worker.body, /Doctor must not author the canonical receipt/);
   }
 });
 
@@ -164,6 +166,7 @@ test("Doctor is an on-demand reasoning role with no durable-state or shell autho
   assert.match(doctor.body, /Do not create, read, edit, or acquire independent ownership/);
   assert.match(doctor.body, /schemas\/doctor\.schema\.json/);
   assert.match(doctor.body, /Never author host inventories/);
+  assert.match(doctor.body, /Do not author canonical campaign\/release receipts/);
   for (const id of ["seangalliher-supervised-worker", "supervised-worker"]) {
     assert.match(readAgent(id).body, /invoke `Supervised Doctor`/);
     assert.match(readAgent(id).body, /src\/doctor-rescue\.mjs/);

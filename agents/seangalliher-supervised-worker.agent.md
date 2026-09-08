@@ -168,6 +168,25 @@ continue independent work.
 - Push the reviewed commit explicitly and verify the intended remote ref.
 - Close or reclassify an issue only after its own acceptance criteria hold.
 
+## Canonical Release Evidence
+
+Use the immutable helper's `campaign inventory` and `campaign compile` commands
+to compile release evidence from bounded hash-validated inputs. Do not restate
+existing artifacts in a new agent-authored release receipt. The compiler is
+read-only; you remain the sole owner that banks its canonical output. Companions
+and Doctor must not author the canonical receipt or read its durable inputs.
+
+Keep item, session checkpoint, campaign, Doctor resolution, and provider
+dispositions distinct. Recorded provider/model observations and unavailable
+Doctor proof hashes do not grant authority, satisfy Stop, or pass an operational
+canary. Include measured timing only when coverage is complete; never infer it
+from transcript length or wall time. Recompile after any bound input or tree
+changes. See `docs/campaign-release.md` and `schemas/campaign-release.schema.json`.
+
+Compile item handoff evidence within 24 hours of its issued review attempt.
+Expired evidence fails compilation; obtain a fresh independent review through
+the existing flow instead of dropping the item or weakening freshness.
+
 ## Internal Supervisor Incidents
 
 For a typed internal supervisor failure, invoke `Supervised Doctor` as an

@@ -32,6 +32,7 @@ const SKILL_KEYS = new Set([
   "allowed-tools",
 ]);
 const SCHEMA_FILES = [
+  "campaign-release.schema.json",
   "checkpoint.schema.json",
   "doctor.schema.json",
   "episode.schema.json",

@@ -1554,6 +1554,36 @@ export function validateTransition(value, definition = null) {
 }
 
 let doctorSchema;
+let campaignReleaseSchema;
+
+export function validateCampaignRelease(value, definition = null) {
+  try {
+    campaignReleaseSchema ??= parseWorkflowJson(readFileSync(new URL("../schemas/campaign-release.schema.json", import.meta.url)));
+    const shape = definition === null ? campaignReleaseSchema : campaignReleaseSchema.$defs[definition];
+    if (!shape || Buffer.byteLength(JSON.stringify(value)) > 4_194_304 || !lifecycleShapeMatches(shape, value, campaignReleaseSchema)) throw new Error();
+    return [];
+  } catch {
+    return ["campaign release record is invalid or exceeds its bound"];
+  }
+}
+
+export function withWorkerEvidenceRead(cwd, input, authority, action) {
+  if (process.platform === "win32") resetWindowsPathChecks();
+  const capability = owningSessionCapability(cwd, input);
+  if (capability === null || attachmentFromSnapshot(capability.snapshot).workerAuthorityHash !== authority?.grantHash) throw new Error("RELEASE_OWNING_WORKER_REQUIRED");
+  const root = capability.root;
+  requireVerifiedWorkerAuthority(authority, root, input);
+  const observation = observeCampaignTransition(root, input);
+  const authorize = () => {
+    requireVerifiedWorkerAuthority(authority, root, input);
+    requireOwningSessionCapability(capability, input);
+    if (canonicalJson(observeCampaignTransition(root, input)) !== canonicalJson(observation)) throw new Error("RELEASE_OWNER_CHANGED");
+  };
+  authorize();
+  const result = action({ root, observation, authorize });
+  authorize();
+  return result;
+}
 
 export function validateDoctor(value, definition = null) {
   try {

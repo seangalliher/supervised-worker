@@ -1128,7 +1128,7 @@ function gitPaths(workspace, args) {
   return output.toString("utf8").split("\0").filter(Boolean).map((value) => value.replaceAll("\\", "/"));
 }
 
-function verifyBuildContext(workspace, contractPath, buildReportPath, source = null) {
+function verifyBuildContext(workspace, contractPath, buildReportPath, source = null, committed = null) {
   const errors = [];
   let contract;
   let build;
@@ -1175,11 +1175,15 @@ function verifyBuildContext(workspace, contractPath, buildReportPath, source = n
       gitPhase = "source-root";
       sourceRoot = realpathSync(source.sourceRoot);
       const artifactRoot = realpathSync(workspace);
-      if (isContained(artifactRoot, sourceRoot) || isContained(sourceRoot, artifactRoot) ||
-        !sameDirectoryIdentity(realpathSync(runGit(sourceRoot, ["rev-parse", "--show-toplevel"], "utf8").trim()), sourceRoot)) throw new Error("repair requires separate canonical roots");
+      if (committed === null) {
+        if (isContained(artifactRoot, sourceRoot) || isContained(sourceRoot, artifactRoot)) throw new Error("repair requires separate canonical roots");
+      } else if (!sameDirectoryIdentity(artifactRoot, sourceRoot) || !TREE_HASH_RE.test(committed.commit ?? "") ||
+        runGit(sourceRoot, ["rev-parse", "HEAD"], "utf8").trim() !== committed.commit ||
+        runGit(sourceRoot, ["rev-parse", "HEAD^{tree}"], "utf8").trim() !== committed.tree) throw new Error("committed candidate changed");
+      if (!sameDirectoryIdentity(realpathSync(runGit(sourceRoot, ["rev-parse", "--show-toplevel"], "utf8").trim()), sourceRoot)) throw new Error("source must be its repository root");
       gitPhase = "base-ancestry";
       runGit(sourceRoot, ["merge-base", "--is-ancestor", source.baseCommit, "HEAD"], "utf8");
-      sourceBinding = sha256(JSON.stringify({ artifactRoot: pathKey(artifactRoot), sourceRoot: pathKey(sourceRoot), baseCommit: source.baseCommit }));
+      sourceBinding = committed === null ? sha256(JSON.stringify({ artifactRoot: pathKey(artifactRoot), sourceRoot: pathKey(sourceRoot), baseCommit: source.baseCommit })) : null;
       for (const target of new Set([...contract.value.targetFiles, ...build.value.changedFiles])) {
         errors.push(...validateRepositoryPath(sourceRoot, target).map((error) => `repair source: ${error}`));
       }
@@ -1215,7 +1219,7 @@ function verifyBuildContext(workspace, contractPath, buildReportPath, source = n
     gitPhase = "untracked-paths";
     const untracked = gitPaths(sourceRoot, ["ls-files", "--others", "--exclude-standard", "-z"])
       .map(pathKey)
-      .filter((file) => source !== null || (file !== ".supervised-worker" && !file.startsWith(".supervised-worker/")));
+      .filter((file) => (source !== null && committed === null) || (file !== ".supervised-worker" && !file.startsWith(".supervised-worker/")));
     if (untracked.length > 0) {
       errors.push(source === null ? "worktree contains untracked files outside .supervised-worker" : "repair worktree contains untracked files");
     }
@@ -1287,7 +1291,25 @@ export function issueReviewAttempt(workspace, contractPath, buildReportPath, sou
 }
 
 export function verifyHandoffChain(workspace, contractPath, buildReportPath, reviewReportPath, source = null) {
-  const buildContext = verifyBuildContext(workspace, contractPath, buildReportPath, source);
+  return verifyHandoffContext(workspace, contractPath, buildReportPath, reviewReportPath, source);
+}
+
+export function verifyCommittedHandoffChain(workspace, contractPath, buildReportPath, reviewReportPath, candidate) {
+  if (!candidate || !TREE_HASH_RE.test(candidate.commit ?? "") || !TREE_HASH_RE.test(candidate.tree ?? "") ||
+    !TREE_HASH_RE.test(candidate.baseCommit ?? "")) return { ok: false, errors: ["committed candidate is invalid"] };
+  try {
+    runGit(workspace, ["merge-base", "--is-ancestor", candidate.baseCommit, candidate.commit], "utf8");
+    const parent = runGit(workspace, ["rev-parse", `${candidate.commit}^1`], "utf8").trim();
+    if (!TREE_HASH_RE.test(parent)) return { ok: false, errors: ["reviewed item parent is unavailable"] };
+    return verifyHandoffContext(workspace, contractPath, buildReportPath, reviewReportPath,
+      { sourceRoot: workspace, baseCommit: parent }, candidate);
+  } catch {
+    return { ok: false, errors: ["committed item ancestry is unavailable"] };
+  }
+}
+
+function verifyHandoffContext(workspace, contractPath, buildReportPath, reviewReportPath, source = null, committed = null) {
+  const buildContext = verifyBuildContext(workspace, contractPath, buildReportPath, source, committed);
   const errors = [...buildContext.errors];
   let review;
   try {
