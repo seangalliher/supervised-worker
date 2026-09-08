@@ -2,6 +2,9 @@
 
 ## 0.1.2-alpha.1 - Unreleased
 
+- Let local-scoped hooks share one bounded acquisition wait across lock scopes,
+  preventing routine parallel hooks from being mistaken for supervisor failures.
+  Preserve live-owner refusal, immutable authority revalidation and legacy bounds.
 - Added explicitly accepted `local-scoped` authority for the VS Code Agent
 	Plugin, binding immutable source, workflow bytes and the real session locator.
 	Existing workflows retain the strict host-inventory profile. Local admission,

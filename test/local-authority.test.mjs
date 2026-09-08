@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -18,6 +18,8 @@ const sourceRoot = fileURLToPath(new URL("../", import.meta.url));
 
 function withLocalFixture(action) {
   const base = realpathSync(mkdtempSync(path.join(os.tmpdir(), "sw-local-authority-")));
+  const cleanup = () => rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  let pending = false;
   try {
     const cwd = path.join(base, "repo");
     const workflowPath = path.join(cwd, ".github", "supervised-worker.json");
@@ -36,11 +38,136 @@ function withLocalFixture(action) {
       const result = acceptWorkflowRoles(cwd, resolveWorkflowRoles(cwd).workflowHash);
       assert.equal(result.ok, true, result.errors?.join("\n"));
     };
-    action({ base, cwd, workflow, workflowPath, storage, input, installRoot, accept });
+    const result = action({ base, cwd, workflow, workflowPath, storage, input, installRoot, accept });
+    if (result instanceof Promise) {
+      pending = true;
+      return result.finally(cleanup);
+    }
+    return result;
   } finally {
-    rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    if (!pending) cleanup();
   }
 }
+
+function localHookChild(fixture, mode, hostId) {
+  const sessionLock = path.join(fixture.storage, "supervised-worker", "session-locks", sha256(fixture.input.session_id));
+  const journalLock = path.join(fixture.cwd, ".supervised-worker", "locks", "journal");
+  const input = { ...fixture.input, tool_name: "read_file", tool_use_id: hostId,
+    tool_input: { filePath: path.join(fixture.cwd, "README.md"), startLine: 1, endLine: 1 } };
+  const child = spawn(process.execPath, [fileURLToPath(new URL("./local-hook-child-fixture.mjs", import.meta.url)),
+    JSON.stringify({ installRoot: fixture.installRoot, input, mode, event: "PreToolUse", sessionLock, journalLock })],
+  { cwd: fixture.cwd, stdio: ["pipe", "ignore", "pipe", "ipc"] });
+  const messages = [];
+  let stderr = "";
+  let failure = null;
+  let closed = false;
+  const waiters = [];
+  const notify = () => { for (const waiter of waiters.splice(0)) waiter(); };
+  const timer = setTimeout(() => { failure = new Error("Local hook child exceeded its 20-second test bound"); child.kill(); notify(); }, 20_000);
+  child.stderr.on("data", (bytes) => { stderr += bytes; });
+  child.on("message", (message) => { messages.push(message); notify(); });
+  child.once("error", (error) => { failure = error; notify(); });
+  const exited = new Promise((resolve) => child.once("close", (code, signal) => {
+    clearTimeout(timer);
+    closed = true;
+    resolve({ code, signal });
+    notify();
+  }));
+  return {
+    child, exited,
+    async waitFor(type) {
+      for (;;) {
+        if (failure) throw failure;
+        const result = messages.find((message) => message.type === type);
+        if (result) return result;
+        assert.equal(closed, false, `Local hook child exited before ${type}: ${stderr}`);
+        await new Promise((resolve) => waiters.push(resolve));
+      }
+    },
+    async finish() {
+      const exit = await exited;
+      assert.equal(failure, null);
+      assert.equal(exit.signal, null, stderr);
+      assert.equal(exit.code, 0, stderr);
+      const results = messages.filter((message) => message.type === "result");
+      assert.equal(results.length, 1);
+      return results[0];
+    },
+  };
+}
+
+function admitLocalFixture(fixture) {
+  fixture.accept();
+  const request = { session_id: fixture.input.session_id, transcript_path: fixture.input.transcript_path };
+  const authority = verifyWorkerAuthority(fixture.cwd, request, fixture.installRoot, "");
+  const plan = { schemaVersion: 1, mode: "active", goal: "Verify local hook overlap.",
+    items: [{ id: "one", title: "One", status: "in_progress" }], completion: null };
+  assert.equal(applyCampaignPlan(fixture.cwd, { ...request, expected: observeCampaignTransition(fixture.cwd, request), plan }, authority).status, "applied");
+}
+
+test("local hooks wait for a live peer beyond the legacy overlap window without losing starts", async () => {
+  await withLocalFixture(async (fixture) => {
+    admitLocalFixture(fixture);
+    const attachmentPath = path.join(fixture.cwd, ".supervised-worker", "attachment.json");
+    const before = readFileSync(attachmentPath);
+    const holder = localHookChild(fixture, "holder", "held-local-hook");
+    let contender;
+    let release;
+    try {
+      await holder.waitFor("held");
+      contender = localHookChild(fixture, "contender", "waiting-local-hook");
+      const boundary = await contender.waitFor("contended");
+      assert.equal(boundary.scope, "session");
+      release = setTimeout(() => holder.child.stdin.end("g"), 400);
+      const [held, waited] = await Promise.all([holder.finish(), contender.finish()]);
+      assert.equal(held.held, true);
+      assert.equal(waited.contended, true);
+      assert.deepEqual(held.output, {});
+      assert.deepEqual(waited.output, {});
+      assert.deepEqual(readFileSync(attachmentPath), before);
+      const records = readFileSync(path.join(fixture.cwd, ".supervised-worker", "runs", `${sha256(fixture.input.session_id)}.jsonl`), "utf8").trim().split("\n").map(JSON.parse);
+      const starts = records.filter((record) => record.event === "tool_started");
+      assert.equal(starts.length, 2);
+      assert.equal(new Set(starts.map((record) => record.operationId)).size, 2);
+    } finally {
+      clearTimeout(release);
+      for (const actor of [holder, contender].filter(Boolean)) {
+        if (actor.child.exitCode === null && actor.child.signalCode === null) actor.child.kill();
+      }
+      await Promise.all([holder, contender].filter(Boolean).map((actor) => actor.exited));
+    }
+  });
+});
+
+test("local hook lock scopes share one monotonic acquisition budget", async () => {
+  await withLocalFixture(async (fixture) => {
+    admitLocalFixture(fixture);
+    const actor = localHookChild(fixture, "shared-budget", "bounded-local-hook");
+    const result = await actor.finish();
+    assert.equal(result.output.permissionDecision, "deny");
+    assert.match(result.output.permissionDecisionReason, /LIFECYCLE_ACQUISITION_CONTENTION/);
+    assert.deepEqual(result.attempts, { session: 2, journal: 1 });
+  });
+});
+
+test("local hook exhausted overlap never reclaims or rewrites a live owner", async () => {
+  await withLocalFixture(async (fixture) => {
+    admitLocalFixture(fixture);
+    const lock = path.join(fixture.storage, "supervised-worker", "session-locks", sha256(fixture.input.session_id));
+    const token = randomUUID();
+    mkdirSync(lock);
+    const ownerPath = path.join(lock, `${token}.json`);
+    const bytes = Buffer.from(JSON.stringify({ schemaVersion: 1, token, processId: process.pid, acquiredAt: new Date().toISOString() }));
+    writeFileSync(ownerPath, bytes);
+    const actor = localHookChild(fixture, "exhaust-live-owner", "unreclaimable-local-hook");
+    const result = await actor.finish();
+    assert.equal(result.output.permissionDecision, "deny");
+    assert.match(result.output.permissionDecisionReason, /LIFECYCLE_OWNER_LIVE/);
+    assert.equal(result.contended, true);
+    assert.equal(result.attempts.session, 1);
+    assert.deepEqual(readFileSync(ownerPath), bytes);
+  });
+});
 
 test("local admission requires exact workflow acceptance and labels its limited provenance", () => {
   withLocalFixture(({ cwd, input, installRoot, accept }) => {

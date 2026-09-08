@@ -43,6 +43,7 @@ const MAX_GIT_POINTER_BYTES = 4_096;
 const MAX_SESSION_LOCATOR_BYTES = 4_096;
 const SESSION_LOCK_WAIT_MS = 250;
 const SESSION_LOCK_POLL_MS = 10;
+const LOCAL_HOOK_LOCK_WAIT_MS = process.platform === "win32" ? 5_000 : 1_000;
 const LIFECYCLE_RELEASE_WAIT_MS = 100;
 const LIFECYCLE_RELEASE_POLL_MS = 25;
 const MAX_LIFECYCLE_RELEASE_ATTEMPTS = 3;
@@ -835,11 +836,11 @@ function sessionLocatorContext(input) {
   };
 }
 
-function acquireSessionLock(input, context = sessionLocatorContext(input)) {
+function acquireSessionLock(input, context = sessionLocatorContext(input), acquisitionDeadline = undefined) {
   if (context === null) return null;
   const locksDirectory = path.join(context.storageRoot, "supervised-worker", "session-locks");
   const lockDirectory = path.join(locksDirectory, sessionHash(input));
-  return acquireLifecycleLock(context.storageRoot, lockDirectory, "session");
+  return acquireLifecycleLock(context.storageRoot, lockDirectory, "session", acquisitionDeadline);
 }
 
 function lifecycleErrorCode(code) {
@@ -1074,9 +1075,9 @@ function observeLifecycleContention(storageRoot, lockDirectory, scope, attempts)
   }
 }
 
-function acquireLifecycleLock(storageRoot, lockDirectory, scope) {
+function acquireLifecycleLock(storageRoot, lockDirectory, scope, acquisitionDeadline = undefined) {
   try {
-    return createLifecycleLock(storageRoot, lockDirectory, scope);
+    return createLifecycleLock(storageRoot, lockDirectory, scope, acquisitionDeadline);
   } catch (error) {
     if (error instanceof LifecycleError) throw error;
     throw new LifecycleError([lifecycleDiagnostic("LIFECYCLE_SYSCALL_FAILURE", scope, "acquire", "acquisition", {
@@ -1085,12 +1086,12 @@ function acquireLifecycleLock(storageRoot, lockDirectory, scope) {
   }
 }
 
-function createLifecycleLock(storageRoot, lockDirectory, scope) {
+function createLifecycleLock(storageRoot, lockDirectory, scope, acquisitionDeadline = undefined) {
   ensureSafeDirectory(storageRoot, path.dirname(lockDirectory));
   const token = randomUUID();
   const ownerPath = path.join(lockDirectory, `${token}.json`);
   assertSafeStatePath(storageRoot, lockDirectory);
-  const deadline = performance.now() + SESSION_LOCK_WAIT_MS;
+  const deadline = acquisitionDeadline ?? performance.now() + SESSION_LOCK_WAIT_MS;
   let observedContention = false;
   let attempts = 0;
   while (true) {
@@ -1393,7 +1394,7 @@ function releaseLifecycleLock(lock, binding = null) {
   }
 }
 
-function acquireRepositoryLocks(roots, releaseContext = createLifecycleReleaseContext(() => ({ roots, session: null }))) {
+function acquireRepositoryLocks(roots, releaseContext = createLifecycleReleaseContext(() => ({ roots, session: null })), acquisitionDeadline = undefined) {
   const canonicalRoots = new Map();
   for (const root of roots) {
     const canonicalRoot = realpathSync(path.resolve(root));
@@ -1410,6 +1411,7 @@ function acquireRepositoryLocks(roots, releaseContext = createLifecycleReleaseCo
         root,
         path.join(stateDirectory(root), "locks", "lifecycle"),
         "repository",
+        acquisitionDeadline,
       ));
     }
     return locks;
@@ -1419,7 +1421,7 @@ function acquireRepositoryLocks(roots, releaseContext = createLifecycleReleaseCo
   }
 }
 
-function acquireJournalLocks(roots, releaseContext = createLifecycleReleaseContext(() => ({ roots, session: null }))) {
+function acquireJournalLocks(roots, releaseContext = createLifecycleReleaseContext(() => ({ roots, session: null })), acquisitionDeadline = undefined) {
   const canonicalRoots = new Map();
   for (const root of roots) {
     const canonicalRoot = realpathSync(path.resolve(root));
@@ -1432,7 +1434,7 @@ function acquireJournalLocks(roots, releaseContext = createLifecycleReleaseConte
   try {
     for (const identity of [...canonicalRoots.keys()].sort()) {
       const root = canonicalRoots.get(identity);
-      locks.push(acquireLifecycleLock(root, path.join(stateDirectory(root), "locks", "journal"), "journal"));
+      locks.push(acquireLifecycleLock(root, path.join(stateDirectory(root), "locks", "journal"), "journal", acquisitionDeadline));
     }
     return locks;
   } catch (error) {
@@ -2150,7 +2152,7 @@ export function rescueLifecycle(cwd, request) {
   }
 }
 
-function acquireHookRepositoryLocks(input, eventName, targets, cwd, releaseContext) {
+function acquireHookRepositoryLocks(input, eventName, targets, cwd, releaseContext, acquisitionDeadline = undefined) {
   const routing = protectedTargetRouting(targets);
   if (routing.hasUnqualifiedTarget || routing.roots.length > 1) {
     throw new Error("protected edit must name one fully qualified repository");
@@ -2181,7 +2183,7 @@ function acquireHookRepositoryLocks(input, eventName, targets, cwd, releaseConte
   ) {
     roots.push(cwd);
   }
-  return acquireRepositoryLocks(roots, releaseContext);
+  return acquireRepositoryLocks(roots, releaseContext, acquisitionDeadline);
 }
 
 function routineHookObservation(input, eventName, targets, cwd) {
@@ -4701,14 +4703,16 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
     const initialRouting = readSessionLocator(input, false, true);
     const transitionRoot = protectedRouting.roots[0] ?? initialRouting.locator?.repositoryRoot ?? cwd;
     let transitionExpected = readCampaignTransition(transitionRoot, input);
-    sessionLock = acquireSessionLock(input, sessionContext);
+    const acquisitionDeadline = authority?.assurance === "local-scoped"
+      ? performance.now() + LOCAL_HOOK_LOCK_WAIT_MS : undefined;
+    sessionLock = acquireSessionLock(input, sessionContext, acquisitionDeadline);
     windowsPathChecksMaySpawn = false;
     const observation = routineHookObservation(input, eventName, preparedTargets, cwd);
     if (observation === null) {
-      repositoryLocks = acquireHookRepositoryLocks(input, eventName, preparedTargets, cwd, releaseContext);
-      journalLocks = acquireJournalLocks(repositoryLocks.map((lock) => lock.storageRoot), releaseContext);
+      repositoryLocks = acquireHookRepositoryLocks(input, eventName, preparedTargets, cwd, releaseContext, acquisitionDeadline);
+      journalLocks = acquireJournalLocks(repositoryLocks.map((lock) => lock.storageRoot), releaseContext, acquisitionDeadline);
     } else {
-      journalLocks = acquireJournalLocks([observation.root], releaseContext);
+      journalLocks = acquireJournalLocks([observation.root], releaseContext, acquisitionDeadline);
     }
     const requireJournal = createJournalGuard(journalLocks, [sessionLock, ...repositoryLocks]);
     const journalGuard = (root) => {

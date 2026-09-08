@@ -30,6 +30,13 @@ workspace identity, or immutable source invalidates it. Lifecycle requests from
 other sessions cannot replace an active campaign attachment. Unadmitted chats
 remain inert except for the existing protection of workflow and lifecycle files.
 
+Local hooks share one monotonic lock-acquisition wait budget across session,
+repository and journal scopes: five seconds on Windows and one second elsewhere.
+This accommodates short peer-hook overlap; it does not reclaim a live owner,
+reset the budget at each lock, replay an invocation, or bound total hook execution.
+Exhausted or unverifiable ownership still denies the operation. Other lifecycle
+callers retain their existing acquisition budget.
+
 The local grant is a cooperative binding, not independent verification of the
 caller's selected role or host process. Another program using the same OS account
 can supply the same files and IDs; this is not an OS sandbox. A matching locator
