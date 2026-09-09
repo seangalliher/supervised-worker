@@ -35,6 +35,18 @@ linked ProbOS-host program. The Provider-Verified Completion claim ladder and
 external dogfood requirements below are unchanged; local evidence does not
 substitute for any of their host/provider/external provenance requirements.
 
+The local gate completed on 2026-09-09: the two pre-existing ProbOS issues
+#1359 and #1234 shipped, the authenticated queue decreased from 94 to 92 with
+no new issues, and both repository/session Doctor recovery variants demonstrated
+subsequent governed progress. The completed canonical receipt was validated
+before typed ownership release. See the
+[verified canary record](https://github.com/seangalliher/supervised-worker/issues/6#issuecomment-5609078703)
+and [merged PR #12](https://github.com/seangalliher/supervised-worker/pull/12).
+This is a resumable local-workflow pass, not an uninterrupted-host claim: the
+run included a computer crash and one native Continue action. Historical Doctor
+states and unavailable provider/host evidence remain explicit. Normal campaigns
+still require their own exact-workflow acceptance and permission scope.
+
 ### Current: Untagged Local Alpha
 
 Implemented, but not a release. Local plan-completion shape and explicit local
@@ -73,9 +85,12 @@ The current alpha may claim:
 - lifecycle failures release visibly rather than silently claiming completion.
 
 It must not claim that Stop consumes verified handoff evidence or that the
-plugin independently proves GitHub pagination, remote push state, CI success,
-pull-request state, reviewer identity, or issue closure. Those facts remain
-Worker-supplied claims until provider reconciliation and host attestation ship.
+plugin independently proves an atomic provider snapshot, remote push state, CI
+success, pull-request state, reviewer identity, or issue closure. The standalone
+queue adapter may claim a bounded authenticated interval observation with cursor
+and truncation validation; it does not grant completion authority. The remaining
+facts stay Worker-supplied until provider reconciliation and host attestation
+ship.
 
 ### Provider-Verified Completion
 
