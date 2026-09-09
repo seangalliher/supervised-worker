@@ -114,6 +114,18 @@ test("companion agents have bounded non-overlapping authority", () => {
   assert.match(reviewer.body, /build report.*SHA-256/is);
 });
 
+test("Worker tool declarations include native delegation before campaign admission", () => {
+  for (const workerId of ["seangalliher-supervised-worker", "supervised-worker"]) {
+    const worker = readAgent(workerId);
+    assert.deepEqual(worker.metadata.tools, ["execute", "edit", "read", "search", "agent", "web", "todo"]);
+    assert.match(worker.body, /Before admission, confirm native `runSubagent`/);
+    assert.match(worker.body, /pass its explicit model selector/);
+    assert.match(worker.body, /Verify the actual serving model/);
+    assert.equal(worker.metadata.model, undefined);
+    assert.equal(worker.metadata.agents, undefined);
+  }
+});
+
 test("companion inline handoff templates pass the runtime validator", () => {
   for (const id of [
     "seangalliher-supervised-architect",

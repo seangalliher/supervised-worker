@@ -8,12 +8,12 @@ const request = JSON.parse(process.argv[2]);
 const { handlePluginHook } = await import(pathToFileURL(path.join(request.installRoot, "src", "core.mjs")));
 const originalWrite = fs.writeFileSync;
 const originalMkdir = fs.mkdirSync;
-const budget = process.platform === "win32" ? 5_000 : 1_000;
+const budget = process.platform === "win32" ? 10_000 : 1_000;
 let held = false;
 let contended = false;
 let monotonic = 0;
 const attempts = { session: 0, journal: 0 };
-if (["shared-budget", "exhaust-live-owner"].includes(request.mode)) performance.now = () => monotonic;
+if (["shared-budget", "exhaust-live-owner", "extended-budget", "extended-ceiling"].includes(request.mode)) performance.now = () => monotonic;
 fs.writeFileSync = (file, bytes, ...options) => {
   let value;
   try { value = JSON.parse(String(bytes)); } catch { value = null; }
@@ -30,6 +30,10 @@ fs.mkdirSync = (directory, ...options) => {
   const scope = normalized === request.sessionLock ? "session"
     : normalized === request.journalLock ? "journal" : null;
   if (scope !== null) attempts[scope] += 1;
+  if (["extended-budget", "extended-ceiling"].includes(request.mode) && scope === "session" && attempts[scope] === 1) {
+    monotonic += request.mode === "extended-budget" ? 7_500 : 10_500;
+    throw Object.assign(new Error("synthetic extended contention"), { code: "EEXIST" });
+  }
   if (request.mode === "shared-budget" && scope !== null && attempts[scope] === 1) {
     monotonic += scope === "session" ? budget * 0.75 : budget * 0.3;
     throw Object.assign(new Error("synthetic contention"), { code: "EEXIST" });

@@ -43,7 +43,7 @@ const MAX_GIT_POINTER_BYTES = 4_096;
 const MAX_SESSION_LOCATOR_BYTES = 4_096;
 const SESSION_LOCK_WAIT_MS = 250;
 const SESSION_LOCK_POLL_MS = 10;
-const LOCAL_HOOK_LOCK_WAIT_MS = process.platform === "win32" ? 5_000 : 1_000;
+const LOCAL_HOOK_LOCK_WAIT_MS = process.platform === "win32" ? 10_000 : 1_000;
 const LIFECYCLE_RELEASE_WAIT_MS = 100;
 const LIFECYCLE_RELEASE_POLL_MS = 25;
 const MAX_LIFECYCLE_RELEASE_ATTEMPTS = 3;
@@ -224,7 +224,8 @@ function assertSafeStatePath(cwd, candidatePath) {
   if (!isContained(workspacePath, targetPath)) {
     throw new Error("state path is outside the workspace");
   }
-  const workspaceRealPath = realpathSync(workspacePath);
+  const canonicalize = process.platform === "win32" ? realpathSync.native : realpathSync;
+  const workspaceRealPath = canonicalize(workspacePath);
   let currentPath = workspacePath;
   const relative = path.relative(workspacePath, targetPath);
   for (const segment of relative.split(path.sep).filter(Boolean)) {
@@ -239,7 +240,7 @@ function assertSafeStatePath(cwd, candidatePath) {
     if (stats.isSymbolicLink()) {
       throw new Error("state path contains a symbolic link or junction");
     }
-    const currentRealPath = realpathSync(currentPath);
+    const currentRealPath = canonicalize(currentPath);
     if (!isContained(workspaceRealPath, currentRealPath)) {
       throw new Error("state path resolves outside the workspace");
     }

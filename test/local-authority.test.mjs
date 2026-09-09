@@ -150,6 +150,54 @@ test("local hook lock scopes share one monotonic acquisition budget", async () =
   });
 });
 
+test("Windows local hooks allow seven-and-a-half seconds of acquisition contention", { skip: process.platform !== "win32" }, async () => {
+  await withLocalFixture(async (fixture) => {
+    admitLocalFixture(fixture);
+    const actor = localHookChild(fixture, "extended-budget", "extended-local-hook");
+    const result = await actor.finish();
+    assert.deepEqual(result.output, {});
+    assert.deepEqual(result.attempts, { session: 2, journal: 1 });
+  });
+});
+
+test("Windows local hooks still deny contention past ten seconds", { skip: process.platform !== "win32" }, async () => {
+  await withLocalFixture(async (fixture) => {
+    admitLocalFixture(fixture);
+    const actor = localHookChild(fixture, "extended-ceiling", "bounded-local-hook-ceiling");
+    const result = await actor.finish();
+    assert.equal(result.output.permissionDecision, "deny");
+    assert.match(result.output.permissionDecisionReason, /LIFECYCLE_ACQUISITION_CONTENTION/);
+    assert.deepEqual(result.attempts, { session: 1, journal: 0 });
+  });
+});
+
+test("eight concurrent installed local hooks preserve one owner and distinct admitted starts", {
+  skip: process.env.SW_NATIVE_PARALLEL_SOAK !== "1",
+}, async () => {
+  await withLocalFixture(async (fixture) => {
+    admitLocalFixture(fixture);
+    const attachmentPath = path.join(fixture.cwd, ".supervised-worker", "attachment.json");
+    const before = readFileSync(attachmentPath);
+    const actors = Array.from({ length: 8 }, (_, ordinal) => localHookChild(fixture, "ordinary", `native-batch-${ordinal}`));
+    try {
+      const results = await Promise.all(actors.map((actor) => actor.finish()));
+      assert.ok(results.some((result) => result.contended), "The parallel test must reach real session-lock contention");
+      for (const result of results) assert.deepEqual(result.output, {});
+      assert.deepEqual(readFileSync(attachmentPath), before);
+      const records = readFileSync(path.join(fixture.cwd, ".supervised-worker", "runs", `${sha256(fixture.input.session_id)}.jsonl`), "utf8").trim().split("\n").map(JSON.parse);
+      const starts = records.filter((record) => record.event === "tool_started");
+      assert.equal(starts.length, actors.length);
+      assert.equal(new Set(starts.map((record) => record.operationId)).size, actors.length);
+      assert.equal(new Set(starts.map((record) => record.invocationHash)).size, actors.length);
+    } finally {
+      for (const actor of actors) {
+        if (actor.child.exitCode === null && actor.child.signalCode === null) actor.child.kill();
+      }
+      await Promise.all(actors.map((actor) => actor.exited));
+    }
+  });
+});
+
 test("local hook exhausted overlap never reclaims or rewrites a live owner", async () => {
   await withLocalFixture(async (fixture) => {
     admitLocalFixture(fixture);

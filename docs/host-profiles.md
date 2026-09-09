@@ -31,7 +31,7 @@ other sessions cannot replace an active campaign attachment. Unadmitted chats
 remain inert except for the existing protection of workflow and lifecycle files.
 
 Local hooks share one monotonic lock-acquisition wait budget across session,
-repository and journal scopes: five seconds on Windows and one second elsewhere.
+repository and journal scopes: ten seconds on Windows and one second elsewhere.
 This accommodates short peer-hook overlap; it does not reclaim a live owner,
 reset the budget at each lock, replay an invocation, or bound total hook execution.
 Exhausted or unverifiable ownership still denies the operation. Other lifecycle

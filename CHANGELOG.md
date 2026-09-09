@@ -2,9 +2,16 @@
 
 ## 0.1.2-alpha.1 - Unreleased
 
-- Let local-scoped hooks share one bounded acquisition wait across lock scopes,
-  preventing routine parallel hooks from being mistaken for supervisor failures.
-  Preserve live-owner refusal, immutable authority revalidation and legacy bounds.
+- Declare the Worker's native delegation tool set and verify tool/model
+	prerequisites before admission; required model selectors must be explicit.
+- Let local-scoped hooks share one bounded acquisition wait across lock scopes:
+	ten seconds on Windows and one second elsewhere. The installed eight-way Windows
+	probe is covered; larger bursts or slower hosts can still exhaust the budget.
+	Preserve live-owner refusal, immutable authority revalidation and legacy bounds.
+	- Use Node's native Windows canonicalizer in the repeated state-path guard,
+	  retaining uncached per-segment link and containment validation while reducing
+	  serialized hook work. Keep the eight-way timing probe opt-in; the ordinary
+	  test gate exercises the acquisition threshold with a controlled monotonic clock.
 - Added explicitly accepted `local-scoped` authority for the VS Code Agent
 	Plugin, binding immutable source, workflow bytes and the real session locator.
 	Existing workflows retain the strict host-inventory profile. Local admission,
