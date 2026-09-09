@@ -12,14 +12,17 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { ALL_TOOL_MATCHER, PLAN_WRITER_MATCHER, PLAN_WRITER_TOOLS, sha256 } from "../src/core.mjs";
 import { validateHookManifest } from "../src/hook-manifest.mjs";
 import { spawnProcessTreeSync } from "./process-tree.mjs";
+import { createWorkerAuthorityFixture } from "./worker-authority-fixture.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const workerRuntimes = new Map();
+afterEach(() => workerRuntimes.clear());
 const rootHooksBytes = readFileSync(path.join(root, "hooks.json"));
 const copilotHooksBytes = readFileSync(
   path.join(root, "com.github.copilot", "hooks", "hooks.json"),
@@ -127,12 +130,14 @@ function invokePowerShell(
 ) {
   assert.notEqual(path.resolve(cwd), root, "repository cwd must differ from plugin cwd");
   const command = hooks[eventName][0].powershell;
+  const runtime = workerRuntimes.get(cwd);
   const result = spawnProcessTreeSync(
     "pwsh",
     ["-NoProfile", "-NonInteractive", "-Command", command],
     {
       cwd,
-      env: { ...process.env, ...extraEnv, PLUGIN_ROOT: pluginRoot },
+      env: { ...process.env, ...extraEnv, PLUGIN_ROOT: runtime?.installRoot ?? pluginRoot,
+        ...(runtime ? { SUPERVISED_WORKER_HOST_AUTHORITY: runtime.inventoryPath } : {}) },
       input: JSON.stringify(input),
       timeout: 20_000,
     },
@@ -166,9 +171,11 @@ function invokeBash(
   assert.notEqual(path.resolve(cwd), root, "repository cwd must differ from plugin cwd");
   const executable = bashExecutable();
   assert.ok(executable, "Git Bash or bash is required for this test");
+  const runtime = workerRuntimes.get(cwd);
   const result = spawnProcessTreeSync(executable, ["-lc", hooks[eventName][0].bash], {
     cwd,
-    env: { ...process.env, ...extraEnv, PLUGIN_ROOT: pluginRoot },
+    env: { ...process.env, ...extraEnv, PLUGIN_ROOT: runtime?.installRoot.replaceAll("\\", "/") ?? pluginRoot,
+      ...(runtime ? { SUPERVISED_WORKER_HOST_AUTHORITY: runtime.inventoryPath } : {}) },
     input: JSON.stringify(input),
     timeout: 20_000,
   });
@@ -224,16 +231,10 @@ test("every checkout hook uses the trusted root and blocks Node startup injectio
   }
 });
 
-function attach(invoke, cwd, planFile) {
-  invoke(
-    "PostToolUse",
-    {
-      ...payload(cwd, "PostToolUse"),
-      tool_name: "create_file",
-      tool_input: { filePath: planFile },
-    },
-    cwd,
-  );
+function attach(_invoke, cwd, _planFile, session = payload(cwd, "SessionStart")) {
+  const runtime = createWorkerAuthorityFixture(cwd, session);
+  runtime.admit();
+  workerRuntimes.set(cwd, runtime);
 }
 
 function claim(invoke, cwd, planFile, session = payload(cwd, "PreToolUse")) {
@@ -299,10 +300,10 @@ function exerciseInvalidStopLifecycle(invoke) {
   const cwd = workspace();
   try {
     const planFile = writeActivePlan(cwd);
+    attach(invoke, cwd, planFile);
     const plan = JSON.parse(readFileSync(planFile, "utf8"));
     plan.unexpectedNonce = 1;
     writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
-    attach(invoke, cwd, planFile);
 
     const first = invoke("Stop", payload(cwd, "Stop"), cwd);
     assert.equal(first.decision, "block");
@@ -521,28 +522,33 @@ test("packaged Bash hook runs the attached Stop lifecycle", {
   exerciseStopLifecycle(invokeBash);
 });
 
-test("packaged PowerShell PreToolUse denies a second plan writer", {
+test("packaged PowerShell denies direct plan writes without changing the issued owner", {
   skip: process.platform !== "win32",
 }, () => {
   const cwd = workspace();
   try {
     const planFile = writeActivePlan(cwd);
-    claim(invokePowerShell, cwd, planFile, {
+    const owner = {
       ...payload(cwd, "PreToolUse"),
       session_id: "owner-session",
-    });
+    };
+    attach(invokePowerShell, cwd, planFile, owner);
+    const attachmentFile = path.join(cwd, ".supervised-worker", "attachment.json");
+    const attachmentBytes = readFileSync(attachmentFile);
+    assert.equal(claim(invokePowerShell, cwd, planFile, owner).permissionDecision, "deny");
     const denied = claim(invokePowerShell, cwd, planFile, {
       ...payload(cwd, "PreToolUse"),
       session_id: "other-session",
     });
     assert.equal(denied.permissionDecision, "deny");
     assert.equal(denied.hookSpecificOutput.permissionDecision, "deny");
+    assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
 
-test("packaged PowerShell routes aliases and reports a missing bound route", {
+test("packaged PowerShell protects aliases and leaves a missing bound route inert", {
   skip: process.platform !== "win32",
 }, () => {
   const repository = workspace();
@@ -557,6 +563,7 @@ test("packaged PowerShell routes aliases and reports a missing bound route", {
       transcript_path: transcriptPath,
       cwd: root,
     };
+    attach(invokePowerShell, repository, planFile, common);
     const claimed = invokePowerShell(
       "PreToolUse",
       {
@@ -566,7 +573,7 @@ test("packaged PowerShell routes aliases and reports a missing bound route", {
       },
       repository,
     );
-    assert.deepEqual(claimed, {});
+    assert.equal(claimed.permissionDecision, "deny");
 
     mkdirSync(path.join(repository, ".git"));
     writeFileSync(path.join(repository, ".git", "config"), "protected\n");
@@ -602,8 +609,7 @@ test("packaged PowerShell routes aliases and reports a missing bound route", {
       { ...common, hook_event_name: "Stop" },
       repository,
     );
-    assert.equal(missingRoute.decision, "allow");
-    assert.match(missingRoute.systemMessage, /could not verify its local state/);
+    assert.deepEqual(missingRoute, {});
     assert.equal(
       existsSync(path.join(repository, ".supervised-worker", "attachment.json")),
       true,
@@ -614,7 +620,7 @@ test("packaged PowerShell routes aliases and reports a missing bound route", {
   }
 });
 
-test("packaged PostToolUseFailure releases a provisional routed claim", {
+test("packaged denied plan writes cannot leave a provisional route after failure", {
   skip: process.platform !== "win32",
 }, () => {
   const repository = workspace();
@@ -630,13 +636,13 @@ test("packaged PostToolUseFailure releases a provisional routed claim", {
       tool_name: "Write",
       tool_input: { file_path: planFile },
     };
-    assert.deepEqual(
+    assert.equal(
       invokePowerShell(
         "PreToolUse",
         { ...common, hook_event_name: "PreToolUse" },
         repository,
-      ),
-      {},
+      ).permissionDecision,
+      "deny",
     );
     assert.deepEqual(
       invokePowerShell(
@@ -653,7 +659,7 @@ test("packaged PostToolUseFailure releases a provisional routed claim", {
       sha256(sessionId),
       "route.json",
     );
-    assert.equal(JSON.parse(readFileSync(routePath, "utf8")).status, "released");
+    assert.equal(existsSync(routePath), false);
     assert.equal(
       existsSync(path.join(repository, ".supervised-worker", "attachment.json")),
       false,
@@ -664,7 +670,7 @@ test("packaged PostToolUseFailure releases a provisional routed claim", {
   }
 });
 
-test("packaged PostToolUse reconciles a missing plan as a failed write", {
+test("packaged terminal hooks cannot acquire a campaign after a denied plan edit", {
   skip: process.platform !== "win32",
 }, () => {
   const repository = workspace();
@@ -680,20 +686,20 @@ test("packaged PostToolUse reconciles a missing plan as a failed write", {
       tool_name: "Write",
       tool_input: { file_path: planFile },
     };
-    assert.deepEqual(
+    assert.equal(
       invokePowerShell(
         "PreToolUse",
         { ...common, hook_event_name: "PreToolUse" },
         repository,
-      ),
-      {},
+      ).permissionDecision,
+      "deny",
     );
     const output = invokePowerShell(
       "PostToolUse",
       { ...common, hook_event_name: "PostToolUse" },
       repository,
     );
-    assert.match(output.additionalContext, /without materializing/);
+    assert.deepEqual(output, {});
     const routePath = path.join(
       storageRoot,
       "supervised-worker",
@@ -701,7 +707,7 @@ test("packaged PostToolUse reconciles a missing plan as a failed write", {
       sha256(sessionId),
       "route.json",
     );
-    assert.equal(JSON.parse(readFileSync(routePath, "utf8")).status, "released");
+    assert.equal(existsSync(routePath), false);
     assert.equal(
       existsSync(path.join(repository, ".supervised-worker", "attachment.json")),
       false,

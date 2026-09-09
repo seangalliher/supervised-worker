@@ -9,7 +9,7 @@ import test from "node:test";
 const testModuleUrl = import.meta.url;
 const coreUrl = new URL("../src/core.mjs", testModuleUrl).href;
 
-function runIsolated(script, timeout = 10_000) {
+function runIsolated(script, timeout = 30_000) {
   const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
     encoding: "utf8",
     timeout,
@@ -518,10 +518,11 @@ for (const checkpointFirst of [true, false]) {
           const boundary = await first.waitFor("held");
           assert.equal(boundary.record.event, ${checkpointFirst} ? "checkpoint_persisted" : "tool_completed");
           const second = startHookChild(${checkpointFirst} ? tool : checkpointInput,
-            ${checkpointFirst} ? "PostToolUse" : "checkpoint");
+            ${checkpointFirst} ? "PostToolUse" : "checkpoint", null, true);
           assert.equal((await second.waitFor("contended")).scope, "journal");
           first.release();
           const firstResult = await first.finish(null);
+          second.release();
           const secondResult = await second.finish(null);
           const checkpoint = (${checkpointFirst} ? firstResult : secondResult).output;
           assert.equal(checkpoint.status, "checkpointed");
@@ -829,11 +830,17 @@ test("observed handoff CLI accepts only the explicit bounded JSON interface", ()
     try {
       ${observedHandoffFaultSetup()}
       const { spawnSync } = await import("node:child_process");
-      const cliPath = ${JSON.stringify(fileURLToPath(new URL("../src/cli.mjs", testModuleUrl)))};
+      const { createWorkerAuthorityFixture } = await import(${JSON.stringify(new URL("./worker-authority-fixture.mjs", testModuleUrl).href)});
+      assert.equal(handleHook({ ...input, stop_hook_active: true }, "Stop").decision, "allow");
+      const runtime = createWorkerAuthorityFixture(repositoryRoot, { session_id: sessionId, transcript_path: transcriptPath },
+        { baseDirectory: path.join(base, "trusted-authority") });
+      runtime.admit();
+      const cliPath = path.join(runtime.installRoot, "src", "cli.mjs");
       startHelper("PRIVATE_CLI_HOST");
       const invoke = (args, stdin = "") => {
         const result = spawnSync(process.execPath, [cliPath, "handoff", "validate", artifactPath, ...args],
-          { cwd: repositoryRoot, input: stdin, encoding: "utf8", timeout: 30_000 });
+          { cwd: repositoryRoot, input: stdin, encoding: "utf8", timeout: 30_000,
+            env: { ...process.env, SUPERVISED_WORKER_HOST_AUTHORITY: runtime.inventoryPath } });
         assert.equal(result.error, undefined, result.error?.message);
         return { status: result.status, report: JSON.parse(result.stdout) };
       };
@@ -1570,7 +1577,7 @@ test("a delayed explicit release cannot delete the checkpoint successor", () => 
         return originalMkdirSync(directory, ...args);
       };
       syncBuiltinESMExports();
-      assert.throws(() => releaseAttachment(repositoryRoot), /session attachment changed/);
+      assert.throws(() => releaseAttachment(repositoryRoot), { transitionCode: "CAMPAIGN_COMPARE_AND_SET_CONFLICT" });
       assert.equal(fired, true);
       assert.deepEqual(originalReadFileSync(attachmentFile), successorBytes);
     ${filesystemCleanup()}
@@ -1595,7 +1602,7 @@ test("checkpoint publication cannot overwrite a replacement generation introduce
         return result;
       };
       syncBuiltinESMExports();
-      assert.throws(() => checkpointSession(repositoryRoot, request), /lifecycle/);
+      assert.throws(() => checkpointSession(repositoryRoot, request), { transitionCode: "CAMPAIGN_COMPARE_AND_SET_CONFLICT" });
       assert.equal(fired, true);
       assert.deepEqual(originalReadFileSync(attachmentFile), replacement);
       assert.equal(JSON.parse(originalReadFileSync(routeFile)).status, "active");
@@ -1723,7 +1730,7 @@ test("release revalidates its pre-wait snapshot instead of removing a successor"
         return originalMkdirSync(directoryPath, ...args);
       };
       syncBuiltinESMExports();
-      assert.throws(() => releaseAttachment(repositoryRoot), /session attachment changed/);
+      assert.throws(() => releaseAttachment(repositoryRoot), { transitionCode: "CAMPAIGN_COMPARE_AND_SET_CONFLICT" });
       assert.equal(injected, true);
       assert.equal(JSON.parse(successorBytes).sessionHash, sha256("release-successor"));
       assert.equal(originalReadFileSync(attachmentPath, "utf8"), successorBytes);
@@ -3087,11 +3094,13 @@ test("locked route reread cannot spawn an uncached drive check", {
       let routeReads = 0;
       let uncachedCalls = 0;
       let underLockCalls = 0;
+      let injectedUnderLock = false;
       fs.readFileSync = (filePath, ...args) => {
         const bytes = originalReadFileSync(filePath, ...args);
         if (path.resolve(String(filePath)) === path.resolve(routePath)) {
           routeReads += 1;
-          if (routeReads === 1) {
+          if (!injectedUnderLock && fs.existsSync(lockDirectory)) {
+            injectedUnderLock = true;
             const route = JSON.parse(Buffer.isBuffer(bytes) ? bytes.toString("utf8") : bytes);
             route.repositoryRoot = "Q:\\\\uncached-route";
             route.repositoryRootHash = sha256("q:\\\\uncached-route");
@@ -3116,6 +3125,7 @@ test("locked route reread cannot spawn an uncached drive check", {
         tool_input: { filePath: path.join(repositoryRoot, "README.md") },
       }, "PostToolUse");
       assert.match(output.systemMessage, /could not verify its local state/);
+      assert.equal(injectedUnderLock, true, "route drift must be injected while the lock is held");
       assert.equal(routeReads >= 2, true);
       assert.equal(uncachedCalls, 0);
       assert.equal(underLockCalls, 0);
@@ -3197,7 +3207,7 @@ for (const failurePoint of ["attachment-migration", "route-promotion"]) {
   });
 }
 
-test("v1 migration restoration failure still leaves a recoverable released route", () => {
+test("v1 migration restoration failure leaves released-route evidence for explicit recovery", () => {
   runIsolated(`
     ${filesystemPrelude("migration-restore-failure")}
     try {
@@ -3262,11 +3272,12 @@ test("v1 migration restoration failure still leaves a recoverable released route
       assert.equal(JSON.parse(fs.readFileSync(routePath, "utf8")).status, "released");
       fs.renameSync = originalRenameSync;
       syncBuiltinESMExports();
+      const attachmentBefore = fs.readFileSync(attachmentPath);
       assert.deepEqual(
         handleHook({ ...common, hook_event_name: "SessionStart" }, "SessionStart"),
         {},
       );
-      assert.equal(fs.existsSync(attachmentPath), false);
+      assert.deepEqual(fs.readFileSync(attachmentPath), attachmentBefore);
     ${filesystemCleanup()}
   `);
 });

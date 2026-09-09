@@ -16,24 +16,38 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { releaseAttachment } from "../src/core.mjs";
 import { validateGitHubQueueObservation } from "../src/github-queue.mjs";
+import { createWorkerAuthorityFixture } from "./worker-authority-fixture.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cli = path.join(root, "src", "cli.mjs");
 const hookLauncher = path.join(root, "src", "hook-launcher.mjs");
+const workerRuntimes = new Map();
+afterEach(() => workerRuntimes.clear());
+
+function authorizeWorker(cwd, input) {
+  const runtime = createWorkerAuthorityFixture(cwd, input);
+  runtime.admit();
+  workerRuntimes.set(cwd, runtime);
+  return runtime;
+}
 
 function workspace() {
   return realpathSync(mkdtempSync(path.join(os.tmpdir(), "supervised-worker-cli-")));
 }
 
 function run(args, options = {}) {
-  return spawnSync(process.execPath, [cli, ...args], {
+  const ownedCommand = ["hook", "checkpoint", "resume", "observation"].includes(args[0]) ||
+    (args[0] === "handoff" && args.includes("--observe"));
+  const runtime = ownedCommand ? workerRuntimes.get(options.cwd) : null;
+  return spawnSync(process.execPath, [runtime ? path.join(runtime.installRoot, "src", "cli.mjs") : cli, ...args], {
     cwd: options.cwd ?? root,
     input: options.input ?? "",
+    ...(runtime ? { env: { ...process.env, SUPERVISED_WORKER_HOST_AUTHORITY: runtime.inventoryPath } } : {}),
     encoding: "utf8",
     timeout: options.timeout,
   });
@@ -88,11 +102,7 @@ test("observed handoff CLI binds one retry and rejects untrusted requests", () =
     const sessionId = "cli-observed-validation";
     const setup = { cwd, session_id: sessionId, tool_name: "Write", tool_use_id: "setup-observed",
       tool_input: { file_path: path.join(state, "plan.json") } };
-    for (const event of ["PreToolUse", "PostToolUse"]) {
-      const result = run(["hook", event], { cwd, input: JSON.stringify(setup) });
-      assert.equal(result.status, 0, result.stderr);
-      assert.deepEqual(JSON.parse(result.stdout), {});
-    }
+    authorizeWorker(cwd, setup);
     const itemId = "cli-observed-item";
     const itemHash = createHash("sha256").update(itemId).digest("hex");
     const artifactPath = path.join(state, "handoffs", itemHash, "build-report.json");
@@ -141,17 +151,29 @@ test("observed handoff CLI binds one retry and rejects untrusted requests", () =
   }
 });
 
+test("observed handoff CLI distinguishes missing authority from malformed input", () => {
+  const cwd = workspace();
+  try {
+    const args = ["handoff", "validate", "unread-artifact.json", "--observe"];
+    const malformed = run(args, { cwd, input: "{" });
+    assert.equal(malformed.status, 1);
+    assert.equal(JSON.parse(malformed.stdout).code, "HANDOFF_OBSERVATION_INPUT_INVALID");
+    const missingAuthority = run(args, { cwd, input: JSON.stringify({ session_id: "unadmitted", tool_use_id: "call", retryOf: null }) });
+    assert.equal(missingAuthority.status, 1);
+    assert.equal(JSON.parse(missingAuthority.stdout).code, "WORKER_AUTHORITY_UNCONFIRMED");
+    assert.equal(existsSync(path.join(cwd, ".supervised-worker")), false);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("CLI status, checkpoint, fresh resume, and Stop cross real process boundaries", () => {
   const cwd = workspace();
   try {
     const state = writeCampaignState(cwd);
     const planFile = path.join(state, "plan.json");
     const input = { cwd, session_id: "cli-checkpoint-source", tool_name: "Write", tool_use_id: "cli-setup", tool_input: { file_path: planFile } };
-    for (const event of ["PreToolUse", "PostToolUse"]) {
-      const result = run(["hook", event], { cwd, input: JSON.stringify(input) });
-      assert.equal(result.status, 0, result.stderr);
-      assert.deepEqual(JSON.parse(result.stdout), {});
-    }
+    const runtime = authorizeWorker(cwd, input);
     const before = readFileSync(planFile);
     const status = run(["status"], { cwd });
     assert.equal(status.status, 0, status.stderr);
@@ -167,6 +189,7 @@ test("CLI status, checkpoint, fresh resume, and Stop cross real process boundari
     assert.doesNotMatch(checkpoint.stdout, /SECRET CLI|secret-cli-id/);
     const fresh = { cwd, session_id: "cli-checkpoint-successor" };
     assert.deepEqual(JSON.parse(run(["hook", "SessionStart"], { cwd, input: JSON.stringify(fresh) }).stdout), {});
+    runtime.select(fresh);
     const resumed = run(["resume"], { cwd, input: JSON.stringify({ session_id: fresh.session_id, planHash: summary.planHash, checkpointHash: saved.checkpointHash }) });
     assert.equal(resumed.status, 0, resumed.stderr || resumed.stdout);
     assert.equal(JSON.parse(resumed.stdout).status, "resumed");
@@ -255,11 +278,7 @@ test("observation retry-denied reserves hook evidence without bypassing policy",
     const state = writeCampaignState(cwd);
     const setup = { cwd, session_id: "cli-denied-owner", tool_name: "Write", tool_use_id: "cli-setup",
       tool_input: { file_path: path.join(state, "plan.json") } };
-    for (const event of ["PreToolUse", "PostToolUse"]) {
-      const result = run(["hook", event], { cwd, input: JSON.stringify(setup) });
-      assert.equal(result.status, 0, result.stderr || result.stdout);
-      assert.deepEqual(JSON.parse(result.stdout), {});
-    }
+    authorizeWorker(cwd, setup);
     const tool = { ...setup, tool_use_id: "PRIVATE_DENIED_CLI_ID",
       tool_input: { file_path: path.join(cwd, ".github", "supervised-worker.json"), content: "PRIVATE_AUTHORITY_CHANGE" } };
     const denied = run(["hook", "PreToolUse"], { cwd, input: JSON.stringify(tool) });
@@ -386,10 +405,10 @@ test("Windows accepts local drive roots and rejects UNC repository roots", {
     }),
   });
   assert.equal(unc.status, 0, unc.stderr);
-  assert.match(JSON.parse(unc.stdout).systemMessage, /could not verify local state/);
+  assert.deepEqual(JSON.parse(unc.stdout), {});
 });
 
-test("invalid repository cwd fails open visibly for non-edit lifecycle events", () => {
+test("invalid repository cwd grants no non-edit lifecycle behavior", () => {
   for (const eventName of ["SessionStart", "PostToolUse", "PostToolUseFailure", "PreCompact", "Stop"]) {
     const result = run(["hook", eventName], {
       input: JSON.stringify({
@@ -400,13 +419,7 @@ test("invalid repository cwd fails open visibly for non-edit lifecycle events", 
     });
     assert.equal(result.status, 0, `${eventName}: ${result.stderr}`);
     const output = JSON.parse(result.stdout);
-    assert.match(output.systemMessage, /absolute repository cwd/, eventName);
-    if (eventName === "Stop") {
-      assert.equal(output.decision, "allow");
-      assert.equal(output.hookSpecificOutput.decision, "allow");
-    } else {
-      assert.match(output.additionalContext, /absolute repository cwd/);
-    }
+    assert.deepEqual(output, {}, eventName);
   }
 });
 
@@ -431,7 +444,7 @@ for (const value of [null, [], "text", 42]) {
   });
 }
 
-test("release removes an explicitly stale attachment", () => {
+test("release CLI cannot remove legacy ownership without a verified session grant", () => {
   const cwd = workspace();
   try {
     const state = path.join(cwd, ".supervised-worker");
@@ -444,9 +457,11 @@ test("release removes an explicitly stale attachment", () => {
         attachedAt: "2026-09-01T00:00:00Z",
       })}\n`,
     );
+    const attachmentBytes = readFileSync(path.join(state, "attachment.json"));
     const result = run(["release"], { cwd });
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(JSON.parse(result.stdout).released, true);
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(JSON.parse(result.stdout).released, false);
+    assert.deepEqual(readFileSync(path.join(state, "attachment.json")), attachmentBytes);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -1016,11 +1031,7 @@ test("queue inspection preserves active state bytes, all seven campaign facts, r
     const state = writeCampaignState(cwd);
     const planFile = path.join(state, "plan.json");
     const input = { cwd, session_id: "queue-compatibility", tool_name: "Write", tool_use_id: "queue-setup", tool_input: { file_path: planFile } };
-    for (const event of ["PreToolUse", "PostToolUse"]) {
-      const attached = run(["hook", event], { cwd, input: JSON.stringify(input) });
-      assert.equal(attached.status, 0, attached.stderr);
-      assert.deepEqual(JSON.parse(attached.stdout), {});
-    }
+    authorizeWorker(cwd, input);
     const status = run(["status"], { cwd });
     assert.equal(status.status, 0, status.stderr);
     assert.equal(JSON.parse(status.stdout).attachment.status, "active");

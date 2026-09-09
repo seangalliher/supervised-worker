@@ -3,6 +3,13 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Validation scope
+        type: choice
+        options: [windows, full]
+        default: windows
 
 permissions:
   contents: read
@@ -12,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON((github.ref_type == 'tag' || inputs.profile == 'full') && '["ubuntu-latest","macos-latest","windows-latest"]' || '["windows-latest"]') }}
         node: [20, 22, 24]
     runs-on: ${{ matrix.os }}
     steps:

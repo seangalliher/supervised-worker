@@ -27,6 +27,7 @@ import {
   handleHook,
   MAX_CHECKPOINT_BYTES,
   MAX_TOOL_TARGETS,
+  observeCampaignTransition,
   planPath,
   releaseAttachment,
   resumeSession,
@@ -379,6 +380,73 @@ test("a v3 checkpoint tombstone is neither ownership nor an ordinary plan-write 
   assert.deepEqual(summarizeRunLedger(cwd), ledgerBefore);
 });
 
+test("checkpointed campaigns leave unrelated hooks inert before lifecycle lock acquisition", () => {
+  const { cwd, storageRoot, source, request, attachmentFile, ledgerFile } = checkpointFixture(true);
+  assert.equal(checkpointSession(cwd, request).status, "checkpointed");
+  const attachmentBytes = readFileSync(attachmentFile);
+  const planBytes = readFileSync(planPath(cwd));
+  const ledgerBytes = readFileSync(ledgerFile);
+  const ordinaryId = "ordinary-checkpoint-neighbor";
+  const transcript = vscodeTranscriptPath(storageRoot, ordinaryId);
+  const locks = [
+    path.join(cwd, ".supervised-worker", "locks", "lifecycle"),
+    path.join(storageRoot, "supervised-worker", "session-locks", sha256(ordinaryId)),
+    path.join(storageRoot, "supervised-worker", "session-locks", sha256(source.session_id)),
+  ];
+  for (const lock of locks) {
+    mkdirSync(lock, { recursive: true });
+    writeFileSync(path.join(lock, "blocked-owner"), "preserve this lock\n");
+  }
+  for (const input of [source, { cwd, session_id: ordinaryId, transcript_path: transcript }]) {
+    for (const toolName of ["Read", "Write"]) {
+      for (const event of ["PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "PreCompact", "Stop"]) {
+        assert.deepEqual(handleHook({
+          ...input, tool_name: toolName, tool_input: { file_path: path.join(cwd, "source.mjs") },
+        }, event), {}, `${input.session_id} ${toolName} ${event}`);
+      }
+    }
+  }
+  assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
+  assert.deepEqual(readFileSync(planPath(cwd)), planBytes);
+  assert.deepEqual(readFileSync(ledgerFile), ledgerBytes);
+  assert.equal(existsSync(sessionRoutePath(storageRoot, ordinaryId)), false);
+  for (const lock of locks) {
+    assert.deepEqual(readdirSync(lock), ["blocked-owner"]);
+    assert.equal(readFileSync(path.join(lock, "blocked-owner"), "utf8"), "preserve this lock\n");
+  }
+});
+
+test("unrelated sessions stay inert in an active repository and a sibling worktree", () => {
+  const { cwd, storageRoot, source, attachmentFile, ledgerFile } = checkpointFixture(true);
+  const sibling = workspace();
+  execFileSync("git", ["init", "--quiet"], { cwd });
+  execFileSync("git", ["-c", "user.name=Test User", "-c", "user.email=test@example.invalid",
+    "commit", "--quiet", "--allow-empty", "-m", "fixture"], { cwd });
+  execFileSync("git", ["worktree", "add", "--quiet", "--detach", sibling], { cwd });
+  const commonRoot = (root) => execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: root, encoding: "utf8" }).trim();
+  assert.equal(commonRoot(cwd), commonRoot(sibling));
+  const attachmentBytes = readFileSync(attachmentFile);
+  const ledgerBytes = readFileSync(ledgerFile);
+  for (const root of [cwd, sibling]) {
+    const sessionId = root === cwd ? "same-repository-chat" : "sibling-worktree-chat";
+    const transcript = vscodeTranscriptPath(storageRoot, sessionId);
+    const input = { cwd: root, session_id: sessionId, transcript_path: transcript };
+    for (const event of ["PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart", "PreCompact", "Stop"]) {
+      for (const tool of ["Read", "Write"]) {
+        assert.deepEqual(handleHook({ ...input, tool_name: tool, tool_input: { file_path: path.join(root, "source.mjs") } }, event), {});
+      }
+    }
+    assert.equal(existsSync(path.join(storageRoot, "supervised-worker", "session-locks", sha256(sessionId))), false);
+    assert.equal(existsSync(sessionRoutePath(storageRoot, sessionId)), false);
+    assert.equal(existsSync(sessionMarkerPath(storageRoot, sessionId)), false);
+    assert.equal(handleHook({ ...input, tool_name: "Write", tool_input: { file_path: attachmentFile } }, "PreToolUse").permissionDecision, "deny");
+  }
+  assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
+  assert.deepEqual(readFileSync(ledgerFile), ledgerBytes);
+  assert.equal(existsSync(path.join(sibling, ".supervised-worker")), false);
+  assert.equal(handleHook({ ...source, tool_input: {} }, "Stop").decision, "block");
+});
+
 test("invalid v3 claim and checkpoint bindings are denied without replacing attachment bytes", () => {
   const cwd = workspace();
   const sessionId = "invalid-v3-owner";
@@ -406,6 +474,22 @@ test("invalid v3 claim and checkpoint bindings are denied without replacing atta
     assert.equal(output.permissionDecision, "deny");
     assert.equal(readFileSync(attachmentPath, "utf8"), bytes);
   }
+});
+
+test("release transition rejects a changed plan or claim generation before mutation", () => {
+  const cwd = workspace();
+  writePlan(cwd);
+  attachPlan(cwd);
+  const expected = observeCampaignTransition(cwd);
+  writePlan(cwd, { goal: "Changed after observation" });
+  const attachmentFile = path.join(cwd, ".supervised-worker", "attachment.json");
+  const attachmentBytes = readFileSync(attachmentFile);
+  assert.throws(() => releaseAttachment(cwd, expected), /compare-and-set/);
+  assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
+  const current = observeCampaignTransition(cwd);
+  assert.throws(() => releaseAttachment(cwd, { ...current, claimGeneration: "00000000-0000-4000-8000-000000000000" }), /compare-and-set/);
+  assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
+  assert.equal(releaseAttachment(cwd, current).released, true);
 });
 
 test("PreToolUse accepts a host cwd alias of the canonical target repository", () => {
@@ -597,7 +681,7 @@ test("PostToolUse without a materialized plan releases the provisional claim", (
   assert.equal(records.at(-1).event, "provisional_claim_released");
 });
 
-test("a released route reconciles its matching interrupted-release attachment", () => {
+test("a released route leaves interrupted-release evidence inert until explicit release", () => {
   const pluginRoot = workspace();
   const repositoryRoot = workspace();
   const storageRoot = workspace();
@@ -621,9 +705,12 @@ test("a released route reconciles its matching interrupted-release attachment", 
     `${JSON.stringify({ ...route, status: "released", updatedAt: new Date().toISOString() }, null, 2)}\n`,
   );
 
+  const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
+  const attachmentBefore = readFileSync(attachmentPath);
   assert.deepEqual(handleHook({ ...common, hook_event_name: "SessionStart" }, "SessionStart"), {});
-  assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), false);
+  assert.deepEqual(readFileSync(attachmentPath), attachmentBefore);
   assert.equal(JSON.parse(readFileSync(routePath, "utf8")).status, "released");
+  assert.equal(releaseAttachment(repositoryRoot).released, true);
 });
 
 test("a fresh session lock denies concurrent state mutation", () => {
@@ -1187,8 +1274,7 @@ test("a routed attachment cannot mutate without its transcript context and lock"
     { hook_event_name: "Stop", session_id: sessionId, cwd: repositoryRoot },
     "Stop",
   );
-  assert.equal(stop.decision, "allow");
-  assert.match(stop.systemMessage, /could not verify its local state/);
+  assert.deepEqual(stop, {});
   assert.equal(readFileSync(routePath, "utf8"), routeBefore);
   assert.equal(readFileSync(attachmentPath, "utf8"), attachmentBefore);
 
@@ -1505,7 +1591,7 @@ test("a routed plan claim migrates a matching v1 attachment", () => {
   assert.equal(handleHook({ ...common, hook_event_name: "Stop" }, "Stop").decision, "block");
 });
 
-test("a bound VS Code session with a missing locator fails visibly", () => {
+test("a missing locator cannot grant lifecycle behavior or remove ownership evidence", () => {
   const pluginRoot = workspace();
   const repositoryRoot = workspace();
   const storageRoot = workspace();
@@ -1527,13 +1613,12 @@ test("a bound VS Code session with a missing locator fails visibly", () => {
   rmSync(sessionRoutePath(storageRoot, sessionId));
 
   const output = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");
-  assert.equal(output.decision, "allow");
-  assert.match(output.systemMessage, /could not verify its local state/);
+  assert.deepEqual(output, {});
   assert.equal(existsSync(path.join(pluginRoot, ".supervised-worker")), false);
   assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), true);
 });
 
-test("a bound VS Code session with a missing route directory fails visibly", () => {
+test("a missing route directory cannot grant lifecycle behavior", () => {
   const pluginRoot = workspace();
   const repositoryRoot = workspace();
   const storageRoot = workspace();
@@ -1559,12 +1644,11 @@ test("a bound VS Code session with a missing route directory fails visibly", () 
   });
 
   const output = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");
-  assert.equal(output.decision, "allow");
-  assert.match(output.systemMessage, /could not verify its local state/);
+  assert.deepEqual(output, {});
   assert.equal(existsSync(path.join(repositoryRoot, ".supervised-worker", "attachment.json")), true);
 });
 
-test("missing binding marker is restored before subsequent route loss", () => {
+test("missing binding markers remain evidence instead of being repaired by unvalidated hooks", () => {
   const pluginRoot = workspace();
   const repositoryRoot = workspace();
   const storageRoot = workspace();
@@ -1588,15 +1672,13 @@ test("missing binding marker is restored before subsequent route loss", () => {
     { ...common, hook_event_name: "Stop", cwd: repositoryRoot },
     "Stop",
   );
-  assert.equal(markerLoss.decision, "allow");
-  assert.match(markerLoss.systemMessage, /could not verify its local state/);
-  assert.equal(existsSync(markerPath), true);
+  assert.deepEqual(markerLoss, {});
+  assert.equal(existsSync(markerPath), false);
   assert.equal(readFileSync(attachmentPath, "utf8"), attachmentBefore);
 
   rmSync(path.dirname(routePath), { recursive: true, force: true });
   const routeLoss = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");
-  assert.equal(routeLoss.decision, "allow");
-  assert.match(routeLoss.systemMessage, /could not verify its local state/);
+  assert.deepEqual(routeLoss, {});
   assert.equal(readFileSync(attachmentPath, "utf8"), attachmentBefore);
 });
 
@@ -2560,7 +2642,9 @@ test("ownerless recovery preserves unknown operations and never repeats a side e
   assert.equal(resumed.context.operations.orphans[0].observationStatus, "outcome-unknown");
   assert.equal(readFileSync(sideEffect, "utf8"), "performed-once\n");
   assert.equal(handleHook({ cwd, session_id: next.session_id, stop_hook_active: true }, "Stop").decision, "block");
-  assert.throws(() => resumeSession(cwd, { ...next, session_id: "stealing-owner" }), /no attachment/);
+  const ownerBefore = readFileSync(attachmentFile);
+  assert.throws(() => resumeSession(cwd, { ...next, session_id: "stealing-owner" }), { transitionCode: "CAMPAIGN_COMPARE_AND_SET_CONFLICT" });
+  assert.deepEqual(readFileSync(attachmentFile), ownerBefore);
 });
 
 test("missing ledger observation is unavailable rather than a verified empty orphan list", () => {
@@ -2940,12 +3024,13 @@ test("malformed attached plan gives bounded SessionStart guidance", () => {
   assert.doesNotMatch(JSON.stringify(output), /TOPSECRET/);
 });
 
-test("malformed attachment state fails open visibly", () => {
+test("malformed attachment state grants no Stop capability", () => {
   const cwd = workspace();
   writePlan(cwd);
   writeFileSync(path.join(cwd, ".supervised-worker", "attachment.json"), "{TOPSECRET");
   const output = handleHook(stopInput(cwd), "Stop");
-  assert.match(output.systemMessage, /fail open visibly/);
+  assert.deepEqual(output, {});
+  assert.equal(readFileSync(path.join(cwd, ".supervised-worker", "attachment.json"), "utf8"), "{TOPSECRET");
   assert.doesNotMatch(JSON.stringify(output), /TOPSECRET/);
 });
 

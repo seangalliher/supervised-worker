@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervised-worker.dev/schemas/transition.schema.json",
+  "title": "Generation-Bound Campaign Transitions And Rescue",
+  "anyOf": [
+    { "$ref": "#/$defs/observation" }, { "$ref": "#/$defs/planRequest" }, { "$ref": "#/$defs/releaseRequest" },
+    { "$ref": "#/$defs/outcome" }, { "$ref": "#/$defs/rescueGrant" },
+    { "$ref": "#/$defs/rescueRequest" }, { "$ref": "#/$defs/rescueResult" }
+  ],
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nullableHash": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/hash" }] },
+    "uuid": { "$ref": "lifecycle.schema.json#/$defs/uuid" },
+    "generation": { "$ref": "lifecycle.schema.json#/$defs/generation" },
+    "state": { "enum": ["released", "provisional", "active", "resumed", "checkpointed", "recovery-fenced"] },
+    "observation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "state", "repositoryHash", "sessionHash", "planHash", "planBytesHash", "attachmentHash", "claimGeneration", "routeGeneration", "routeHash", "markerHash", "stopHash"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "campaign-transition-observation" },
+        "state": { "$ref": "#/$defs/state" }, "repositoryHash": { "$ref": "#/$defs/hash" },
+        "sessionHash": { "$ref": "#/$defs/nullableHash" }, "planHash": { "$ref": "#/$defs/nullableHash" },
+        "planBytesHash": { "$ref": "#/$defs/nullableHash" }, "attachmentHash": { "$ref": "#/$defs/nullableHash" },
+        "claimGeneration": { "$ref": "#/$defs/generation" }, "routeGeneration": { "$ref": "#/$defs/generation" },
+        "routeHash": { "$ref": "#/$defs/nullableHash" }, "markerHash": { "$ref": "#/$defs/nullableHash" }, "stopHash": { "$ref": "#/$defs/nullableHash" }
+      }
+    },
+    "planRequest": {
+      "type": "object", "additionalProperties": false, "required": ["session_id", "expected", "plan"],
+      "properties": {
+        "session_id": { "$ref": "lifecycle.schema.json#/$defs/sessionId" },
+        "transcript_path": { "$ref": "lifecycle.schema.json#/$defs/transcriptPath" },
+        "expected": { "$ref": "#/$defs/observation" }, "plan": { "$ref": "https://github.com/seangalliher/supervised-worker/schemas/plan.schema.json" }
+      }
+    },
+    "releaseRequest": {
+      "type": "object", "additionalProperties": false, "required": ["session_id", "expected"],
+      "properties": {
+        "session_id": { "$ref": "lifecycle.schema.json#/$defs/sessionId" },
+        "transcript_path": { "$ref": "lifecycle.schema.json#/$defs/transcriptPath" },
+        "expected": { "$ref": "#/$defs/observation" }
+      }
+    },
+    "outcome": {
+      "anyOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["schemaVersion", "kind", "status", "operation", "previousHash", "observation"],
+          "properties": {
+            "schemaVersion": { "const": 1 }, "kind": { "const": "campaign-transition-outcome" }, "status": { "const": "applied" },
+            "operation": { "const": "plan" }, "previousHash": { "$ref": "#/$defs/hash" }, "observation": { "$ref": "#/$defs/observation" }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["schemaVersion", "kind", "status", "code"],
+          "properties": {
+            "schemaVersion": { "const": 1 }, "kind": { "const": "campaign-transition-outcome" }, "status": { "enum": ["conflict", "unconfirmed"] },
+            "code": { "enum": ["CAMPAIGN_COMPARE_AND_SET_CONFLICT", "CAMPAIGN_AUTHORITY_OR_STATE_UNCONFIRMED"] }
+          }
+        }
+      ]
+    },
+    "rescueGrant": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "status", "capability", "incidentId", "snapshotHash", "expiresAt", "observation"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "lifecycle-rescue-grant" }, "status": { "const": "issued" },
+        "capability": { "$ref": "#/$defs/hash" }, "incidentId": { "$ref": "#/$defs/uuid" }, "snapshotHash": { "$ref": "#/$defs/hash" },
+        "expiresAt": { "type": "string", "format": "date-time" }, "observation": { "$ref": "#/$defs/observation" }
+      }
+    },
+    "rescueRequest": {
+      "type": "object", "additionalProperties": false, "required": ["capability", "incidentId", "snapshotHash", "action", "session_id"],
+      "properties": {
+        "capability": { "$ref": "#/$defs/hash" }, "incidentId": { "$ref": "#/$defs/uuid" }, "snapshotHash": { "$ref": "#/$defs/hash" },
+        "action": { "enum": ["inspect", "recover"] }, "session_id": { "$ref": "lifecycle.schema.json#/$defs/sessionId" },
+        "transcript_path": { "$ref": "lifecycle.schema.json#/$defs/transcriptPath" }
+      }
+    },
+    "rescueResult": {
+      "anyOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["schemaVersion", "kind", "status", "code"],
+          "properties": {
+            "schemaVersion": { "const": 1 }, "kind": { "const": "lifecycle-rescue-result" }, "status": { "const": "unconfirmed" },
+            "code": { "const": "RESCUE_CAPABILITY_OR_SNAPSHOT_REJECTED" }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["schemaVersion", "kind", "status", "incidentId", "snapshotHash", "observation", "owner"],
+          "properties": {
+            "schemaVersion": { "const": 1 }, "kind": { "const": "lifecycle-rescue-result" }, "status": { "const": "inspected" },
+            "incidentId": { "$ref": "#/$defs/uuid" }, "snapshotHash": { "$ref": "#/$defs/hash" },
+            "observation": { "$ref": "#/$defs/observation" }, "owner": { "const": "dead" }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["schemaVersion", "kind", "status", "incidentId", "snapshotHash", "intentHash", "outcomeHash", "diagnostics"],
+          "properties": {
+            "schemaVersion": { "const": 1 }, "kind": { "const": "lifecycle-rescue-result" }, "status": { "enum": ["recovered", "already-recovered", "unconfirmed"] },
+            "incidentId": { "$ref": "#/$defs/uuid" }, "snapshotHash": { "$ref": "#/$defs/hash" },
+            "intentHash": { "$ref": "#/$defs/nullableHash" }, "outcomeHash": { "$ref": "#/$defs/nullableHash" },
+            "diagnostics": { "$ref": "lifecycle.schema.json#/$defs/diagnostics" }
+          }
+        }
+      ]
+    }
+  }
+}

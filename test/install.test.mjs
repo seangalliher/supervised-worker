@@ -27,6 +27,7 @@ import {
   resolvePluginSourceIdentity,
 } from "../src/install.mjs";
 import { spawnProcessTreeSync } from "./process-tree.mjs";
+import { createWorkerAuthorityFixture } from "./worker-authority-fixture.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INSTALL_SOURCE_ENTRIES = [
@@ -153,17 +154,21 @@ test("isolated installed dispatch durably observes an owned non-writer", () => {
     mkdirSync(state);
     const planFile = path.join(state, "plan.json");
     writeFileSync(planFile, JSON.stringify({ schemaVersion: 1, mode: "active", goal: "Fixture", items: [{ id: "one", title: "One", status: "pending" }], completion: null }));
+    const runtime = createWorkerAuthorityFixture(cwd, { session_id: "installed-observer" }, { installRoot: installed.installRoot });
+    runtime.admit();
     const invoke = (event, input) => {
       const command = manifest.hooks[event][0][process.platform === "win32" ? "powershell" : "bash"];
       const execution = spawnProcessTreeSync(process.platform === "win32" ? process.env.ComSpec : "bash",
         process.platform === "win32" ? ["/d", "/s", "/c", command] : ["-lc", command],
-        { cwd, input: JSON.stringify({ cwd, session_id: "installed-observer", ...input }), timeout: 25_000 });
+        { cwd, input: JSON.stringify({ cwd, session_id: "installed-observer", ...input }), timeout: 25_000,
+          env: { ...process.env, SUPERVISED_WORKER_HOST_AUTHORITY: runtime.inventoryPath } });
       assert.equal(execution.error, undefined, execution.error?.message);
       assert.equal(execution.status, 0, execution.stderr);
-      assert.ok(execution.elapsedMs < manifest.hooks[event][0].timeoutSec * 1_000);
+      assert.ok(execution.elapsedMs < manifest.hooks[event][0].timeoutSec * 1_000,
+        JSON.stringify({ event, elapsedMs: execution.elapsedMs, timeoutMs: manifest.hooks[event][0].timeoutSec * 1_000 }));
       return JSON.parse(execution.stdout);
     };
-    assert.deepEqual(invoke("PostToolUse", { tool_name: "Write", tool_input: { file_path: planFile } }), {});
+    assert.deepEqual(invoke("SessionStart", { session_id: "ordinary-session" }), {});
     assert.equal(JSON.parse(readFileSync(path.join(state, "attachment.json"))).status, "active");
     assert.deepEqual(invoke("PreToolUse", { tool_name: "Read", tool_use_id: "installed-hint", tool_input: { file_path: "PRIVATE_CONTENT" } }), {});
     const ledger = readFileSync(path.join(state, "runs", `${sha256("installed-observer")}.jsonl`), "utf8");

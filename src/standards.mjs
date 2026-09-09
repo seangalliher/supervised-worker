@@ -32,7 +32,9 @@ const SKILL_KEYS = new Set([
   "allowed-tools",
 ]);
 const SCHEMA_FILES = [
+  "campaign-release.schema.json",
   "checkpoint.schema.json",
+  "doctor.schema.json",
   "episode.schema.json",
   "lifecycle.schema.json",
   "local-campaign-receipt.schema.json",
@@ -41,11 +43,13 @@ const SCHEMA_FILES = [
   "policy-proposal.schema.json",
   "procedure.schema.json",
   "role-handoff.schema.json",
+  "transition.schema.json",
   "workflow.schema.json",
 ];
 const EXAMPLE_SCHEMAS = [
   ["examples/workflow.json", "workflow.schema.json"],
   ["examples/workflow.specialized.json", "workflow.schema.json"],
+  ["examples/workflow.vscode-local.json", "workflow.schema.json"],
   ["examples/plan.active.json", "plan.schema.json"],
   ["examples/plan.complete.json", "plan.schema.json"],
   ["examples/handoff.build-contract.json", "role-handoff.schema.json"],
@@ -430,6 +434,13 @@ export function validatePublishedSchemas(root) {
     } catch (error) {
       errors.push(`schemas/${fileName} could not be compiled: ${error.message}`);
     }
+  }
+
+  try {
+    const transitionId = schemas.get("transition.schema.json");
+    if (!transitionId || !ajv.getSchema(transitionId)) errors.push("transition schema could not be compiled");
+  } catch (error) {
+    errors.push(`transition schema could not be compiled: ${error.message}`);
   }
 
   for (const [examplePath, schemaFile] of EXAMPLE_SCHEMAS) {

@@ -10,8 +10,8 @@ or work expected to span several implementation slices.
 
 ## Durable Plan
 
-Create `.supervised-worker/plan.json` through a fully qualified file target using
-this minimum shape:
+Publish `.supervised-worker/plan.json` through the verified immutable helper's
+`lifecycle plan` transition, using this minimum plan shape:
 
 ```json
 {
@@ -39,12 +39,21 @@ Allowed item states are `pending`, `in_progress`, `banked`, and `parked`.
 Exactly one item should normally be `in_progress`. Never turn a failed queue
 enumeration into an empty `items` array.
 
-Create or update `plan.json` through a file-editing tool. The pre-tool hook
-creates a provisional, generation-bound claim for the hashed writing session;
-the successful post-tool hook promotes it and records completion metadata. A
-failed first write that leaves no materialized plan, or Stop without one,
-releases the provisional claim. Other Copilot sessions in the same repository
-remain inert and do not log tools or receive Stop decisions.
+Check `workflow roles` for the accepted `authorityAssurance`. The opt-in
+`local-scoped` profile uses the immutable plugin and a matching real VS Code
+session transcript; it does not require or invent host-wide inventory. Use it
+only after the user explicitly accepts the workflow hash. An omitted assurance
+or `host-attested` still requires `SUPERVISED_WORKER_HOST_AUTHORITY`; never fall
+back to local mode after an authority failure. Local assurance covers this
+plugin's governed campaign, not all host processes, agents, or hooks.
+Run `node <immutable-plugin-root>/src/cli.mjs lifecycle observe` with JSON stdin
+containing `session_id` and any `transcript_path`. Pass that exact observation as
+`expected`, plus the session fields and `plan`, to `lifecycle plan`. Direct file
+edits are denied. The transition owns claim, plan publication, and promotion.
+Use explicit `resume` for an existing ownerless plan or checkpoint tombstone.
+Other sessions, including sibling worktrees and checkpointed source sessions,
+remain inert and do not acquire lifecycle locks, log tools, or receive Stop
+behavior. Only a validated owning-session capability enables lifecycle hooks.
 If route or attachment cleanup fails, the hook reports that failure and the
 claim remains recoverable; do not treat that output as a release receipt.
 
@@ -130,7 +139,11 @@ Only after a successful final enumeration, set `mode` to `complete` and add:
 ```
 
 The Stop hook validates structure and queue state, but it is not a security
-boundary against a malicious process running as the same user.
+boundary against a malicious process running as the same user. Continue between
+items without status-only stops while the host permits it. Quotas, approvals,
+network loss, editor shutdown, and host continuation limits can still interrupt
+the session; checkpoint and provide the exact resume reference instead of
+claiming the queue is complete. Do not bypass host controls or create a daemon.
 
 ## Memory Discipline
 

@@ -2,6 +2,43 @@
 
 ## 0.1.2-alpha.1 - Unreleased
 
+- Add an owner-bound native Doctor control-plane entry for local-scoped recovery
+	when the ordinary session lock is dead. Admit only the exact immutable
+	root-bound `--request-base64` command or a current hash-bound Doctor consultation; retain
+	ordinary denial, independent incident transactions, capability checks and
+	unknown-effect non-replay. Keep stdin and strict-host compatibility unchanged.
+- Added `handoff record-model` for owner-checked model receipt publication.
+	Keep runtime file edits denied, bind publication to the current staged build
+	and issued review attempt, preserve superseded evidence, and retain the
+	existing final handoff/model-policy checks and recorded-provenance ceiling.
+- Scope routine CI to Windows on Node 20, 22 and 24 during the Windows-first
+	Copilot-local canary. Keep the complete cross-platform matrix for tags and
+	explicit `full` workflow dispatch; strict promotion and public release gates
+	continue to require all nine jobs.
+- Declare the Worker's native delegation tool set and verify tool/model
+	prerequisites before admission; required model selectors must be explicit.
+- Let local-scoped hooks share one bounded acquisition wait across lock scopes:
+	ten seconds on Windows and one second elsewhere. The installed eight-way Windows
+	probe is covered; larger bursts or slower hosts can still exhaust the budget.
+	Preserve live-owner refusal, immutable authority revalidation and legacy bounds.
+	- Use Node's native Windows canonicalizer in the repeated state-path guard,
+	  retaining uncached per-segment link and containment validation while reducing
+	  serialized hook work. Keep the eight-way timing probe opt-in; the ordinary
+	  test gate exercises the acquisition threshold with a controlled monotonic clock.
+- Added explicitly accepted `local-scoped` authority for the VS Code Agent
+	Plugin, binding immutable source, workflow bytes and the real session locator.
+	Existing workflows retain the strict host-inventory profile. Local admission,
+	incomplete-plan Stop, checkpoint/resume and exact dead-lock Doctor recovery
+	use the existing single-owner kernel; admitted calls fail closed after authority
+	drift. Status distinguishes configured assurance from evidence not checked.
+	Whole-host assurance and automatic host replacement remain separately planned.
+- Centralized lifecycle writes behind one generation-bound compare-and-set
+	owner while preserving #8's separate metadata journal boundary. Added typed
+	plan observation/publication and capability-bound out-of-band rescue.
+- Split plugin-wide protected mutation denial from owning-Worker lifecycle and
+	Stop behavior. Ordinary and checkpointed chats are inert; production startup
+	requires a single trusted host authority inventory and a verified immutable
+	installation. Legacy state remains readable but does not confer that grant.
 - Changed `npm test` to run every test file and report an aggregated list of
 	failing files instead of stopping at the first one. A single early failure
 	previously hid every later test file and skipped `npm run validate`, which

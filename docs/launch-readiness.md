@@ -16,6 +16,25 @@ validation, and explicit completion records.
 
 ## Milestones
 
+### Copilot-Local Evaluation
+
+The 2026-09-08 delivery split introduces an explicitly accepted `local-scoped`
+workflow for the VS Code Agent Plugin. Its assurance covers this plugin's
+immutable source, accepted workflow, session-bound campaign ownership and local
+evidence checks, not the complete host or an adversarial same-user process.
+See [Host Profiles](host-profiles.md) for the contract and host limitations.
+
+The local #10/#6/#5 acceptance requires a real bounded issue campaign, supported
+Doctor recovery and checkpoint/fresh-session resume. Source tests, a configured
+plugin, or an accepted workflow alone cannot pass that gate. A quota, approval,
+editor shutdown or other host-forced interruption remains an honest checkpoint,
+not an uninterrupted success. Automatic immutable host replacement is not claimed.
+
+The original strong obligations are retained in Supervised Worker #11 and the
+linked ProbOS-host program. The Provider-Verified Completion claim ladder and
+external dogfood requirements below are unchanged; local evidence does not
+substitute for any of their host/provider/external provenance requirements.
+
 ### Current: Untagged Local Alpha
 
 Implemented, but not a release. Local plan-completion shape and explicit local

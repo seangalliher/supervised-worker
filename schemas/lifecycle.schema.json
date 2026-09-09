@@ -13,7 +13,7 @@
     "uuid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
     "generation": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/uuid" }] },
     "nullableHash": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/hash" }] },
-    "scope": { "enum": ["repository", "session", "journal"] },
+    "scope": { "enum": ["repository", "session", "journal", "doctor"] },
     "pid": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
     "identity": {
       "type": "object", "additionalProperties": false, "required": ["dev", "ino"],
@@ -75,6 +75,7 @@
       "required": ["scope", "location", "token", "processId", "directory", "owner", "repository", "root", "parent", "attachment", "routing"],
       "properties": {
         "scope": { "$ref": "#/$defs/scope" }, "location": { "enum": ["canonical", "retired"] },
+        "incidentId": { "$ref": "#/$defs/uuid" },
         "token": { "$ref": "#/$defs/uuid" }, "processId": { "$ref": "#/$defs/pid" },
         "directory": { "$ref": "#/$defs/identity" }, "owner": { "$ref": "#/$defs/file" },
         "repository": { "$ref": "#/$defs/boundary" }, "root": { "$ref": "#/$defs/boundary" },
@@ -88,11 +89,13 @@
       "type": "object", "additionalProperties": false, "required": ["scope"],
       "properties": {
         "scope": { "$ref": "#/$defs/scope" }, "location": { "enum": ["canonical", "retired"] },
+        "incidentId": { "$ref": "#/$defs/uuid" },
         "token": { "$ref": "#/$defs/uuid" }, "session_id": { "$ref": "#/$defs/sessionId" },
         "transcript_path": { "$ref": "#/$defs/transcriptPath" }
       },
       "dependentRequired": { "session_id": ["transcript_path"], "transcript_path": ["session_id"] },
       "allOf": [
+        { "if": { "required": ["scope"], "properties": { "scope": { "const": "doctor" } } }, "then": { "required": ["incidentId"] } },
         { "if": { "required": ["scope"], "properties": { "scope": { "const": "session" } } }, "then": { "required": ["session_id", "transcript_path"] } },
         { "if": { "required": ["location"], "properties": { "location": { "const": "retired" } } }, "then": { "required": ["token"] } }
       ]
@@ -112,7 +115,7 @@
       "required": ["code", "scope", "operation", "phase", "syscall", "errorCode", "attempts", "token", "processId", "cause", "nextStep"],
       "properties": {
         "code": { "enum": ["LIFECYCLE_ACQUISITION_CONTENTION", "LIFECYCLE_OWNER_LIVE", "LIFECYCLE_OWNER_DEAD", "LIFECYCLE_OWNER_UNKNOWN", "LIFECYCLE_IDENTITY_REJECTED", "LIFECYCLE_OWNER_MALFORMED", "LIFECYCLE_SYSCALL_FAILURE", "LIFECYCLE_EVIDENCE_PERSISTENCE_FAILURE"] },
-        "scope": { "enum": [null, "repository", "session", "journal"] }, "operation": { "enum": ["acquire", "release", "guard", "inspect", "recover"] },
+        "scope": { "enum": [null, "repository", "session", "journal", "doctor"] }, "operation": { "enum": ["acquire", "release", "guard", "inspect", "recover"] },
         "phase": { "enum": ["acquisition", "owner-observation", "ownership-validation", "descriptor-close", "retirement", "retired-validation", "owner-removal", "directory-removal", "request-validation", "binding-validation", "guard-acquisition", "intent-persistence", "outcome-persistence"] },
         "syscall": { "enum": [null, "close", "fstat", "fsync", "kill", "lstat", "mkdir", "open", "read", "readdir", "realpath", "rename", "rm", "rmdir", "unlink", "write"] },
         "errorCode": { "enum": [null, "UNKNOWN", "EACCES", "EBADF", "EBUSY", "EEXIST", "EINVAL", "EIO", "EISDIR", "ELOOP", "EMFILE", "ENAMETOOLONG", "ENFILE", "ENOENT", "ENOMEM", "ENOSPC", "ENOTDIR", "ENOTEMPTY", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EROFS", "ESRCH", "ESTALE", "ETXTBSY", "EXDEV"] },
@@ -144,7 +147,7 @@
           "type": "object", "additionalProperties": false, "required": ["processId", "errorCode"],
           "properties": { "processId": { "$ref": "#/$defs/pid" }, "errorCode": { "const": "ESRCH" } }
         },
-        "destination": { "type": "string", "pattern": "^(lifecycle|journal|[0-9a-f]{64})\\.[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.recovered$" }
+        "destination": { "type": "string", "pattern": "^(lifecycle|journal|transition|[0-9a-f]{64})\\.[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.recovered$" }
       }
     },
     "recoveryOutcome": {

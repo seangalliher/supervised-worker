@@ -35,6 +35,7 @@ test("plugin ships the complete namespaced companion role pack", () => {
     "seangalliher-supervised-architect",
     "seangalliher-supervised-builder",
     "seangalliher-supervised-diff-reviewer",
+    "seangalliher-supervised-doctor",
     "seangalliher-supervised-worker",
     "supervised-worker",
   ]);
@@ -113,6 +114,18 @@ test("companion agents have bounded non-overlapping authority", () => {
   assert.match(reviewer.body, /build report.*SHA-256/is);
 });
 
+test("Worker tool declarations include native delegation before campaign admission", () => {
+  for (const workerId of ["seangalliher-supervised-worker", "supervised-worker"]) {
+    const worker = readAgent(workerId);
+    assert.deepEqual(worker.metadata.tools, ["execute", "edit", "read", "search", "agent", "web", "todo"]);
+    assert.match(worker.body, /Before admission, confirm native `runSubagent`/);
+    assert.match(worker.body, /pass its explicit model selector/);
+    assert.match(worker.body, /Verify the actual serving model/);
+    assert.equal(worker.metadata.model, undefined);
+    assert.equal(worker.metadata.agents, undefined);
+  }
+});
+
 test("companion inline handoff templates pass the runtime validator", () => {
   for (const id of [
     "seangalliher-supervised-architect",
@@ -151,6 +164,34 @@ test("main worker is the sole durable-plan owner and names every handoff", () =>
     assert.match(worker.body, /rendered staged\s+diff/is);
     assert.match(worker.body, /handoff\s+verify/is);
     assert.match(worker.body, /host-reported Builder and Reviewer model IDs/i);
+    assert.match(worker.body, /receipts with `handoff record-model`/);
+    assert.match(worker.body, /That call is not the review/);
     assert.match(worker.body, /host\s+fallback is a failed review precondition/i);
+    assert.match(worker.body, /`campaign inventory` and `campaign compile`/);
+    assert.match(worker.body, /Doctor must not author the canonical receipt/);
+    assert.match(worker.body, /authority\.assurance: "local-scoped"/);
+    assert.match(worker.body, /does not require `SUPERVISED_WORKER_HOST_AUTHORITY`/);
+    assert.match(worker.body, /never create a fake\s+transcript/);
+    assert.match(worker.body, /An omitted assurance or `host-attested` keeps the strict inventory requirement/);
+    assert.match(worker.body, /checkpoint-and-restart boundary/);
+    assert.match(worker.body, /not a guarantee against\s+host cancellation/);
   }
+});
+
+test("Doctor is an on-demand reasoning role with no durable-state or shell authority", () => {
+  const doctor = readAgent("seangalliher-supervised-doctor");
+  assert.deepEqual(doctor.metadata.tools, ["read", "search", "web", "agent"]);
+  assert.equal(doctor.metadata["user-invocable"], false);
+  assert.equal(doctor.metadata["disable-model-invocation"], false);
+  assert.match(doctor.body, /Do not create, read, edit, or acquire independent ownership/);
+  assert.match(doctor.body, /schemas\/doctor\.schema\.json/);
+  assert.match(doctor.body, /Never author host inventories/);
+  assert.match(doctor.body, /Do not author canonical campaign\/release receipts/);
+  for (const id of ["seangalliher-supervised-worker", "supervised-worker"]) {
+    assert.match(readAgent(id).body, /invoke `Supervised Doctor`/);
+    assert.match(readAgent(id).body, /src\/doctor-rescue\.mjs/);
+    assert.match(readAgent(id).body, /--request-base64/);
+    assert.match(readAgent(id).body, /doctor-consultation/);
+  }
+  assert.match(doctor.body, /rather than calling tools/);
 });

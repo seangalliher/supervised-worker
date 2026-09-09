@@ -32,6 +32,7 @@
       "required": ["mode", "boundaries"],
       "properties": {
         "mode": { "enum": ["supervised", "delegated"] },
+        "assurance": { "enum": ["host-attested", "local-scoped"], "default": "host-attested" },
         "boundaries": {
           "type": "array",
           "items": { "$ref": "#/$defs/nonBlank" },
@@ -99,6 +100,15 @@
       "properties": {
         "maximumNewPerClosures": { "type": "integer", "minimum": 0 },
         "closureDenominator": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "doctor": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sourceRepository", "repairDirectory", "baseCommit"],
+      "properties": {
+        "sourceRepository": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\\u0000-\\u001f\\u007f]+$" },
+        "repairDirectory": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\\u0000-\\u001f\\u007f]+$" },
+        "baseCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
       }
     }
   },

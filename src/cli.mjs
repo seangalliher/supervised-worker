@@ -11,21 +11,26 @@ import {
   serializeLocalCampaignReceipt,
 } from "./campaign.mjs";
 import {
+  applyCampaignPlan,
   checkpointSession,
-  handleHook,
+  handlePluginHook,
   inspectLifecycleLock,
+  issueRescueCapability,
   lifecycleFailureDetails,
   MAX_CHECKPOINT_REQUEST_BYTES,
   MAX_LIFECYCLE_REQUEST_BYTES,
   MAX_OBSERVATION_REQUEST_BYTES,
   observeHandoffValidation,
-  recoverLifecycleLock,
+  observeCampaignTransition,
+  recordModelReceipt,
   releaseAttachment,
   requestDeniedToolRetry,
+  rescueLifecycle,
   resumeSession,
   summarizePlan,
   validatePlan,
 } from "./core.mjs";
+import { verifyWorkerAuthority } from "./authority.mjs";
 import { inspectGitHubQueue, validateGitHubQueueObservation } from "./github-queue.mjs";
 import {
   inspectHandoffFile,
@@ -97,6 +102,7 @@ async function validateRepository() {
     "seangalliher-supervised-architect.agent.md",
     "seangalliher-supervised-builder.agent.md",
     "seangalliher-supervised-diff-reviewer.agent.md",
+    "seangalliher-supervised-doctor.agent.md",
     "seangalliher-supervised-worker.agent.md",
     "supervised-worker.agent.md",
   ];
@@ -117,6 +123,8 @@ async function validateRepository() {
     "hooks.json",
     "com.github.copilot/hooks/hooks.json",
     "docs/architecture.md",
+    "docs/doctor.md",
+    "docs/campaign-release.md",
     "docs/customizing-roles.md",
     "docs/evaluation.md",
     "docs/roadmap.md",
@@ -124,12 +132,15 @@ async function validateRepository() {
     "examples/plan.complete.json",
     "examples/workflow.json",
     "examples/workflow.specialized.json",
+    "examples/workflow.vscode-local.json",
     "examples/handoff.build-contract.json",
     "examples/handoff.build-report.json",
     "examples/handoff.review-report.json",
     "examples/local-campaign-receipt.json",
     "policy/constitution.json",
     "schemas/checkpoint.schema.json",
+    "schemas/campaign-release.schema.json",
+    "schemas/doctor.schema.json",
     "schemas/episode.schema.json",
     "schemas/lifecycle.schema.json",
     "schemas/local-campaign-receipt.schema.json",
@@ -343,7 +354,7 @@ async function main() {
   const [command = "help", argument, ...argumentsAfter] = process.argv.slice(2);
   const hasNoArguments = argument === undefined && argumentsAfter.length === 0;
   const usage =
-    "Usage: node src/cli.mjs <validate|doctor|install|status|checkpoint|resume|release|observation retry-denied|lifecycle inspect|lifecycle recover|queue inspect OWNER/REPO --state open|closed|all|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
+    "Usage: node src/cli.mjs <validate|doctor|install|status|checkpoint|resume|release|observation retry-denied|lifecycle observe|lifecycle plan|lifecycle rescue-authorize|lifecycle inspect|lifecycle recover|queue inspect OWNER/REPO --state open|closed|all|campaign export [--format json|markdown]|campaign validate PATH|workflow roles|workflow accept HASH|handoff|hook EVENT>\n";
   if (command === "help" && hasNoArguments) {
     process.stdout.write(usage);
     return;
@@ -405,7 +416,9 @@ async function main() {
       );
       return;
     }
-    process.stdout.write(`${JSON.stringify(handleHook(input, argument, input.cwd))}\n`);
+    const { routeDoctorConsultation, routeDoctorFromHook } = await import("./doctor-routing.mjs");
+    const consultation = routeDoctorConsultation(input, argument, root);
+    process.stdout.write(`${JSON.stringify(consultation ?? routeDoctorFromHook(input, handlePluginHook(input, argument, root), root))}\n`);
     return;
   }
   if (command === "observation" && argument === "retry-denied" && argumentsAfter.length === 0) {
@@ -420,7 +433,12 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    const result = requestDeniedToolRetry(process.cwd(), request);
+    let result;
+    try {
+      result = requestDeniedToolRetry(process.cwd(), request, verifyWorkerAuthority(process.cwd(), request, root));
+    } catch {
+      result = { status: "denied", permit: null, reason: "Denied retry requires a verified owning Worker capability." };
+    }
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     if (result.status !== "reserved") process.exitCode = 1;
     return;
@@ -435,11 +453,35 @@ async function main() {
       return;
     }
     try {
-      const result = command === "checkpoint" ? checkpointSession(process.cwd(), request) : resumeSession(process.cwd(), request);
+      const authority = verifyWorkerAuthority(process.cwd(), request, root);
+      const result = command === "checkpoint" ? checkpointSession(process.cwd(), request, authority) : resumeSession(process.cwd(), request, authority);
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       if (result.status !== (command === "checkpoint" ? "checkpointed" : "resumed")) process.exitCode = 1;
     } catch (error) {
       process.stdout.write(`${JSON.stringify(lifecycleFailureDetails(error) ?? { status: "unconfirmed", error: error.message })}\n`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (command === "lifecycle" && ["observe", "plan", "rescue-authorize"].includes(argument) && argumentsAfter.length === 0) {
+    try {
+      const request = parseWorkflowJson(await readStdin(argument === "plan" ? MAX_STDIN_BYTES + MAX_CHECKPOINT_REQUEST_BYTES : MAX_CHECKPOINT_REQUEST_BYTES));
+      let result;
+      if (argument === "observe") {
+        if (!request || typeof request !== "object" || Array.isArray(request) ||
+          Object.keys(request).some((key) => !["session_id", "transcript_path"].includes(key))) throw new Error("invalid observation request");
+        result = observeCampaignTransition(process.cwd(), request);
+      } else if (argument === "rescue-authorize") {
+        result = issueRescueCapability(process.cwd(), request, verifyWorkerAuthority(process.cwd(), request, root));
+      } else {
+        result = applyCampaignPlan(process.cwd(), request, verifyWorkerAuthority(process.cwd(), request, root));
+      }
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } catch (error) {
+      process.stdout.write(`${JSON.stringify(lifecycleFailureDetails(error) ?? {
+        schemaVersion: 1, kind: "campaign-transition-outcome", status: error?.transitionCode ? "conflict" : "unconfirmed",
+        code: error?.transitionCode ?? "CAMPAIGN_AUTHORITY_OR_STATE_UNCONFIRMED",
+      })}\n`);
       process.exitCode = 1;
     }
     return;
@@ -452,12 +494,34 @@ async function main() {
       request = null;
     }
     const result = argument === "recover"
-      ? recoverLifecycleLock(process.cwd(), request) : inspectLifecycleLock(process.cwd(), request);
+      ? rescueLifecycle(process.cwd(), request) : inspectLifecycleLock(process.cwd(), request);
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     if (result.status === "unconfirmed") process.exitCode = 1;
     return;
   }
   if (command === "campaign") {
+    if (["compile", "inventory"].includes(argument) && (argumentsAfter.length === 0 ||
+      (argument === "compile" && argumentsAfter.length === 2 && argumentsAfter[0] === "--format" && ["json", "markdown"].includes(argumentsAfter[1])))) {
+      try {
+        const request = parseWorkflowJson(await readStdin(65_536));
+        if (!request || typeof request !== "object" || Array.isArray(request) ||
+          Object.keys(request).some((key) => !["session_id", "transcript_path", ...(argument === "compile" ? ["manifest"] : [])].includes(key))) throw new Error("RELEASE_REQUEST_INVALID");
+        const input = { session_id: request.session_id, ...(request.transcript_path === undefined ? {} : { transcript_path: request.transcript_path }) };
+        const authority = verifyWorkerAuthority(process.cwd(), input, root);
+        if (argument === "inventory") {
+          const { observeReleaseDoctorInventory } = await import("./release-inputs.mjs");
+          process.stdout.write(`${JSON.stringify(observeReleaseDoctorInventory(process.cwd(), input, authority))}\n`);
+        } else {
+          const { compileCampaignRelease, renderCampaignReleaseMarkdown, serializeCampaignRelease } = await import("./campaign-release.mjs");
+          const receipt = compileCampaignRelease(process.cwd(), input, request.manifest, authority);
+          process.stdout.write(argumentsAfter[1] === "markdown" ? renderCampaignReleaseMarkdown(receipt) : serializeCampaignRelease(receipt));
+        }
+      } catch (error) {
+        process.stdout.write(`${JSON.stringify({ ok: false, code: /^RELEASE_[A-Z_]+$/.test(error.message) ? error.message : "RELEASE_AUTHORITY_OR_INPUT_UNCONFIRMED" })}\n`);
+        process.exitCode = 1;
+      }
+      return;
+    }
     const exportFormat = argument === "export" && argumentsAfter.length === 0
       ? "json"
       : argument === "export" &&
@@ -514,6 +578,13 @@ async function main() {
   if (command === "status" && hasNoArguments) {
     try {
       const report = summarizePlan(process.cwd());
+      const workflow = resolveWorkflowRoles(process.cwd());
+      report.assurance = {
+        requested: workflow.authorityAssurance ?? "host-attested",
+        workflowAcceptance: !workflow.ok ? "invalid" : !workflow.configured ? "not-required" : workflow.accepted ? "accepted" : "required",
+        hostInventory: "not-checked",
+        providerCompletion: "not-checked",
+      };
       process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
       if (report.valid === false) process.exitCode = 1;
     } catch {
@@ -526,7 +597,12 @@ async function main() {
   }
   if (command === "release" && hasNoArguments) {
     try {
-      process.stdout.write(`${JSON.stringify(releaseAttachment(process.cwd()), null, 2)}\n`);
+      const request = parseWorkflowJson(await readStdin(MAX_CHECKPOINT_REQUEST_BYTES));
+      if (!request || typeof request !== "object" || Array.isArray(request) ||
+        Object.keys(request).some((key) => !["session_id", "transcript_path", "expected"].includes(key)) ||
+        !Object.hasOwn(request, "expected")) throw new Error("release requires an exact expected state and owning session");
+      process.stdout.write(`${JSON.stringify(releaseAttachment(process.cwd(), request.expected, request,
+        verifyWorkerAuthority(process.cwd(), request, root)), null, 2)}\n`);
     } catch (error) {
       process.stdout.write(
         `${JSON.stringify(lifecycleFailureDetails(error) ?? { released: false, message: "Local attachment could not be released safely." }, null, 2)}\n`,
@@ -537,17 +613,45 @@ async function main() {
   }
   if (command === "handoff") {
     let report;
-    if (argument === "validate" && argumentsAfter.length === 1) {
+    if (argument === "record-model" && argumentsAfter.length === 0) {
+      let request;
+      try {
+        request = parseWorkflowJson(await readStdin(MAX_OBSERVATION_REQUEST_BYTES));
+        const required = ["session_id", "expected", "receipt"];
+        if (!request || typeof request !== "object" || Array.isArray(request) ||
+          !required.every((key) => Object.hasOwn(request, key)) ||
+          Object.keys(request).some((key) => ![...required, "transcript_path"].includes(key))) throw new Error();
+      } catch {
+        report = { ok: false, code: "MODEL_RECEIPT_INPUT_INVALID", errors: ["Model receipt publication requires bounded typed JSON with session_id, expected observation and receipt."] };
+      }
+      if (report === undefined) {
+        try { report = recordModelReceipt(process.cwd(), request, verifyWorkerAuthority(process.cwd(), request, root)); }
+        catch {
+          report = { ok: false, code: "MODEL_RECEIPT_PUBLICATION_DENIED", errors: ["Model receipt publication could not verify owning-session authority, current candidate bindings or safe storage; preserve existing evidence and inspect the request before retrying."] };
+        }
+      }
+    } else if (argument === "validate" && argumentsAfter.length === 1) {
       report = inspectHandoffFile(process.cwd(), argumentsAfter[0]);
     } else if (argument === "validate" && argumentsAfter.length === 2 && argumentsAfter[1] === "--observe") {
+      let request;
       try {
-        const request = parseWorkflowJson(await readStdin(MAX_OBSERVATION_REQUEST_BYTES));
-        report = observeHandoffValidation(process.cwd(), argumentsAfter[0], request);
+        request = parseWorkflowJson(await readStdin(MAX_OBSERVATION_REQUEST_BYTES));
       } catch {
         report = {
           ok: false, status: "denied", outcome: "not-evaluated",
+          code: "HANDOFF_OBSERVATION_INPUT_INVALID",
           errors: ["Observed handoff validation requires bounded, duplicate-key-free JSON stdin."],
         };
+      }
+      if (report === undefined) {
+        try {
+          report = observeHandoffValidation(process.cwd(), argumentsAfter[0], request, verifyWorkerAuthority(process.cwd(), request, root));
+        } catch {
+          report = {
+            ok: false, status: "denied", outcome: "not-evaluated", code: "WORKER_AUTHORITY_UNCONFIRMED",
+            errors: ["Observed handoff validation requires a verified immutable installation and accepted owning-session authority."],
+          };
+        }
       }
     } else if (argument === "pre-review" && argumentsAfter.length === 2) {
       report = verifyBuildHandoff(process.cwd(), ...argumentsAfter);
@@ -559,7 +663,7 @@ async function main() {
       report = {
         ok: false,
         errors: [
-          "Usage: handoff validate <artifact> [--observe] | handoff pre-review <contract> <build-report> | handoff issue-review <contract> <build-report> | handoff verify <contract> <build-report> <review-report>",
+          "Usage: handoff validate <artifact> [--observe] | handoff pre-review <contract> <build-report> | handoff issue-review <contract> <build-report> | handoff record-model | handoff verify <contract> <build-report> <review-report>",
         ],
       };
     }
