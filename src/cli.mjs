@@ -22,6 +22,7 @@ import {
   MAX_OBSERVATION_REQUEST_BYTES,
   observeHandoffValidation,
   observeCampaignTransition,
+  recordModelReceipt,
   releaseAttachment,
   requestDeniedToolRetry,
   rescueLifecycle,
@@ -611,7 +612,24 @@ async function main() {
   }
   if (command === "handoff") {
     let report;
-    if (argument === "validate" && argumentsAfter.length === 1) {
+    if (argument === "record-model" && argumentsAfter.length === 0) {
+      let request;
+      try {
+        request = parseWorkflowJson(await readStdin(MAX_OBSERVATION_REQUEST_BYTES));
+        const required = ["session_id", "expected", "receipt"];
+        if (!request || typeof request !== "object" || Array.isArray(request) ||
+          !required.every((key) => Object.hasOwn(request, key)) ||
+          Object.keys(request).some((key) => ![...required, "transcript_path"].includes(key))) throw new Error();
+      } catch {
+        report = { ok: false, code: "MODEL_RECEIPT_INPUT_INVALID", errors: ["Model receipt publication requires bounded typed JSON with session_id, expected observation and receipt."] };
+      }
+      if (report === undefined) {
+        try { report = recordModelReceipt(process.cwd(), request, verifyWorkerAuthority(process.cwd(), request, root)); }
+        catch {
+          report = { ok: false, code: "MODEL_RECEIPT_PUBLICATION_DENIED", errors: ["Model receipt publication could not verify owning-session authority, current candidate bindings or safe storage; preserve existing evidence and inspect the request before retrying."] };
+        }
+      }
+    } else if (argument === "validate" && argumentsAfter.length === 1) {
       report = inspectHandoffFile(process.cwd(), argumentsAfter[0]);
     } else if (argument === "validate" && argumentsAfter.length === 2 && argumentsAfter[1] === "--observe") {
       let request;
@@ -644,7 +662,7 @@ async function main() {
       report = {
         ok: false,
         errors: [
-          "Usage: handoff validate <artifact> [--observe] | handoff pre-review <contract> <build-report> | handoff issue-review <contract> <build-report> | handoff verify <contract> <build-report> <review-report>",
+          "Usage: handoff validate <artifact> [--observe] | handoff pre-review <contract> <build-report> | handoff issue-review <contract> <build-report> | handoff record-model | handoff verify <contract> <build-report> <review-report>",
         ],
       };
     }

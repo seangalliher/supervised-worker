@@ -164,6 +164,8 @@ test("main worker is the sole durable-plan owner and names every handoff", () =>
     assert.match(worker.body, /rendered staged\s+diff/is);
     assert.match(worker.body, /handoff\s+verify/is);
     assert.match(worker.body, /host-reported Builder and Reviewer model IDs/i);
+    assert.match(worker.body, /receipts with `handoff record-model`/);
+    assert.match(worker.body, /That call is not the review/);
     assert.match(worker.body, /host\s+fallback is a failed review precondition/i);
     assert.match(worker.body, /`campaign inventory` and `campaign compile`/);
     assert.match(worker.body, /Doctor must not author the canonical receipt/);

@@ -2,6 +2,10 @@
 
 ## 0.1.2-alpha.1 - Unreleased
 
+- Added `handoff record-model` for owner-checked model receipt publication.
+	Keep runtime file edits denied, bind publication to the current staged build
+	and issued review attempt, preserve superseded evidence, and retain the
+	existing final handoff/model-policy checks and recorded-provenance ceiling.
 - Scope routine CI to Windows on Node 20, 22 and 24 during the Windows-first
 	Copilot-local canary. Keep the complete cross-platform matrix for tags and
 	explicit `full` workflow dispatch; strict promotion and public release gates

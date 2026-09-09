@@ -21,7 +21,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { sha256 } from "../src/core.mjs";
+import { checkpointSession, observeCampaignTransition, recordModelReceipt, sha256 } from "../src/core.mjs";
 import {
   directoryIdentityMatches,
   inspectHandoffFile,
@@ -31,7 +31,8 @@ import {
   verifyBuildHandoff,
   verifyHandoffChain,
 } from "../src/handoff.mjs";
-import { DEFAULT_ROLES } from "../src/workflow.mjs";
+import { acceptWorkflowRoles, DEFAULT_ROLES, resolveWorkflowRoles } from "../src/workflow.mjs";
+import { createWorkerAuthorityFixture } from "./worker-authority-fixture.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cli = path.join(root, "src", "cli.mjs");
@@ -90,6 +91,234 @@ function issueFixtureReview(fixture, workflowHash = null, roles = DEFAULT_ROLES)
   fixture.attempt = attempt;
   return attempt;
 }
+
+function modelPublicationFixture(fixture, assurance = "host-attested") {
+  fixture.cwd = realpathSync(fixture.cwd);
+  const input = { session_id: "model-publication-owner" };
+  let options = {};
+  let workflowHash = null;
+  if (assurance === "local-scoped") {
+    const workflow = readJson("examples/workflow.vscode-local.json");
+    workflow.roles = { ...DEFAULT_ROLES };
+    Object.assign(workflow.review, { agent: DEFAULT_ROLES.reviewer, requiredModel: "fixture-reviewer",
+      requiredModelFamily: "fixture-provider", requireDifferentModelFamily: true });
+    writeJson(path.join(fixture.cwd, ".github", "supervised-worker.json"), workflow);
+    git(fixture.cwd, "add", "--", ".github/supervised-worker.json");
+    git(fixture.cwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "--quiet", "-m", "fixture baseline");
+    writeFileSync(path.join(fixture.cwd, "src", "module.js"), "export const value = 2;\n");
+    git(fixture.cwd, "add", "--", "src/module.js");
+    workflowHash = resolveWorkflowRoles(fixture.cwd).workflowHash;
+    assert.equal(acceptWorkflowRoles(fixture.cwd, workflowHash).ok, true);
+    fixture.contract.workflowHash = workflowHash;
+    fixture.build.workflowHash = workflowHash;
+    fixture.build.contractHash = writeJson(fixture.contractPath, fixture.contract);
+    fixture.build.testedTreeHash = git(fixture.cwd, "write-tree");
+    writeJson(fixture.buildPath, fixture.build);
+    const external = realpathSync(mkdtempSync(path.join(os.tmpdir(), "sw-local-model-publication-")));
+    const transcripts = path.join(external, "storage", "GitHub.copilot-chat", "transcripts");
+    mkdirSync(transcripts, { recursive: true });
+    writeFileSync(path.join(external, "storage", "workspace.json"), "{}\n");
+    input.transcript_path = path.join(transcripts, `${input.session_id}.jsonl`);
+    writeFileSync(input.transcript_path, "");
+    options = { baseDirectory: external };
+  }
+  const runtime = createWorkerAuthorityFixture(fixture.cwd, input, options);
+  assert.equal(runtime.admit({ schemaVersion: 1, mode: "active", goal: "Model publication boundaries",
+    items: [{ id: fixture.review.itemId, title: "Receipt item", status: "in_progress" }], completion: null }).status, "applied");
+  const attempt = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath);
+  assert.equal(attempt.ok, true, attempt.errors.join("\n"));
+  const receipt = { schemaVersion: 2, itemId: fixture.review.itemId, role: "builder", agentSelector: DEFAULT_ROLES.builder,
+    model: "fixture-model", family: "fixture-family", workflowHash,
+    reviewAttemptId: attempt.reviewAttemptId, buildReportHash: attempt.buildReportHash, stagedTreeHash: attempt.stagedTreeHash,
+    observedBy: "supervised-worker:seangalliher-supervised-worker", observedAt: new Date().toISOString(),
+    host: "vscode", sessionHash: sha256(input.session_id), source: "host" };
+  return { input, runtime, receipt, attempt,
+    request: { ...input, expected: observeCampaignTransition(fixture.cwd, input), receipt },
+    target: path.join(fixture.cwd, ".supervised-worker", "runtime", "model-receipts", sha256(receipt.itemId), "builder.json") };
+}
+
+for (const mutation of ["role", "workflow", "attempt", "build", "tree", "session", "host", "observed-time", "expected", "extra", "null"]) {
+  test(`model receipt publication rejects ${mutation} mismatch without changing prior evidence`, () => {
+    withFixture((fixture) => {
+      const context = modelPublicationFixture(fixture);
+      const before = readFileSync(context.target);
+      const request = structuredClone(context.request);
+      if (mutation === "role") request.receipt.agentSelector = "other-builder";
+      if (mutation === "workflow") request.receipt.workflowHash = "e".repeat(64);
+      if (mutation === "attempt") request.receipt.reviewAttemptId = "11111111-1111-4111-8111-111111111111";
+      if (mutation === "build") request.receipt.buildReportHash = "e".repeat(64);
+      if (mutation === "tree") request.receipt.stagedTreeHash = "e".repeat(40);
+      if (mutation === "session") request.receipt.sessionHash = "e".repeat(64);
+      if (mutation === "host") request.receipt.host = "copilot-cli";
+      if (mutation === "observed-time") request.receipt.observedAt = "2000-01-01T00:00:00Z";
+      if (mutation === "expected") request.expected.planHash = "e".repeat(64);
+      if (mutation === "extra") request.target = "arbitrary/path";
+      assert.throws(() => recordModelReceipt(fixture.cwd, mutation === "null" ? null : request, context.runtime.authority()));
+      assert.deepEqual(readFileSync(context.target), before);
+    });
+  });
+}
+
+test("model receipt publication refuses copied authority and a checkpointed owner", () => {
+  withFixture((fixture) => {
+    const context = modelPublicationFixture(fixture);
+    const authority = context.runtime.authority();
+    assert.throws(() => recordModelReceipt(fixture.cwd, context.request, { ...authority }), /verified/);
+    const checkpoint = checkpointSession(fixture.cwd, { ...context.input,
+      planHash: context.request.expected.planHash, attachmentHash: context.request.expected.attachmentHash }, authority);
+    assert.equal(checkpoint.status, "checkpointed");
+    const request = { ...context.request, expected: observeCampaignTransition(fixture.cwd, context.input) };
+    assert.throws(() => recordModelReceipt(fixture.cwd, request, authority));
+  });
+});
+
+test("model receipt publication honors accepted local-scoped authority and reviewer policy", () => {
+  withFixture((fixture) => {
+    const context = modelPublicationFixture(fixture, "local-scoped");
+    const authority = context.runtime.authority();
+    assert.equal(authority.assurance, "local-scoped");
+    const builder = recordModelReceipt(fixture.cwd, context.request, authority);
+    assert.equal(builder.ok, true);
+    const reviewer = structuredClone(context.request);
+    reviewer.receipt.role = "reviewer";
+    reviewer.receipt.agentSelector = DEFAULT_ROLES.reviewer;
+    assert.throws(() => recordModelReceipt(fixture.cwd, reviewer, authority));
+    reviewer.receipt.model = "fixture-reviewer";
+    reviewer.receipt.family = "fixture-provider";
+    assert.equal(recordModelReceipt(fixture.cwd, reviewer, authority).ok, true);
+    fs.appendFileSync(path.join(fixture.cwd, ".github", "supervised-worker.json"), "\n");
+    assert.throws(() => recordModelReceipt(fixture.cwd, context.request, authority));
+  });
+});
+
+test("model receipt publication rechecks plan ownership after preparing the write", () => {
+  withFixture((fixture) => {
+    const context = modelPublicationFixture(fixture);
+    const authority = context.runtime.authority();
+    const before = readFileSync(context.target);
+    const original = fs.writeFileSync;
+    let fired = false;
+    try {
+      fs.writeFileSync = (target, bytes, ...options) => {
+        let value;
+        try { value = JSON.parse(String(bytes)); } catch { value = null; }
+        if (!fired && value?.sessionHash === context.receipt.sessionHash && value?.role === "builder") {
+          fired = true;
+          const planPath = path.join(fixture.cwd, ".supervised-worker", "plan.json");
+          const plan = JSON.parse(readFileSync(planPath));
+          original(planPath, JSON.stringify({ ...plan, goal: "changed during publication" }));
+        }
+        return original(target, bytes, ...options);
+      };
+      syncBuiltinESMExports();
+      assert.throws(() => recordModelReceipt(fixture.cwd, context.request, authority));
+      assert.equal(fired, true, "The actual model-receipt write must reach the injected drift");
+      assert.deepEqual(readFileSync(context.target), before);
+    } finally {
+      fs.writeFileSync = original;
+      syncBuiltinESMExports();
+    }
+  });
+});
+
+test("model receipt publication preserves previous bytes and refuses same-attempt conflicts", () => {
+  withFixture((fixture) => {
+    const context = modelPublicationFixture(fixture);
+    const prior = readFileSync(context.target);
+    const publication = recordModelReceipt(fixture.cwd, context.request, context.runtime.authority());
+    assert.equal(publication.ok, true);
+    assert.deepEqual(readFileSync(path.join(path.dirname(context.target), "history", `${sha256(prior)}.json`)), prior);
+    const current = readFileSync(context.target);
+    const changed = structuredClone(context.request);
+    changed.receipt.model = "changed-model";
+    assert.throws(() => recordModelReceipt(fixture.cwd, changed, context.runtime.authority()));
+    assert.deepEqual(readFileSync(context.target), current);
+  });
+});
+
+test("model receipt publication creates absent canonical evidence and leaves identical writes untouched", () => {
+  withFixture((fixture) => {
+    const context = modelPublicationFixture(fixture);
+    rmSync(path.dirname(context.target), { recursive: true });
+    assert.equal(existsSync(context.target), false);
+    const first = recordModelReceipt(fixture.cwd, context.request, context.runtime.authority());
+    const before = lstatSync(context.target, { bigint: true });
+    const second = recordModelReceipt(fixture.cwd, context.request, context.runtime.authority());
+    assert.equal(second.sha256, first.sha256);
+    assert.equal(lstatSync(context.target, { bigint: true }).mtimeNs, before.mtimeNs);
+    assert.equal(sha256(readFileSync(context.target)), first.sha256);
+  });
+});
+
+test("model receipt publication refuses a changed staged candidate and hard-linked evidence", () => {
+  withFixture((fixture) => {
+    const context = modelPublicationFixture(fixture);
+    const before = readFileSync(context.target);
+    writeFileSync(path.join(fixture.cwd, "src", "module.js"), "export const value = 2;\n");
+    git(fixture.cwd, "add", "--", "src/module.js");
+    assert.throws(() => recordModelReceipt(fixture.cwd, context.request, context.runtime.authority()));
+    assert.deepEqual(readFileSync(context.target), before);
+  });
+  withFixture((fixture) => {
+    const context = modelPublicationFixture(fixture);
+    const before = readFileSync(context.target);
+    const linked = path.join(fixture.cwd, ".supervised-worker", "receipt-alias.json");
+    linkSync(context.target, linked);
+    assert.throws(() => recordModelReceipt(fixture.cwd, context.request, context.runtime.authority()));
+    assert.deepEqual(readFileSync(linked), before);
+  });
+});
+
+test("installed owner publishes model receipts that the real handoff verifier accepts", () => {
+  withFixture((fixture) => {
+    const input = { session_id: "model-receipt-owner" };
+    const runtime = createWorkerAuthorityFixture(fixture.cwd, input);
+    assert.equal(runtime.admit({ schemaVersion: 1, mode: "active", goal: "Verify receipt publication",
+      items: [{ id: fixture.review.itemId, title: "Receipt item", status: "in_progress" }], completion: null }).status, "applied");
+    const environment = { ...process.env, SUPERVISED_WORKER_HOST_AUTHORITY: runtime.inventoryPath };
+    const installedCli = path.join(runtime.installRoot, "src", "cli.mjs");
+    const attempt = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath);
+    assert.equal(attempt.ok, true, attempt.errors.join("\n"));
+    Object.assign(fixture.review, { reviewAttemptId: attempt.reviewAttemptId, contractHash: attempt.contractHash,
+      buildReportHash: attempt.buildReportHash, stagedTreeHash: attempt.stagedTreeHash });
+    for (const role of ["builder", "reviewer"]) {
+      const receipt = { schemaVersion: 2, itemId: fixture.review.itemId, role,
+        agentSelector: DEFAULT_ROLES[role], model: fixture.review.modelResolution[role].model,
+        family: fixture.review.modelResolution[role].family, workflowHash: null,
+        reviewAttemptId: attempt.reviewAttemptId, buildReportHash: attempt.buildReportHash,
+        stagedTreeHash: attempt.stagedTreeHash, observedBy: "supervised-worker:seangalliher-supervised-worker",
+        observedAt: new Date().toISOString(), host: "vscode", sessionHash: sha256(input.session_id), source: "host" };
+      const request = { ...input, expected: observeCampaignTransition(fixture.cwd, input), receipt };
+      const result = spawnSync(process.execPath, [installedCli, "handoff", "record-model"], {
+        cwd: fixture.cwd, env: environment, input: JSON.stringify(request), encoding: "utf8", timeout: 30000,
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stdout || result.stderr);
+      const publication = JSON.parse(result.stdout);
+      assert.equal(publication.ok, true);
+      assert.equal(publication.provenance, "worker-recorded");
+      const publishedPath = path.join(fixture.cwd, publication.locator);
+      assert.equal(sha256(readFileSync(publishedPath)), publication.sha256);
+      const repeated = spawnSync(process.execPath, [installedCli, "handoff", "record-model"], {
+        cwd: fixture.cwd, env: environment, input: JSON.stringify(request), encoding: "utf8", timeout: 30000,
+      });
+      assert.equal(repeated.status, 0, repeated.stdout || repeated.stderr);
+      assert.equal(JSON.parse(repeated.stdout).sha256, publication.sha256);
+      const forbidden = spawnSync(process.execPath, [installedCli, "hook", "PreToolUse"], {
+        cwd: fixture.cwd, env: environment, encoding: "utf8", timeout: 30000,
+        input: JSON.stringify({ ...input, cwd: fixture.cwd, tool_name: "create_file", tool_use_id: `direct-${role}`,
+          tool_input: { filePath: publishedPath, content: JSON.stringify(receipt) } }),
+      });
+      assert.equal(forbidden.status, 0, forbidden.stdout || forbidden.stderr);
+      assert.equal(JSON.parse(forbidden.stdout).permissionDecision, "deny");
+      fixture.review.modelResolution[role].evidence = { kind: "host-model", locator: publication.locator, sha256: publication.sha256 };
+    }
+    fixture.review.createdAt = new Date().toISOString();
+    writeJson(fixture.reviewPath, fixture.review);
+    const verified = verifyHandoffChain(fixture.cwd, fixture.contractPath, fixture.buildPath, fixture.reviewPath);
+    assert.equal(verified.ok, true, verified.errors.join("\n"));
+  });
+});
 
 function git(cwd, ...args) {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();

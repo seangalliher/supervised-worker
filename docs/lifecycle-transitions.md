@@ -83,6 +83,7 @@ command remains available, but does not confer mutation authority.
 | --- | --- | --- |
 | First plan | Released, with no existing plan | Provisional claim and route, atomic plan publication, then active ownership. An existing ownerless plan requires explicit resume. |
 | Plan update | Same provisional, active, or resumed owner | Publish only against the exact observation. Another owner, stale hash/generation, or checkpoint tombstone is rejected. |
+| Model receipt | Active or resumed owner, current active item | `handoff record-model` validates the issued attempt and staged candidate, then publishes only the canonical role receipt under the same session/repository guards. Stale owner, policy, source, or evidence is rejected; direct runtime edits remain denied. |
 | Checkpoint | Active or resumed | Persist receipt and journal watermark, then checkpointed attachment and released source route. The active incomplete plan is unchanged. |
 | Checkpoint retry | Matching checkpointed source | Validate the original receipt/ledger binding and finish the same source-route release; never manufacture completion. |
 | Resume | Matching checkpoint, fresh session | Restore bounded Stop/unknown-operation context, publish a new claim and route generation, then report resumed. A changed plan or competing successor is rejected. |

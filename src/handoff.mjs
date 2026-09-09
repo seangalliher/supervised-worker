@@ -709,6 +709,34 @@ function loadReviewAttempt(workspace, itemId) {
   return loaded.value;
 }
 
+export function requireModelReceiptPublication(workspace, value) {
+  const errors = validateModelReceiptValue(value);
+  if (errors.length > 0) throw new Error(errors.join("; "));
+  const workflow = resolveWorkflowRoles(workspace, { requireAcceptance: true });
+  if (!workflow.ok || (workflow.configured && !workflow.accepted)) throw new Error("model receipt workflow is not accepted");
+  const directory = path.join(stateDirectory(workspace), "handoffs", sha256(value.itemId));
+  const build = verifyBuildContext(workspace, path.join(directory, "build-contract.json"), path.join(directory, "build-report.json"));
+  if (!build.ok) throw new Error("model receipt requires a verified current staged build");
+  const attempt = loadReviewAttempt(workspace, value.itemId);
+  for (const key of ["itemId", "buildReportHash", "stagedTreeHash"]) {
+    if (value[key] !== attempt[key] || value[key] !== build[key]) throw new Error("model receipt candidate binding differs");
+  }
+  if (attempt.contractHash !== build.contractHash || attempt.sourceBinding !== undefined ||
+    value.reviewAttemptId !== attempt.reviewAttemptId || value.workflowHash !== workflow.workflowHash ||
+    value.agentSelector !== workflow.roles[value.role]) throw new Error("model receipt attempt or role binding differs");
+  const now = Date.now();
+  const issuedAt = Date.parse(attempt.issuedAt);
+  const observedAt = Date.parse(value.observedAt);
+  if (issuedAt > now + REVIEW_CLOCK_SKEW_MS || now - issuedAt > REVIEW_ATTEMPT_MAX_AGE_MS + REVIEW_CLOCK_SKEW_MS ||
+    observedAt < issuedAt - REVIEW_CLOCK_SKEW_MS || observedAt > now + REVIEW_CLOCK_SKEW_MS) {
+    throw new Error("model receipt observation or review attempt is not current");
+  }
+  const policy = workflow.reviewPolicy;
+  if (value.role === "reviewer" && ((policy.requiredModel && value.model !== policy.requiredModel) ||
+    (policy.requiredModelFamily && value.family !== policy.requiredModelFamily))) throw new Error("model receipt does not satisfy the reviewer policy");
+  return modelReceiptLocator(value.itemId, value.role);
+}
+
 function loadModelReceipt(workspace, review, workflow, role, attempt, now) {
   const identity = review.modelResolution[role];
   const expectedLocator = modelReceiptLocator(review.itemId, role);

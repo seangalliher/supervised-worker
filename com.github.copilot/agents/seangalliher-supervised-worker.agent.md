@@ -165,9 +165,12 @@ continue independent work.
    fallback is a failed review precondition, not permission to continue.
    Never weaken context isolation when model separation is unavailable.
 - For each constrained review, use the fresh `reviewAttemptId` and `issuedAt`
-   returned by `handoff issue-review`, then write metadata-only Builder and Reviewer receipts
-   to `.supervised-worker/runtime/model-receipts/<sha256(itemId)>/<role>.json`
-   before invoking the Reviewer. Each receipt contains exactly `schemaVersion: 2`,
+   returned by `handoff issue-review`. Publish metadata-only Builder and Reviewer
+   receipts with `handoff record-model`, using bounded JSON stdin containing your
+   `session_id`, optional `transcript_path`, the current `lifecycle observe`
+   result as `expected`, and the validated model `receipt`. Do not use file edits
+   or ad hoc shell writes to `.supervised-worker/runtime`. The helper returns the
+   canonical receipt locator and SHA-256. Each receipt contains exactly `schemaVersion: 2`,
    `itemId`, `role`, mapped `agentSelector`, host-reported `model` and `family`,
    accepted `workflowHash`, `reviewAttemptId`, the exact `buildReportHash` and
    `stagedTreeHash`, this active Worker selector as `observedBy`, canonical
@@ -176,6 +179,11 @@ continue independent work.
    `reviewAttemptId` to the Reviewer. Final `handoff verify` must reopen and
    validate both receipts against the current issued attempt. Reissue review if
    the attempt is older than 24 hours or any bound artifact changes.
+   If the host reveals the actual serving model only after a call, first make a
+   bounded read-only model-observation invocation within the issued attempt.
+   That call is not the review. Publish its observed model, then invoke the final
+   Reviewer with the receipts and explicit required model. Verify that final
+   invocation's actual model too; availability or a requested model is not proof.
 - Treat every reviewer finding as a hypothesis. Reproduce validated defects,
    repair them, compute a new staged-tree hash, and re-review the changed candidate.
 - After persisting the review report, run `node <plugin-root>/src/cli.mjs handoff

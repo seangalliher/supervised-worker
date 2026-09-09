@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -41,6 +42,28 @@ test("host model receipt passes schema and runtime validation", () => {
   const value = receipt();
   assert.equal(validate(value), true, ajv.errorsText(validate.errors));
   assert.deepEqual(validateModelReceiptValue(value), []);
+});
+
+test("model receipt CLI exposes a typed publisher instead of requiring protected file edits", () => {
+  const result = spawnSync(process.execPath, [path.join(root, "src", "cli.mjs"), "handoff", "record-model"], {
+    cwd: root, input: "{}", encoding: "utf8", timeout: 30000,
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 1);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.ok, false);
+  assert.equal(output.code, "MODEL_RECEIPT_INPUT_INVALID");
+});
+
+test("model receipt publisher rejects malformed duplicate-key and oversized CLI input", () => {
+  for (const input of ["", "null", "[]", '{"session_id":"one","session_id":"two"}', "x".repeat(8193)]) {
+    const result = spawnSync(process.execPath, [path.join(root, "src", "cli.mjs"), "handoff", "record-model"], {
+      cwd: root, input, encoding: "utf8", timeout: 30000,
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 1);
+    assert.equal(JSON.parse(result.stdout).code, "MODEL_RECEIPT_INPUT_INVALID");
+  }
 });
 
 test("host model receipt rejects untrusted provenance and malformed fields", () => {

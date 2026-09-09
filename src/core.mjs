@@ -22,7 +22,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { parseWorkflowJson, resolveWorkflowRoles, WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
-import { captureHandoffValidation } from "./handoff.mjs";
+import { captureHandoffValidation, requireModelReceiptPublication, validateModelReceiptValue } from "./handoff.mjs";
 import { requireVerifiedWorkerAuthority, verifyWorkerAuthority } from "./authority.mjs";
 
 export const STATE_DIRECTORY = ".supervised-worker";
@@ -117,6 +117,7 @@ export const CAMPAIGN_TRANSITIONS = Object.freeze({
   release: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed", "recovery-fenced"]),
   recover: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed", "recovery-fenced"]),
   doctor: Object.freeze(["active", "resumed"]),
+  "record-model": Object.freeze(["active", "resumed"]),
 });
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const PLAN_WRITER_MATCHER =
@@ -3569,6 +3570,19 @@ function checkpointFailure(reason) {
 }
 
 function requireSessionRequest(request, operation) {
+  if (operation === "record-model") {
+    const required = ["session_id", "expected", "receipt"];
+    const allowed = [...required, "transcript_path"];
+    if (!request || typeof request !== "object" || Array.isArray(request) ||
+      Object.keys(request).some((key) => !allowed.includes(key)) || !required.every((key) => Object.hasOwn(request, key)) ||
+      sessionHash(request) === null || typeof request.session_id !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(request.session_id) ||
+      (Object.hasOwn(request, "transcript_path") && (typeof request.transcript_path !== "string" || request.transcript_path.length > 4096)) ||
+      Buffer.byteLength(JSON.stringify(request)) > MAX_OBSERVATION_REQUEST_BYTES ||
+      validateTransition(request.expected, "observation").length > 0 || validateModelReceiptValue(request.receipt).length > 0) {
+      checkpointFailure("model receipt publication request is invalid");
+    }
+    return;
+  }
   if (operation === "release") {
     if (validateTransition(request, "releaseRequest").length > 0 ||
       Buffer.byteLength(JSON.stringify(request)) > MAX_CHECKPOINT_REQUEST_BYTES) checkpointFailure("release request is invalid");
@@ -4246,6 +4260,61 @@ export function applyCampaignPlan(cwd, request, authority) {
     }, journalGuard, requireGuards);
     return { schemaVersion: 1, kind: "campaign-transition-outcome", status: "applied", operation: "plan",
       previousHash: sha256(canonicalJson(request.expected)), observation };
+  });
+}
+
+export function recordModelReceipt(cwd, request, authority) {
+  requireSessionRequest(request, "record-model");
+  requireVerifiedWorkerAuthority(authority, cwd, request);
+  sessionRequestAuthorities.set(request, authority);
+  return withSessionLifecycle(cwd, request, "record-model", (root, input, _routing, requireGuards, journalGuard) => {
+    const snapshot = readAttachmentSnapshot(root);
+    const attachment = attachedRecord(root, input, undefined, snapshot);
+    if (attachment === null || attachment.status !== "active" || attachment.workerAuthorityHash !== authority.grantHash ||
+      request.receipt.sessionHash !== sessionHash(input) || request.receipt.host !== authority.host) {
+      checkpointFailure("model receipt publication requires the current owning Worker and host");
+    }
+    const validate = () => {
+      requireGuards();
+      requireAttachmentSnapshot(root, snapshot);
+      const plan = requireActivePlan(root, request.expected.planHash);
+      if (!plan.items.some((item) => item.id === request.receipt.itemId && item.status === "in_progress")) {
+        checkpointFailure("model receipt publication requires the current active item");
+      }
+      return requireModelReceiptPublication(root, request.receipt);
+    };
+    const locator = validate();
+    const target = path.join(root, ...locator.split("/"));
+    const bytes = Buffer.from(`${JSON.stringify(request.receipt, null, 2)}\n`);
+    assertSafeStatePath(root, target);
+    const prior = existsSync(target) ? readBoundedStateBytes(root, target, MAX_OBSERVATION_REQUEST_BYTES).bytes : null;
+    if (prior !== null && !prior.equals(bytes)) {
+      const value = parseWorkflowJson(prior);
+      if (validateModelReceiptValue(value).length > 0 || value.itemId !== request.receipt.itemId ||
+        value.role !== request.receipt.role || value.reviewAttemptId === request.receipt.reviewAttemptId) {
+        checkpointFailure("model receipt publication cannot replace conflicting evidence for the same attempt");
+      }
+    }
+    const beforePublish = () => {
+      validate();
+      if (prior === null ? existsSync(target) : !readBoundedStateBytes(root, target, MAX_OBSERVATION_REQUEST_BYTES).bytes.equals(prior)) {
+        checkpointFailure("model receipt publication target changed");
+      }
+    };
+    if (prior === null || !prior.equals(bytes)) {
+      if (prior !== null) {
+        const history = path.join(path.dirname(target), "history", `${sha256(prior)}.json`);
+        assertSafeStatePath(root, history);
+        if (existsSync(history)) {
+          if (!readBoundedStateBytes(root, history, MAX_OBSERVATION_REQUEST_BYTES).bytes.equals(prior)) checkpointFailure("model receipt history differs");
+        } else transitionWriteBytes(journalGuard, root, history, prior, MAX_OBSERVATION_REQUEST_BYTES, true, beforePublish);
+      }
+      transitionWriteBytes(journalGuard, root, target, bytes, MAX_OBSERVATION_REQUEST_BYTES, false, beforePublish);
+    }
+    validate();
+    if (!readBoundedStateBytes(root, target, MAX_OBSERVATION_REQUEST_BYTES).bytes.equals(bytes)) checkpointFailure("model receipt readback differs");
+    return { ok: true, status: "recorded", itemId: request.receipt.itemId, role: request.receipt.role,
+      locator, sha256: sha256(bytes), provenance: "worker-recorded", errors: [] };
   });
 }
 

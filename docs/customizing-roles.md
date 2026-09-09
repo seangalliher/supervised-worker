@@ -58,9 +58,17 @@ evidence supplied and checked by the Worker; it is not trusted self-attestation.
 After `handoff pre-review` passes, the Worker runs `handoff issue-review
 <contract> <build-report>`. The command atomically records a fresh current
 attempt under `.supervised-worker/runtime/review-attempts/`, bound to the exact
-contract, build report, and staged tree. Before invoking the Reviewer, the
-Worker writes one metadata-only receipt per role under
-`.supervised-worker/runtime/model-receipts/<sha256(itemId)>/{builder|reviewer}.json`.
+contract, build report, and staged tree. The owning Worker publishes one
+metadata-only receipt per role using `handoff record-model`. Its bounded JSON
+stdin contains `session_id`, optional `transcript_path`, the exact current
+`lifecycle observe` result as `expected`, and the model `receipt`. The helper
+requires the active item, current issued attempt and staged build, matching
+workflow/role/host/session bindings, and the configured reviewer model policy.
+It returns the canonical locator under
+`.supervised-worker/runtime/model-receipts/<sha256(itemId)>/{builder|reviewer}.json`
+and its SHA-256. Direct runtime file edits remain denied. Identical publication
+is idempotent; conflicting same-attempt evidence is rejected. Replacing a
+superseded attempt retains the old receipt by hash in the item's `history/`.
 Each receipt conforms to `schemas/model-receipt.schema.json` and binds the item,
 mapped selector, host-reported model and family, accepted workflow hash,
 fresh review-attempt UUID, build-report hash, staged-tree hash, observing Worker
@@ -70,6 +78,13 @@ verify` reopens the safe local receipt path, checks its hash and chronology, and
 compares every binding with the current issued attempt before allowing a clean
 verdict to advance. Attempts expire after 24 hours; timestamps may be at most
 five minutes ahead to tolerate clock skew.
+
+When the host exposes the actual serving model only after invocation, use a
+bounded read-only model-observation call within the issued attempt, publish
+that observation, and then invoke the final reviewer with both receipts. Verify
+the final invocation's serving model too. The observation call is not a review,
+and model availability or selection is not serving-model evidence. Publication
+validates Worker-recorded metadata; it does not independently attest the host.
 
 Resolve the effective map from the target repository:
 
