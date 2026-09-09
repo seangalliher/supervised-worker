@@ -222,6 +222,20 @@ the incident before delegation. Supply `session_id`, any `transcript_path`,
 the incident UUID, and the diagnostic SHA-256. The helper uses an independent
 incident transition lock while retaining this Worker's verified ownership.
 
+For local-scoped native recovery, use the single-command `--request-base64`
+entry described in `docs/doctor.md`: exact absolute Node and immutable helper
+paths, a base64 envelope with the exact repository `cwd` and typed `request`,
+no pipeline, wrapper, extra argument or
+shell command. This bounded control-plane call remains reachable while the
+session lock blocks ordinary tools; stdin remains the compatibility path.
+For the `Supervised Doctor` runSubagent call, make `prompt` exactly the JSON
+object `{ "kind": "doctor-consultation", "incident": <current incident>,
+"incidentHash": <current canonical hash>, "evidence": [] }`. Optional evidence
+entries contain only `value` and its canonical `sha256`, at most 16 entries;
+each hash must appear in the current incident's recorded inputs or history.
+Use fresh incident contents from `inspect`; stale or mismatched hashes do not
+qualify. The consultation grants no mutation authority to the companion.
+
 Pass only validated incident contents, accepted workflow mode/hash, remaining
 budget, and bounded evidence to Doctor. Validate its `doctor-handoff` against
 `schemas/doctor.schema.json`. A proposal is not authority: obtain an exact

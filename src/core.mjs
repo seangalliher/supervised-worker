@@ -24,6 +24,7 @@ import { performance } from "node:perf_hooks";
 import { parseWorkflowJson, resolveWorkflowRoles, WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
 import { captureHandoffValidation, requireModelReceiptPublication, validateModelReceiptValue } from "./handoff.mjs";
 import { requireVerifiedWorkerAuthority, verifyWorkerAuthority } from "./authority.mjs";
+import { doctorInvocationRequest } from "./doctor-invocation.mjs";
 
 export const STATE_DIRECTORY = ".supervised-worker";
 export const PLAN_FILE = "plan.json";
@@ -4350,6 +4351,14 @@ export function handlePluginHook(input, eventName, pluginRoot) {
     if (attachment.workerAuthorityHash !== authority.grantHash) throw new Error("attachment has no matching immutable Worker grant");
     requireOwningSessionCapability(capability, input);
     requireVerifiedWorkerAuthority(authority, capability.root, input);
+    const doctorNodePath = authority.assurance === "local-scoped"
+      ? parseWorkflowJson(readFileSync(path.join(pluginRoot, "install-record.json"))).nodePath : null;
+    if (authority.assurance === "local-scoped" && pathEquals(input.cwd, capability.root) &&
+      ["PreToolUse", "PostToolUse", "PostToolUseFailure"].includes(eventName) && doctorInvocationRequest(input, pluginRoot, doctorNodePath) !== null) {
+      requireVerifiedWorkerAuthority(authority, capability.root, input);
+      return eventName === "PreToolUse" ? preToolDecision(input, "allow",
+        "Exact immutable Doctor control-plane request admitted for the current Worker; its incident transaction enforces authority, capability, and recovery evidence. Ordinary tools remain subject to lifecycle exclusion.") : {};
+    }
     return handleHook(input, eventName, input.cwd, lifecycleEdit
       ? "Protected lifecycle files require their typed transition entry point; direct file edits are denied." : null, authority);
   } catch {

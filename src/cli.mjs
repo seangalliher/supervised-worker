@@ -416,8 +416,9 @@ async function main() {
       );
       return;
     }
-    const { routeDoctorFromHook } = await import("./doctor-routing.mjs");
-    process.stdout.write(`${JSON.stringify(routeDoctorFromHook(input, handlePluginHook(input, argument, root), root))}\n`);
+    const { routeDoctorConsultation, routeDoctorFromHook } = await import("./doctor-routing.mjs");
+    const consultation = routeDoctorConsultation(input, argument, root);
+    process.stdout.write(`${JSON.stringify(consultation ?? routeDoctorFromHook(input, handlePluginHook(input, argument, root), root))}\n`);
     return;
   }
   if (command === "observation" && argument === "retry-denied" && argumentsAfter.length === 0) {

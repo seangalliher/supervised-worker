@@ -27,6 +27,51 @@ identity, and typed record or hash. No arbitrary shell text or free-form target
 path crosses that boundary. The Doctor agent has no direct durable-state or
 shell tool; probes and mutations run through the Worker and dedicated executors.
 
+### Native Recovery Entry
+
+An ordinary terminal call is also subject to PreToolUse. A dead session lock
+therefore blocks a plain stdin invocation before the Doctor executor can run.
+The accepted `local-scoped` profile admits one narrowly formatted control-plane
+command without acquiring that session lock. It still revalidates the exact
+immutable source, workflow and owning session. The executor's existing independent
+incident transaction owns action reservations, capabilities, audit outcomes and
+exact dead-owner recovery; this path does not authorize ordinary tools or replay.
+
+Use the installation record's exact absolute Node path and the immutable
+`src/doctor-rescue.mjs` path, each single-quoted, followed by `--request-base64`
+and one single-quoted canonical base64 argument. Decode that argument as UTF-8
+JSON with exactly `cwd` (the absolute campaign root) and `request` (the usual
+typed Doctor request). The hook requires that root to match its owning workspace;
+the executor uses it independently of the terminal's current directory.
+PowerShell requires the leading
+`& `; POSIX shells do not. Escape an apostrophe inside a PowerShell argument as
+`''`, or inside a POSIX argument as `'\''`. No prefix command, pipeline, wrapper,
+redirection, environment override, extra argument or trailing command qualifies.
+The decoded envelope is bounded to 65,536 UTF-8 bytes; a host terminal may impose
+a smaller command-length limit. Requests use the same fields and operations as
+stdin and must carry the native hook's exact session and transcript. Base64 avoids
+JSON quote loss in Windows PowerShell 5.1 and is also accepted by PowerShell 7.
+Do not include raw prompts, credentials or opaque rescue capabilities in it.
+
+The named `Supervised Doctor` companion is reachable with a `runSubagent` prompt
+containing only a `doctor-consultation` JSON object: `kind`, the current `incident`,
+its canonical `incidentHash`, and `evidence`. Evidence is an array of at most 16
+objects with `value` and its canonical `sha256`; every hash must be recorded in
+the incident's inputs or committed history. The complete prompt is bounded to
+65,536 bytes. The hook reopens
+the current incident and requires the exact hash. This is a bounded diagnosis
+request, not a grant for the companion to mutate state or call arbitrary tools.
+Initial native setup must verify the intended installed Doctor has no shadow
+selector; this cooperative local profile does not attest host-wide agent identity.
+
+Doctor control-plane operations use their existing incident records instead of
+the ordinary tool journal. A request that fails before entering the executor's
+incident transaction has no plugin action receipt; retain the native host failure
+or mark that observation unavailable. A native hook allow is not an action outcome:
+reopen the Doctor result, retain recovery fences, and prove the next ordinary
+governed action succeeds. Lost or unknown mutating results are not replayed.
+Strict host-attested workflows and the stdin compatibility entry are unchanged.
+
 ## Incident State
 
 `schemas/doctor.schema.json` defines versioned incident, capability, step,

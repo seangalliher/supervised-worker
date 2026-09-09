@@ -2,6 +2,11 @@
 
 ## 0.1.2-alpha.1 - Unreleased
 
+- Add an owner-bound native Doctor control-plane entry for local-scoped recovery
+	when the ordinary session lock is dead. Admit only the exact immutable
+	root-bound `--request-base64` command or a current hash-bound Doctor consultation; retain
+	ordinary denial, independent incident transactions, capability checks and
+	unknown-effect non-replay. Keep stdin and strict-host compatibility unchanged.
 - Added `handoff record-model` for owner-checked model receipt publication.
 	Keep runtime file edits denied, bind publication to the current staged build
 	and issued review attempt, preserve superseded evidence, and retain the

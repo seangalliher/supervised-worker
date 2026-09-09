@@ -4,6 +4,7 @@ import path from "node:path";
 import { verifyWorkerAuthority } from "./authority.mjs";
 import { acceptDoctorHandoff, detectDoctorIncident, executeDoctorIntent, grantDoctorAction, inspectDoctorIncident } from "./doctor.mjs";
 import { requireDoctor } from "./doctor-state.mjs";
+import { parseDoctorEnvelope } from "./doctor-invocation.mjs";
 import { parseWorkflowJson } from "./workflow.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -38,15 +39,20 @@ export function handleDoctorRequest(cwd, request) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   let result;
   try {
-    if (process.argv.length !== 2) throw new Error("arguments are not accepted");
-    const chunks = [];
-    let bytes = 0;
-    for await (const chunk of process.stdin) {
-      bytes += chunk.length;
-      if (bytes > 65_536) throw new Error("request exceeds its bound");
-      chunks.push(chunk);
+    if (process.argv.length === 4 && process.argv[2] === "--request-base64") {
+      const envelope = parseDoctorEnvelope(process.argv[3]);
+      result = handleDoctorRequest(envelope.cwd, envelope.request);
+    } else {
+      if (process.argv.length !== 2) throw new Error("arguments are not accepted");
+      const chunks = [];
+      let bytes = 0;
+      for await (const chunk of process.stdin) {
+        bytes += chunk.length;
+        if (bytes > 65_536) throw new Error("request exceeds its bound");
+        chunks.push(chunk);
+      }
+      result = handleDoctorRequest(process.cwd(), parseWorkflowJson(Buffer.concat(chunks)));
     }
-    result = handleDoctorRequest(process.cwd(), parseWorkflowJson(Buffer.concat(chunks)));
   } catch {
     result = { status: "blocked", reason: "DOCTOR_REQUEST_INVALID" };
   }

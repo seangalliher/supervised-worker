@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +13,7 @@ import { requireVerifiedWorkerAuthority, verifyWorkerAuthority } from "../src/au
 import { applyCampaignPlan, canonicalPlanHash, checkpointSession, handlePluginHook, observeCampaignTransition, resumeSession, sha256 } from "../src/core.mjs";
 import { detectDoctorIncident, executeDoctorIntent, grantDoctorAction, inspectDoctorIncident } from "../src/doctor.mjs";
 import { doctorHash } from "../src/doctor-state.mjs";
+import { routeDoctorConsultation } from "../src/doctor-routing.mjs";
 import { installLocalPlugin } from "../src/install.mjs";
 import { acceptWorkflowRoles, resolveWorkflowRoles } from "../src/workflow.mjs";
 
@@ -104,6 +107,156 @@ function admitLocalFixture(fixture) {
     items: [{ id: "one", title: "One", status: "in_progress" }], completion: null };
   assert.equal(applyCampaignPlan(fixture.cwd, { ...request, expected: observeCampaignTransition(fixture.cwd, request), plan }, authority).status, "applied");
 }
+
+test("local native Doctor requests recover a dead session lock while ordinary tools remain denied", () => {
+  withLocalFixture((fixture) => {
+    admitLocalFixture(fixture);
+    const record = JSON.parse(readFileSync(path.join(fixture.installRoot, "install-record.json")));
+    const hookNode = process.platform === "win32" ? record.nodePath.toUpperCase() : record.nodePath;
+    if (process.platform === "win32") assert.notEqual(hookNode, record.nodePath, "Executable identity probe must use a different launch spelling");
+    const quote = (value) => `'${process.platform === "win32" ? value.replaceAll("'", "''") : value.replaceAll("'", "'\\''")}'`;
+    const helper = path.join(fixture.installRoot, "src", "doctor-rescue.mjs");
+    const requestBase = { session_id: fixture.input.session_id, transcript_path: fixture.input.transcript_path, incidentId: randomUUID() };
+    const hook = (command, overrides = {}, eventName = "PreToolUse", invocation = randomUUID()) => {
+      const input = { ...fixture.input, hook_event_name: eventName, tool_name: "run_in_terminal", tool_use_id: invocation,
+        tool_input: { command, mode: "sync" }, ...overrides };
+      const result = spawnSync(hookNode, [path.join(fixture.installRoot, "src", "hook-launcher.mjs"), eventName], {
+        cwd: fixture.cwd, input: JSON.stringify(input), encoding: "utf8", timeout: 30000,
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stderr);
+      return JSON.parse(result.stdout);
+    };
+    const commandFor = (request) => `${process.platform === "win32" ? "& " : ""}${quote(record.nodePath)} ${quote(helper)} --request-base64 ${quote(Buffer.from(JSON.stringify({ cwd: fixture.cwd, request })).toString("base64"))}`;
+    const healthy = hook("git status --short");
+    assert.notEqual(healthy.permissionDecision, "deny");
+    const ledgerFile = path.join(fixture.cwd, ".supervised-worker", "runs", `${sha256(fixture.input.session_id)}.jsonl`);
+    assert.ok(readFileSync(ledgerFile, "utf8").includes('"event":"tool_started"'), "Healthy premise must durably admit a tool");
+    const planPath = path.join(fixture.cwd, ".supervised-worker", "plan.json");
+    const attachmentPath = path.join(fixture.cwd, ".supervised-worker", "attachment.json");
+    const before = [readFileSync(planPath), readFileSync(attachmentPath)];
+    const child = spawnSync(record.nodePath, ["--eval", ""], { encoding: "utf8", timeout: 10000 });
+    assert.equal(child.status, 0);
+    assert.throws(() => process.kill(child.pid, 0), { code: "ESRCH" });
+    const lock = path.join(fixture.storage, "supervised-worker", "session-locks", sha256(fixture.input.session_id));
+    const token = randomUUID();
+    mkdirSync(lock);
+    const owner = JSON.stringify({ schemaVersion: 1, token, processId: child.pid, acquiredAt: new Date().toISOString() });
+    writeFileSync(path.join(lock, `${token}.json`), owner);
+    assert.equal(hook("git status --short").permissionDecision, "deny");
+    const doctor = (operation, parameters = {}) => {
+      const request = { ...requestBase, operation, ...parameters };
+      const invocation = randomUUID();
+      const permission = hook(commandFor(request), {}, "PreToolUse", invocation);
+      assert.equal(permission.permissionDecision, "allow", JSON.stringify(permission));
+      const shell = process.platform === "win32" ? path.join(process.env.SystemRoot, "System32/WindowsPowerShell/v1.0/powershell.exe") : "/bin/sh";
+      const args = process.platform === "win32" ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", commandFor(request)] : ["-c", commandFor(request)];
+      const result = spawnSync(shell, args, {
+        cwd: fixture.base, encoding: "utf8", timeout: 30000,
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, result.stdout || result.stderr);
+      assert.deepEqual(hook(commandFor(request), { tool_result: { exitCode: result.status } }, "PostToolUse", invocation), {});
+      return JSON.parse(result.stdout);
+    };
+    const detected = doctor("detect", { diagnosticHash: "a".repeat(64) });
+    const consultation = { kind: "doctor-consultation", incident: detected.incident, incidentHash: detected.hash, evidence: [] };
+    const consultationInput = { tool_name: "runSubagent", tool_input: { agentName: "Supervised Doctor",
+      prompt: JSON.stringify(consultation), description: "Diagnose the bounded fixture incident" } };
+    const consultationInvocation = randomUUID();
+    assert.equal(hook(null, consultationInput, "PreToolUse", consultationInvocation).permissionDecision, "allow");
+    assert.deepEqual(hook(null, consultationInput, "PostToolUse", consultationInvocation), {});
+    const execute = (action, inputHashes = []) => {
+      const current = doctor("inspect");
+      const grant = doctor("grant", { grant: { action, actionId: randomUUID(), expectedHash: current.hash } });
+      return doctor("execute", { intent: { schemaVersion: 1, kind: "doctor-repair-intent", binding: current.incident.binding,
+        attemptId: current.incident.attemptId, actionId: grant.capability.actionId, action,
+        capabilityHash: grant.hash, expectedHash: current.hash, inputHashes } });
+    };
+    const inspected = execute("inspect");
+    assert.equal(inspected.status, "succeeded");
+    assert.ok(inspected.values.some((value) => value.diagnostics.some((entry) => entry.scope === "session" && entry.code === "LIFECYCLE_OWNER_DEAD")));
+    const recovered = execute("recover", inspected.outcome.outputHashes);
+    assert.equal(recovered.status, "succeeded", JSON.stringify(recovered));
+    assert.equal(existsSync(lock), false);
+    assert.equal(readFileSync(path.join(`${lock}.${token}.recovered`, `${token}.json`), "utf8"), owner);
+    assert.deepEqual([readFileSync(planPath), readFileSync(attachmentPath)], before);
+    const startsBefore = readFileSync(ledgerFile, "utf8").split("\n").filter((line) => line.includes('"event":"tool_started"')).length;
+    assert.notEqual(hook("git status --short").permissionDecision, "deny");
+    const startsAfter = readFileSync(ledgerFile, "utf8").split("\n").filter((line) => line.includes('"event":"tool_started"')).length;
+    assert.equal(startsAfter, startsBefore + 1, "Recovery must reach the next governed consumer");
+    assert.equal(readFileSync(ledgerFile, "utf8").split("\n").filter(Boolean).map(JSON.parse)
+      .filter((entry) => entry.event === "tool_completed" && entry.operationId === null).length, 0,
+    "Unchanged Doctor Pre/Post payloads must not create unpaired ordinary completions");
+  });
+});
+
+test("local Doctor consultation rejects unbound evidence, wrong agents, sessions and stale incident state", (context) => {
+  withLocalFixture((fixture) => {
+    admitLocalFixture(fixture);
+    const authority = verifyWorkerAuthority(fixture.cwd, fixture.input, fixture.installRoot, "");
+    const incidentId = randomUUID();
+    const value = { detail: "Bounded diagnostic observation" };
+    const detected = detectDoctorIncident(fixture.cwd, fixture.input, incidentId, doctorHash(value), authority);
+    const request = { kind: "doctor-consultation", incident: detected.incident, incidentHash: detected.hash,
+      evidence: [{ value, sha256: doctorHash(value) }] };
+    const input = { ...fixture.input, hook_event_name: "PreToolUse", tool_name: "runSubagent",
+      tool_input: { agentName: "Supervised Doctor", description: "Fixture diagnosis", prompt: JSON.stringify(request) } };
+    const route = (candidate, event = "PreToolUse") => routeDoctorConsultation(candidate, event, fixture.installRoot);
+    assert.equal(route(input).permissionDecision, "allow");
+    assert.equal(route({ ...fixture.input, toolName: "RUNSUBAGENT", toolArgs: input.tool_input }).permissionDecision, "allow");
+    assert.equal(route({ ...fixture.input, toolName: "functions.runSubagent", toolArgs: input.tool_input, toolInput: {} }).permissionDecision, "allow");
+    let rejectedRootReads = 0;
+    const originalRealpath = fs.realpathSync;
+    const unsafeRoots = process.platform === "win32" ? ["relative", "\\\\unavailable.invalid\\share"] : ["relative"];
+    const pathKey = (value) => path.resolve(String(value)).replace(/[\\/]+$/, "").toLowerCase();
+    const unsafeKeys = unsafeRoots.map(pathKey);
+    const inspectRealpath = (original) => (value, ...options) => {
+      const candidate = pathKey(value);
+      if (unsafeKeys.some((unsafe) => candidate === unsafe || candidate.startsWith(`${unsafe}${path.sep}`))) {
+        rejectedRootReads += 1;
+        throw new Error("Rejected root must not reach filesystem traversal");
+      }
+      return original(value, ...options);
+    };
+    if (typeof fs.realpathSync.native === "function") context.mock.method(fs.realpathSync, "native", inspectRealpath(fs.realpathSync.native));
+    context.mock.method(fs, "realpathSync", inspectRealpath(originalRealpath));
+    syncBuiltinESMExports();
+    try {
+      for (const cwd of unsafeRoots) assert.throws(() => fs.realpathSync(path.resolve(cwd)), /Rejected root/);
+      assert.equal(rejectedRootReads, unsafeRoots.length, "Positive control must detect normalized unsafe-root traversal");
+      if (typeof fs.realpathSync.native === "function") {
+        assert.throws(() => fs.realpathSync.native(path.resolve(unsafeRoots[0])), /Rejected root/);
+        assert.equal(rejectedRootReads, unsafeRoots.length + 1);
+      }
+      rejectedRootReads = 0;
+      for (const cwd of unsafeRoots) assert.equal(route({ ...input, cwd }), null);
+      assert.equal(rejectedRootReads, 0);
+    } finally {
+      context.mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+    assert.deepEqual(route(input, "PostToolUse"), {});
+    assert.equal(route(input, "Stop"), null);
+    assert.equal(route({ ...input, tool_name: "run_in_terminal" }), null);
+    assert.equal(route({ ...input, session_id: "another-worker" }), null);
+    for (const parameters of [
+      { ...input.tool_input, agentName: "Builder" }, { ...input.tool_input, tools: ["execute"] },
+      { ...input.tool_input, prompt: "plain unbound text" }, { ...input.tool_input, prompt: " ".repeat(65537) },
+      { ...input.tool_input, prompt: JSON.stringify({ ...request, incidentHash: "b".repeat(64) }) },
+      { ...input.tool_input, prompt: JSON.stringify({ ...request, evidence: [{ value, sha256: "b".repeat(64) }] }) },
+      { ...input.tool_input, prompt: JSON.stringify({ ...request, evidence: [{ value: { unrelated: true }, sha256: doctorHash({ unrelated: true }) }] }) },
+      { ...input.tool_input, prompt: JSON.stringify({ ...request, evidence: new Array(17).fill(request.evidence[0]) }) },
+      { ...input.tool_input, prompt: JSON.stringify({ ...request, arbitrary: true }) },
+      { ...input.tool_input, prompt: JSON.stringify({ ...request, incident: {} }) },
+    ]) assert.equal(route({ ...input, tool_input: parameters }), null);
+    const grant = grantDoctorAction(fixture.cwd, fixture.input, incidentId, { action: "inspect", actionId: randomUUID(), expectedHash: detected.hash }, authority);
+    assert.equal(executeDoctorIntent(fixture.cwd, fixture.input, { schemaVersion: 1, kind: "doctor-repair-intent",
+      binding: detected.incident.binding, attemptId: detected.incident.attemptId, actionId: grant.capability.actionId,
+      action: "inspect", capabilityHash: grant.hash, expectedHash: detected.hash, inputHashes: [] }, authority).status, "succeeded");
+    assert.equal(route(input), null, "Old hash-bound consultation cannot represent the new incident revision");
+  });
+});
 
 test("local hooks wait for a live peer beyond the legacy overlap window without losing starts", async () => {
   await withLocalFixture(async (fixture) => {

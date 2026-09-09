@@ -190,5 +190,8 @@ test("Doctor is an on-demand reasoning role with no durable-state or shell autho
   for (const id of ["seangalliher-supervised-worker", "supervised-worker"]) {
     assert.match(readAgent(id).body, /invoke `Supervised Doctor`/);
     assert.match(readAgent(id).body, /src\/doctor-rescue\.mjs/);
+    assert.match(readAgent(id).body, /--request-base64/);
+    assert.match(readAgent(id).body, /doctor-consultation/);
   }
+  assert.match(doctor.body, /rather than calling tools/);
 });
