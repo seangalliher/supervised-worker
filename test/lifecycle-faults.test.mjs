@@ -518,10 +518,11 @@ for (const checkpointFirst of [true, false]) {
           const boundary = await first.waitFor("held");
           assert.equal(boundary.record.event, ${checkpointFirst} ? "checkpoint_persisted" : "tool_completed");
           const second = startHookChild(${checkpointFirst} ? tool : checkpointInput,
-            ${checkpointFirst} ? "PostToolUse" : "checkpoint");
+            ${checkpointFirst} ? "PostToolUse" : "checkpoint", null, true);
           assert.equal((await second.waitFor("contended")).scope, "journal");
           first.release();
           const firstResult = await first.finish(null);
+          second.release();
           const secondResult = await second.finish(null);
           const checkpoint = (${checkpointFirst} ? firstResult : secondResult).output;
           assert.equal(checkpoint.status, "checkpointed");
