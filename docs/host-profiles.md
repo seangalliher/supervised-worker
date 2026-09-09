@@ -103,6 +103,14 @@ verification rather than treating local host facts as provider seals.
 
 ## Evidence And Release
 
+During the Windows-first Copilot-local canary, routine push and pull-request CI
+runs on Windows with Node 20, 22 and 24. The `ci` workflow's manual `full` profile
+and all tag runs retain Windows, macOS and Linux. This temporary validation scope
+was explicitly approved; it does not establish cross-platform release readiness.
+Public release and strict Doctor promotion still require the complete nine-job
+matrix on the exact candidate commit. Neither their validators nor the protected
+workflow's review and test requirements are relaxed by this CI scheduling choice.
+
 Local and strict admission are separate from receipt trust. The canonical receipt
 continues to grant no permissions or Stop authority; provider/model observations
 remain recorded/unavailable as specified. A verified local plan or accepted workflow

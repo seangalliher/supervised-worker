@@ -2,6 +2,10 @@
 
 ## 0.1.2-alpha.1 - Unreleased
 
+- Scope routine CI to Windows on Node 20, 22 and 24 during the Windows-first
+	Copilot-local canary. Keep the complete cross-platform matrix for tags and
+	explicit `full` workflow dispatch; strict promotion and public release gates
+	continue to require all nine jobs.
 - Declare the Worker's native delegation tool set and verify tool/model
 	prerequisites before admission; required model selectors must be explicit.
 - Let local-scoped hooks share one bounded acquisition wait across lock scopes:
