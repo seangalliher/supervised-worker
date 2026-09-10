@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import {
+  chmodSync,
+  closeSync,
   existsSync,
   linkSync,
   lstatSync,
   mkdtempSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -2646,6 +2649,134 @@ test("ownerless recovery preserves unknown operations and never repeats a side e
   assert.throws(() => resumeSession(cwd, { ...next, session_id: "stealing-owner" }), { transitionCode: "CAMPAIGN_COMPARE_AND_SET_CONFLICT" });
   assert.deepEqual(readFileSync(attachmentFile), ownerBefore);
 });
+
+test("ownerless recovery carries prior unknown operations through checkpoint and next resume", () => {
+  const { cwd, source, request, attachmentFile, ledgerFile } = checkpointFixture();
+  const input = { ...source, tool_name: "Bash", tool_use_id: "prior-outcome-unknown", tool_input: { command: "fixture-effect" } };
+  assert.deepEqual(handleHook(input, "PreToolUse"), {});
+  const sideEffect = path.join(cwd, "side-effect.txt");
+  writeFileSync(sideEffect, "performed once\n", { flag: "wx" });
+  const orphans = summarizePlan(cwd).operations.orphans;
+  assert.equal(orphans.length, 1);
+  let stopped;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    stopped = handleHook({ ...source, stop_hook_active: attempt > 0 }, "Stop");
+    if (stopped.decision === "allow") break;
+    assert.equal(stopped.decision, "block");
+  }
+  assert.equal(stopped.decision, "allow");
+  assert.equal(existsSync(attachmentFile), false);
+  const originalLedger = readFileSync(ledgerFile);
+  const planBytes = readFileSync(planPath(cwd));
+  const next = { session_id: "ownerless-checkpoint-successor", planHash: request.planHash, checkpointHash: null };
+  const recovered = resumeSession(cwd, next);
+  assert.equal(recovered.status, "resumed");
+  assert.equal(recovered.context.operations.status, "observed");
+  assert.deepEqual(recovered.context.operations.orphans, orphans);
+  const checkpoint = checkpointSession(cwd, { session_id: next.session_id, planHash: next.planHash,
+    attachmentHash: sha256(readFileSync(attachmentFile)) });
+  assert.equal(checkpoint.status, "checkpointed");
+  assert.equal(checkpoint.context.operations.status, "observed");
+  assert.deepEqual(checkpoint.context.operations.orphans, orphans);
+  const final = resumeSession(cwd, { session_id: "ownerless-checkpoint-final", planHash: next.planHash,
+    checkpointHash: checkpoint.checkpointHash });
+  assert.deepEqual(final.context.operations.orphans, orphans);
+  assert.deepEqual(summarizePlan(cwd).operations.orphans, orphans);
+  assert.deepEqual(readFileSync(ledgerFile), originalLedger);
+  assert.deepEqual(readFileSync(planPath(cwd)), planBytes);
+  assert.equal(readFileSync(sideEffect, "utf8"), "performed once\n");
+});
+
+for (const history of ["empty", "mixed", "unavailable"]) {
+  test(`ownerless checkpoint preserves ${history} operation history without double counting`, () => {
+    const { cwd, source, request, attachmentFile, ledgerFile } = checkpointFixture();
+    if (history === "mixed") {
+      assert.deepEqual(handleHook({ ...source, tool_name: "Bash", tool_use_id: "old-unknown",
+        tool_input: { command: "old fixture action" } }, "PreToolUse"), {});
+    }
+    assert.equal(releaseAttachment(cwd).released, true);
+    if (history === "unavailable") writeFileSync(ledgerFile, Buffer.concat([readFileSync(ledgerFile), Buffer.from("{partial")]));
+    const originalLedger = readFileSync(ledgerFile);
+    const next = { session_id: `ownerless-${history}-successor`, planHash: request.planHash, checkpointHash: null };
+    assert.equal(resumeSession(cwd, next).status, "resumed");
+    const tool = { cwd, ...next, tool_name: "Read", tool_use_id: "successor-read", tool_input: {} };
+    assert.deepEqual(handleHook(tool, "PreToolUse"), {});
+    assert.deepEqual(handleHook(tool, "PostToolUse"), {});
+    if (history === "mixed") {
+      assert.deepEqual(handleHook({ ...tool, tool_name: "Bash", tool_use_id: "new-unknown" }, "PreToolUse"), {});
+      assert.deepEqual(handleHook({ ...tool, tool_use_id: undefined }, "PostToolUse"), {});
+    }
+    const before = summarizePlan(cwd).operations;
+    assert.equal(before.status, history === "unavailable" ? "unavailable" : "observed");
+    if (history !== "unavailable") {
+      assert.equal(before.orphans.length, history === "mixed" ? 2 : 0);
+      assert.equal(before.uncorrelatedCompletions, history === "mixed" ? 1 : 0);
+    }
+    const checkpoint = checkpointSession(cwd, { session_id: next.session_id, planHash: request.planHash,
+      attachmentHash: sha256(readFileSync(attachmentFile)) });
+    assert.equal(checkpoint.context.operations.status, before.status);
+    assert.equal(checkpoint.context.operations.reason, before.reason);
+    assert.deepEqual(checkpoint.context.operations.orphans, before.orphans);
+    assert.equal(checkpoint.context.operations.uncorrelatedCompletions, before.uncorrelatedCompletions);
+    const final = resumeSession(cwd, { session_id: `ownerless-${history}-final`, planHash: request.planHash,
+      checkpointHash: checkpoint.checkpointHash });
+    assert.equal(final.context.operations.status, before.status);
+    assert.equal(final.context.operations.reason, before.reason);
+    assert.deepEqual(final.context.operations.orphans, before.orphans);
+    assert.equal(final.context.operations.uncorrelatedCompletions, before.uncorrelatedCompletions);
+    assert.deepEqual(readFileSync(ledgerFile), originalLedger);
+  });
+}
+
+  test("ownerless checkpoint reads preserved read-only historical journals", { skip: process.platform !== "win32" }, () => {
+    const { cwd, source, request, attachmentFile, ledgerFile } = checkpointFixture();
+    assert.deepEqual(handleHook({ ...source, tool_name: "Bash", tool_use_id: "read-only-history-orphan",
+      tool_input: { command: "fixture action" } }, "PreToolUse"), {});
+    const orphans = summarizePlan(cwd).operations.orphans;
+    assert.equal(orphans.length, 1);
+    assert.equal(releaseAttachment(cwd).released, true);
+    const next = { session_id: "read-only-history-successor", planHash: request.planHash, checkpointHash: null };
+    assert.equal(resumeSession(cwd, next).status, "resumed");
+    const original = readFileSync(ledgerFile);
+    const originalMode = lstatSync(ledgerFile).mode;
+    try {
+      chmodSync(ledgerFile, 0o444);
+      closeSync(openSync(ledgerFile, "r"));
+      assert.throws(() => {
+        const descriptor = openSync(ledgerFile, "r+");
+        closeSync(descriptor);
+      }, "The fixture must reject write-mode access to the historical journal");
+      assert.equal(summarizePlan(cwd).operations.status, "observed");
+      const checkpoint = checkpointSession(cwd, { session_id: next.session_id, planHash: request.planHash,
+        attachmentHash: sha256(readFileSync(attachmentFile)) });
+      assert.equal(checkpoint.status, "checkpointed");
+      assert.deepEqual(checkpoint.context.operations.orphans, orphans);
+      assert.deepEqual(readFileSync(ledgerFile), original);
+    } finally {
+      chmodSync(ledgerFile, originalMode);
+    }
+  });
+
+  test("receiptless checkpoint agrees with status for an existing historical orphan", () => {
+    const { cwd, request, attachmentFile, ledgerFile } = checkpointFixture();
+    const foreignHash = sha256("historical-owner-without-receipt");
+    const observedStart = JSON.parse(readFileSync(ledgerFile, "utf8").trimEnd().split("\n")[0]);
+    const historical = { ...observedStart, session: foreignHash,
+      operationId: "12121212-1212-4121-8121-121212121212", invocationHash: sha256("historical-invocation") };
+    const historicalBytes = Buffer.from(`${JSON.stringify(historical)}\n`);
+    const historicalPath = path.join(cwd, ".supervised-worker", "runs", `${foreignHash}.jsonl`);
+    writeFileSync(historicalPath, historicalBytes);
+    assert.equal(JSON.parse(readFileSync(attachmentFile)).checkpointHash, null);
+    assert.equal(readFileSync(ledgerFile, "utf8").includes('"checkpoint_resumed"'), false,
+      "A fresh receiptless owner must not need a matching old resume or route record");
+    const before = summarizePlan(cwd).operations;
+    assert.equal(before.status, "observed");
+    assert.equal(before.orphans.length, 1);
+    assert.equal(before.orphans[0].operationId, historical.operationId);
+    const checkpoint = checkpointSession(cwd, request);
+    assert.deepEqual(checkpoint.context.operations, before);
+    assert.deepEqual(readFileSync(historicalPath), historicalBytes);
+  });
 
 test("missing ledger observation is unavailable rather than a verified empty orphan list", () => {
   const cwd = workspace();

@@ -495,6 +495,24 @@ confirmation fails. A known-stale owner must be handled with the separately
 authorized, snapshot-bound `release` operation. Neither SessionStart nor
 PreCompact initiates this process.
 
+When a session has no inherited checkpoint receipt, its next checkpoint observes
+the complete bounded journal set, as status does. This preserves prior-session
+unknown operations after ownerless recovery even if a legacy route was migrated.
+The current session journal is flushed before its watermark is captured;
+historical journals are opened read-only for that checkpoint. Ownerless resume
+retains its existing flush and revalidation of the prior journals. Valid unknown
+operations and uncorrelated completion counts are carried without double counting;
+unavailable history remains explicitly unavailable.
+
+Journal capacity is finite: 1 MiB per session file, 16 MiB across the runs root,
+and at most 256 files. Recovery does not truncate or rotate history and does not
+raise those limits. After a bounded Stop has released ownership, a verified fresh
+session can use ownerless resume and a new journal if the existing history and
+aggregate limits permit it. This is recovery, not automatic capacity prevention.
+If combined orphan references exceed the checkpoint's 256-reference bound, the
+checkpoint fails rather than silently dropping references. Capacity handoff and
+unknown-outcome reconciliation require separately governed work.
+
 Receipt, flush, or pre-detachment event failure leaves the original attachment
 and route authoritative. After tombstone publication, a route-cleanup failure
 is unconfirmed, not an active source or a completed release; the same source

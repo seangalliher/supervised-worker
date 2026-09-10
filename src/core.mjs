@@ -4064,12 +4064,15 @@ export function checkpointSession(cwd, request, authority = undefined) {
       requireCheckpointLedger(root, previous, attachment.checkpointHash, journalGuard);
       inherited = previous.context.operations;
     }
+    const operations = attachment.checkpointHash === null
+      ? allSessionOperations(root, journalGuard, false)
+      : ledger.exists ? inspectOperations(ledger.records, inherited) : unavailableOperations("ledger-absent");
     const receipt = {
       schemaVersion: 1, kind: "session-checkpoint", checkpointId: randomUUID(), createdAt: new Date().toISOString(),
       planHash: request.planHash, sessionHash: attachment.sessionHash,
       routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration, attachmentHash: snapshot.hash,
       ledgerPosition: { path: `runs/${attachment.sessionHash}.jsonl`, byteOffset: ledger.bytes.length, recordCount: ledger.records.length, prefixHash: sha256(ledger.bytes) },
-      context: checkpointContext(plan, readStopSnapshot(root, attachment.sessionHash), ledger.exists ? inspectOperations(ledger.records, inherited) : unavailableOperations("ledger-absent")),
+      context: checkpointContext(plan, readStopSnapshot(root, attachment.sessionHash), operations),
     };
     if (validateCheckpoint(receipt).length > 0) checkpointFailure("checkpoint context exceeds its typed artifact limits");
     const bytes = Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`);
@@ -4116,17 +4119,19 @@ function restoreStopSnapshot(cwd, input, state, journalGuard) {
   transitionWriteBytes(journalGuard, cwd, filePath, Buffer.from(`${JSON.stringify(state, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES);
 }
 
-function ownerlessContext(cwd, plan, journalGuard) {
+function allSessionOperations(cwd, journalGuard, flush = true) {
   const ledger = summarizeRunLedgerHeld(cwd, journalGuard);
-  let operations;
   if (ledger.status !== "available") {
-    operations = unavailableOperations(ledger.reason === "run-ledger-absent" ? "ledger-absent" : "ledger-invalid");
-  } else {
-    const directory = path.join(stateDirectory(cwd), "runs");
-    const records = readdirSync(directory).sort().flatMap((name) => readSessionLedger(cwd, name.slice(0, 64), journalGuard, true).records);
-    if (summarizeRunLedgerHeld(cwd, journalGuard).hash !== ledger.hash) checkpointFailure("ownerless recovery ledger changed while observing it");
-    operations = inspectOperations(records);
+    return unavailableOperations(ledger.reason === "run-ledger-absent" ? "ledger-absent" : "ledger-invalid");
   }
+  const directory = path.join(stateDirectory(cwd), "runs");
+  const records = readdirSync(directory).sort().flatMap((name) => readSessionLedger(cwd, name.slice(0, 64), journalGuard, flush).records);
+  if (summarizeRunLedgerHeld(cwd, journalGuard).hash !== ledger.hash) checkpointFailure("ownerless recovery ledger changed while observing it");
+  return inspectOperations(records);
+}
+
+function ownerlessContext(cwd, plan, journalGuard) {
+  const operations = allSessionOperations(cwd, journalGuard);
   const states = new Map();
   const runtimeDirectory = path.join(stateDirectory(cwd), "runtime");
   assertSafeStatePath(cwd, runtimeDirectory);
