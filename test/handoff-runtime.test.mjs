@@ -26,9 +26,11 @@ import {
   directoryIdentityMatches,
   inspectHandoffFile,
   issueReviewAttempt,
+  resolveCommittedCandidate,
   validateHandoffValue,
   validateRepositoryPath,
   verifyBuildHandoff,
+  verifyCommittedHandoffChain,
   verifyHandoffChain,
 } from "../src/handoff.mjs";
 import { acceptWorkflowRoles, DEFAULT_ROLES, resolveWorkflowRoles } from "../src/workflow.mjs";
@@ -389,6 +391,214 @@ test("runtime validates and hash-binds a complete staged handoff chain", () => {
     assert.equal(result.ok, true, result.errors.join("\n"));
     assert.equal(result.verdict, "clean");
     assert.equal(result.stagedTreeHash, git(cwd, "write-tree"));
+  });
+});
+
+test("committed pre-review validates the tested HEAD without restaging its changes", () => {
+  withFixture((fixture) => {
+    git(fixture.cwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false",
+      "commit", "--quiet", "--allow-empty", "--only", "-m", "baseline");
+    const baseCommit = git(fixture.cwd, "rev-parse", "HEAD");
+    assert.equal(verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath).ok, true);
+    git(fixture.cwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false",
+      "commit", "--quiet", "-m", "tested candidate");
+    const commit = git(fixture.cwd, "rev-parse", "HEAD");
+    assert.equal(git(fixture.cwd, "rev-parse", `${commit}^1`), baseCommit);
+    const tree = git(fixture.cwd, "write-tree");
+    const reportBytes = readFileSync(fixture.buildPath);
+    assert.equal(git(fixture.cwd, "diff", "--cached", "--name-only"), "", "The regression requires an empty post-commit index diff");
+    assert.equal(verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath).ok, false, "Staged mode must not silently switch candidates");
+    const result = spawnSync(process.execPath, [cli, "handoff", "pre-review", fixture.contractPath, fixture.buildPath, "--committed", commit],
+      { cwd: fixture.cwd, encoding: "utf8", timeout: 30_000 });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const verified = JSON.parse(result.stdout);
+    assert.equal(verified.ok, true, verified.errors.join("\n"));
+    assert.equal(verified.stagedTreeHash, tree);
+    assert.equal(git(fixture.cwd, "rev-parse", "HEAD"), commit);
+    assert.equal(git(fixture.cwd, "diff", "--cached", "--name-only"), "");
+    assert.deepEqual(readFileSync(fixture.buildPath), reportBytes);
+  });
+});
+
+function commitFixtureCandidate(fixture) {
+  git(fixture.cwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false",
+    "commit", "--quiet", "--allow-empty", "--only", "-m", "baseline");
+  git(fixture.cwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false",
+    "commit", "--quiet", "-m", "tested candidate");
+  return resolveCommittedCandidate(fixture.cwd, git(fixture.cwd, "rev-parse", "HEAD"));
+}
+
+for (const mutation of ["abbreviated", "commit", "tree", "parent", "extra-key", "index", "unstaged", "untracked", "build", "contract"]) {
+  test(`committed review rejects ${mutation} drift without issuing a new attempt`, () => {
+    withFixture((fixture) => {
+      const candidate = commitFixtureCandidate(fixture);
+      const baseline = verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath, null, candidate);
+      assert.equal(baseline.ok, true, baseline.errors.join("\n"));
+      const attemptPath = path.join(fixture.cwd, fixture.attempt.locator);
+      const previous = readFileSync(attemptPath);
+      if (mutation === "abbreviated") candidate.commit = candidate.commit.slice(0, 12);
+      if (mutation === "commit") candidate.commit = candidate.baseCommit;
+      if (mutation === "tree") candidate.tree = "f".repeat(40);
+      if (mutation === "parent") candidate.baseCommit = candidate.commit;
+      if (mutation === "extra-key") candidate.ref = "refs/heads/main";
+      if (mutation === "index" || mutation === "unstaged") {
+        writeFileSync(path.join(fixture.cwd, "src", "module.js"), "export const value = 99;\n");
+        if (mutation === "index") {
+          git(fixture.cwd, "add", "src/module.js");
+          fixture.build.testedTreeHash = git(fixture.cwd, "write-tree");
+          assert.notEqual(fixture.build.testedTreeHash, candidate.tree);
+          writeJson(fixture.buildPath, fixture.build);
+        }
+      }
+      if (mutation === "untracked") writeFileSync(path.join(fixture.cwd, "unexpected.txt"), "untracked\n");
+      if (mutation === "build") {
+        fixture.build.changedFiles = [];
+        writeJson(fixture.buildPath, fixture.build);
+      }
+      if (mutation === "contract") fs.appendFileSync(fixture.contractPath, "\n");
+      const rejected = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath, null, candidate);
+      assert.equal(rejected.ok, false, `The ${mutation} mutation must invalidate the candidate`);
+      if (mutation === "index") assert.ok(rejected.errors.includes("Git index does not match the committed candidate tree"));
+      assert.deepEqual(readFileSync(attemptPath), previous);
+    });
+  });
+}
+
+test("committed review rejects root commits and malformed CLI candidate arguments", () => {
+  withFixture((fixture) => {
+    git(fixture.cwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false",
+      "commit", "--quiet", "-m", "root candidate");
+    const commit = git(fixture.cwd, "rev-parse", "HEAD");
+    for (const tail of [["--committed", commit], ["--committed", commit.slice(0, 12)], ["--committed"], ["--committed", commit, "extra"]]) {
+      const result = spawnSync(process.execPath, [cli, "handoff", "pre-review", fixture.contractPath, fixture.buildPath, ...tail],
+        { cwd: fixture.cwd, encoding: "utf8", timeout: 30_000 });
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.equal(JSON.parse(result.stdout).ok, false);
+    }
+    assert.equal(git(fixture.cwd, "rev-parse", "HEAD"), commit);
+  });
+});
+
+test("committed model publication rejects a rewritten same-tree HEAD and preserves prior receipts", () => {
+  withFixture((fixture) => {
+    const context = modelPublicationFixture(fixture);
+    const candidate = commitFixtureCandidate(fixture);
+    const attempt = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath, null, candidate);
+    assert.equal(attempt.ok, true, attempt.errors.join("\n"));
+    context.request.receipt.reviewAttemptId = attempt.reviewAttemptId;
+    context.request.receipt.observedAt = new Date().toISOString();
+    const published = recordModelReceipt(fixture.cwd, context.request, context.runtime.authority());
+    assert.equal(published.ok, true);
+    const previous = readFileSync(context.target);
+    git(fixture.cwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false",
+      "commit", "--quiet", "--amend", "-m", "rewritten candidate");
+    assert.notEqual(git(fixture.cwd, "rev-parse", "HEAD"), candidate.commit);
+    assert.equal(git(fixture.cwd, "rev-parse", "HEAD^{tree}"), candidate.tree, "The stale attempt must face an identical tree");
+    assert.throws(() => recordModelReceipt(fixture.cwd, context.request, context.runtime.authority()), (error) => {
+      assert.match(error.message, /record-model could not confirm its local lifecycle state/);
+      assert.match(error.cause?.message ?? "", /verified current build candidate/);
+      return true;
+    });
+    assert.deepEqual(readFileSync(context.target), previous);
+  });
+});
+
+for (const mutation of ["deleted", "null", "extra-key", "missing-tree", "abbreviated", "repair-context", "wrong-parent", "missing-mode", "wrong-mode", "legacy-version", "legacy-downgrade"]) {
+  test(`committed model publication rejects ${mutation} attempt context`, () => {
+    withFixture((fixture) => {
+      const context = modelPublicationFixture(fixture);
+      const candidate = commitFixtureCandidate(fixture);
+      const attempt = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath, null, candidate);
+      assert.equal(attempt.ok, true, attempt.errors.join("\n"));
+      context.request.receipt.reviewAttemptId = attempt.reviewAttemptId;
+      context.request.receipt.observedAt = new Date().toISOString();
+      if (!["deleted", "legacy-downgrade"].includes(mutation)) assert.equal(recordModelReceipt(fixture.cwd, context.request, context.runtime.authority()).ok, true);
+      const previous = readFileSync(context.target);
+      const attemptPath = path.join(fixture.cwd, attempt.locator);
+      const changed = JSON.parse(readFileSync(attemptPath));
+      if (["deleted", "legacy-downgrade"].includes(mutation)) {
+        delete changed.committedCandidate;
+        if (mutation === "legacy-downgrade") {
+          delete changed.mode;
+          changed.schemaVersion = 1;
+        }
+        assert.equal(Object.hasOwn(changed, "committedCandidate"), false);
+        git(fixture.cwd, "reset", "--soft", candidate.baseCommit);
+        assert.notEqual(git(fixture.cwd, "rev-parse", "HEAD"), candidate.commit);
+        assert.equal(git(fixture.cwd, "write-tree"), candidate.tree);
+        assert.equal(verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath).ok, true,
+          "The altered fixture must pass staged validation so only the committed-attempt guard discriminates");
+      }
+      if (mutation === "null") changed.committedCandidate = null;
+      if (mutation === "extra-key") changed.committedCandidate.ref = "refs/heads/main";
+      if (mutation === "missing-tree") delete changed.committedCandidate.tree;
+      if (mutation === "abbreviated") changed.committedCandidate.commit = candidate.commit.slice(0, 12);
+      if (mutation === "repair-context") changed.sourceBinding = "a".repeat(64);
+      if (mutation === "wrong-parent") changed.committedCandidate.baseCommit = candidate.commit;
+      if (mutation === "missing-mode") delete changed.mode;
+      if (mutation === "wrong-mode") changed.mode = "staged";
+      if (mutation === "legacy-version") changed.schemaVersion = 1;
+      writeJson(attemptPath, changed);
+      assert.throws(() => recordModelReceipt(fixture.cwd, context.request, context.runtime.authority()),
+        (error) => {
+          assert.match(error.message, /record-model could not confirm its local lifecycle state/);
+          assert.match(error.cause?.message ?? "",
+            mutation === "wrong-parent" ? /verified current build candidate/ :
+              mutation === "repair-context" ? /sourceBinding does not match its mode/ :
+                mutation === "missing-mode" ? /review attempt mode is invalid/ :
+                  mutation === "legacy-version" ? /unknown property/ :
+                    mutation === "legacy-downgrade" ? /fresh version 2 review attempt/ : /committedCandidate is invalid/);
+          return true;
+        });
+      assert.deepEqual(readFileSync(context.target), previous);
+    });
+  });
+}
+
+test("committed review refuses a simultaneous repair source context", () => {
+  withFixture((fixture) => {
+    const candidate = commitFixtureCandidate(fixture);
+    assert.equal(verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath, null, candidate).ok, true);
+    const result = verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath,
+      { sourceRoot: fixture.cwd, baseCommit: candidate.baseCommit }, candidate);
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.includes("Git staged state could not be verified: source-context"));
+  });
+});
+
+test("explicit committed verification rejects a staged attempt without breaking historical compilation", () => {
+  withFixture((fixture) => {
+    const candidate = commitFixtureCandidate(fixture);
+    assert.equal(verifyBuildHandoff(fixture.cwd, fixture.contractPath, fixture.buildPath, null, candidate).ok, true);
+    const result = verifyHandoffChain(fixture.cwd, fixture.contractPath, fixture.buildPath, fixture.reviewPath, null, candidate);
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.includes("explicit committed verification requires a committed-mode review attempt"));
+    const historical = verifyCommittedHandoffChain(fixture.cwd, fixture.contractPath, fixture.buildPath, fixture.reviewPath, candidate);
+    assert.equal(historical.ok, true, historical.errors.join("\n"));
+  });
+});
+
+test("legacy attempts require reissuance before new model receipt publication", () => {
+  withFixture((fixture) => {
+    const context = modelPublicationFixture(fixture);
+    const attemptPath = path.join(fixture.cwd, context.attempt.locator);
+    const legacy = JSON.parse(readFileSync(attemptPath));
+    legacy.schemaVersion = 1;
+    delete legacy.mode;
+    writeJson(attemptPath, legacy);
+    const previous = readFileSync(context.target);
+    assert.throws(() => recordModelReceipt(fixture.cwd, context.request, context.runtime.authority()), (error) => {
+      assert.match(error.cause?.message ?? "", /fresh version 2 review attempt; reissue review/);
+      return true;
+    });
+    assert.deepEqual(readFileSync(context.target), previous);
+    const attempt = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath);
+    assert.equal(attempt.ok, true, attempt.errors.join("\n"));
+    assert.equal(attempt.schemaVersion, 2);
+    assert.notEqual(attempt.reviewAttemptId, legacy.reviewAttemptId);
+    context.request.receipt.reviewAttemptId = attempt.reviewAttemptId;
+    context.request.receipt.observedAt = new Date().toISOString();
+    assert.equal(recordModelReceipt(fixture.cwd, context.request, context.runtime.authority()).ok, true);
   });
 });
 

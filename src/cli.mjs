@@ -35,6 +35,7 @@ import { inspectGitHubQueue, validateGitHubQueueObservation } from "./github-que
 import {
   inspectHandoffFile,
   issueReviewAttempt,
+  resolveCommittedCandidate,
   verifyBuildHandoff,
   verifyHandoffChain,
 } from "./handoff.mjs";
@@ -653,6 +654,16 @@ async function main() {
           };
         }
       }
+    } else if (["pre-review", "issue-review", "verify"].includes(argument) &&
+      argumentsAfter.length === (argument === "verify" ? 5 : 4) && argumentsAfter.at(-2) === "--committed") {
+      try {
+        const candidate = resolveCommittedCandidate(process.cwd(), argumentsAfter.at(-1));
+        const files = argumentsAfter.slice(0, -2);
+        const operation = { "pre-review": verifyBuildHandoff, "issue-review": issueReviewAttempt, verify: verifyHandoffChain }[argument];
+        report = operation(process.cwd(), ...files, null, candidate);
+      } catch {
+        report = { ok: false, errors: ["Committed review requires the current HEAD's full object ID and an available first parent."] };
+      }
     } else if (argument === "pre-review" && argumentsAfter.length === 2) {
       report = verifyBuildHandoff(process.cwd(), ...argumentsAfter);
     } else if (argument === "issue-review" && argumentsAfter.length === 2) {
@@ -663,7 +674,7 @@ async function main() {
       report = {
         ok: false,
         errors: [
-          "Usage: handoff validate <artifact> [--observe] | handoff pre-review <contract> <build-report> | handoff issue-review <contract> <build-report> | handoff record-model | handoff verify <contract> <build-report> <review-report>",
+          "Usage: handoff validate <artifact> [--observe] | handoff pre-review <contract> <build-report> [--committed <commit>] | handoff issue-review <contract> <build-report> [--committed <commit>] | handoff record-model | handoff verify <contract> <build-report> <review-report> [--committed <commit>]",
         ],
       };
     }

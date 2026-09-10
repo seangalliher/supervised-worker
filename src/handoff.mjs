@@ -632,9 +632,19 @@ function reviewAttemptLocator(itemId) {
 function validateReviewAttemptValue(value) {
   const errors = [];
   if (!requiredKeys(value, [...REVIEW_ATTEMPT_KEYS], "review attempt", errors)) return errors;
-  unknownKeys(value, new Set([...REVIEW_ATTEMPT_KEYS, "sourceBinding"]), "review attempt", errors);
+  unknownKeys(value, new Set([...REVIEW_ATTEMPT_KEYS, "sourceBinding",
+    ...(value.schemaVersion === 2 ? ["mode", "committedCandidate"] : [])]), "review attempt", errors);
   if (value.sourceBinding !== undefined && !HASH_RE.test(value.sourceBinding ?? "")) errors.push("review attempt sourceBinding is invalid");
-  if (value.schemaVersion !== 1) errors.push("review attempt schemaVersion must be 1");
+  if (value.schemaVersion === 2) {
+    if (!["staged", "repair", "committed"].includes(value.mode)) errors.push("review attempt mode is invalid");
+    if (value.mode === "committed" ? !validCommittedCandidate(value.committedCandidate) : Object.hasOwn(value, "committedCandidate")) {
+      errors.push("review attempt committedCandidate is invalid");
+    }
+    if (value.mode === "repair" ? !HASH_RE.test(value.sourceBinding ?? "") : Object.hasOwn(value, "sourceBinding")) {
+      errors.push("review attempt sourceBinding does not match its mode");
+    }
+  }
+  if (![1, 2].includes(value.schemaVersion)) errors.push("review attempt schemaVersion must be 1 or 2");
   if (!nonBlank(value.itemId)) errors.push("review attempt itemId must be non-empty");
   if (
     typeof value.reviewAttemptId !== "string" ||
@@ -715,9 +725,11 @@ export function requireModelReceiptPublication(workspace, value) {
   const workflow = resolveWorkflowRoles(workspace, { requireAcceptance: true });
   if (!workflow.ok || (workflow.configured && !workflow.accepted)) throw new Error("model receipt workflow is not accepted");
   const directory = path.join(stateDirectory(workspace), "handoffs", sha256(value.itemId));
-  const build = verifyBuildContext(workspace, path.join(directory, "build-contract.json"), path.join(directory, "build-report.json"));
-  if (!build.ok) throw new Error("model receipt requires a verified current staged build");
   const attempt = loadReviewAttempt(workspace, value.itemId);
+  if (attempt.schemaVersion !== 2) throw new Error("model receipt publication requires a fresh version 2 review attempt; reissue review before publishing");
+  const build = verifyBuildContext(workspace, path.join(directory, "build-contract.json"), path.join(directory, "build-report.json"),
+    null, attempt.committedCandidate ?? null);
+  if (!build.ok) throw new Error("model receipt requires a verified current build candidate");
   for (const key of ["itemId", "buildReportHash", "stagedTreeHash"]) {
     if (value[key] !== attempt[key] || value[key] !== build[key]) throw new Error("model receipt candidate binding differs");
   }
@@ -1156,6 +1168,25 @@ function gitPaths(workspace, args) {
   return output.toString("utf8").split("\0").filter(Boolean).map((value) => value.replaceAll("\\", "/"));
 }
 
+function validCommittedCandidate(candidate) {
+  return isRecord(candidate) && Object.keys(candidate).sort().join(",") === "baseCommit,commit,tree" &&
+    [candidate.commit, candidate.tree, candidate.baseCommit].every((value) => typeof value === "string" && TREE_HASH_RE.test(value));
+}
+
+export function resolveCommittedCandidate(workspace, commit) {
+  if (typeof commit !== "string" || !TREE_HASH_RE.test(commit) ||
+    runGit(workspace, ["rev-parse", "HEAD"], "utf8").trim() !== commit) {
+    throw new Error("committed candidate must identify the current HEAD by its full object ID");
+  }
+  const candidate = {
+    commit,
+    tree: runGit(workspace, ["rev-parse", `${commit}^{tree}`], "utf8").trim(),
+    baseCommit: runGit(workspace, ["rev-parse", `${commit}^1`], "utf8").trim(),
+  };
+  if (!validCommittedCandidate(candidate)) throw new Error("committed candidate parent or tree is unavailable");
+  return candidate;
+}
+
 function verifyBuildContext(workspace, contractPath, buildReportPath, source = null, committed = null) {
   const errors = [];
   let contract;
@@ -1196,6 +1227,12 @@ function verifyBuildContext(workspace, contractPath, buildReportPath, source = n
   let sourceBinding = null;
   let gitPhase = "source-context";
   try {
+    if (committed !== null) {
+      if (source !== null || !validCommittedCandidate(committed)) throw new Error("invalid committed candidate context");
+      const current = resolveCommittedCandidate(workspace, committed.commit);
+      if (current.tree !== committed.tree || current.baseCommit !== committed.baseCommit) throw new Error("committed candidate changed");
+      source = { sourceRoot: workspace, baseCommit: current.baseCommit };
+    }
     let sourceRoot = workspace;
     if (source !== null) {
       if (!isRecord(source) || Object.keys(source).sort().join(",") !== "baseCommit,sourceRoot" ||
@@ -1218,6 +1255,9 @@ function verifyBuildContext(workspace, contractPath, buildReportPath, source = n
     }
     gitPhase = "write-tree";
     stagedTreeHash = runGit(sourceRoot, ["write-tree"], "utf8").trim();
+    if (committed !== null && stagedTreeHash !== committed.tree) {
+      errors.push("Git index does not match the committed candidate tree");
+    }
     if (build.value.testedTreeHash !== stagedTreeHash) {
       errors.push("build report testedTreeHash does not match the current Git index");
     }
@@ -1262,14 +1302,15 @@ function verifyBuildContext(workspace, contractPath, buildReportPath, source = n
     buildReportHash: build.hash,
     stagedTreeHash,
     sourceBinding,
+    committedCandidate: committed,
     errors,
     contract,
     build,
   };
 }
 
-export function verifyBuildHandoff(workspace, contractPath, buildReportPath, source = null) {
-  const result = verifyBuildContext(workspace, contractPath, buildReportPath, source);
+export function verifyBuildHandoff(workspace, contractPath, buildReportPath, source = null, committed = null) {
+  const result = verifyBuildContext(workspace, contractPath, buildReportPath, source, committed);
   return {
     ok: result.ok,
     itemId: result.itemId ?? null,
@@ -1280,8 +1321,8 @@ export function verifyBuildHandoff(workspace, contractPath, buildReportPath, sou
   };
 }
 
-export function issueReviewAttempt(workspace, contractPath, buildReportPath, source = null) {
-  const result = verifyBuildContext(workspace, contractPath, buildReportPath, source);
+export function issueReviewAttempt(workspace, contractPath, buildReportPath, source = null, committed = null) {
+  const result = verifyBuildContext(workspace, contractPath, buildReportPath, source, committed);
   if (!result.ok) {
     return {
       ok: false,
@@ -1296,7 +1337,8 @@ export function issueReviewAttempt(workspace, contractPath, buildReportPath, sou
     };
   }
   const attempt = {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    mode: result.committedCandidate !== null ? "committed" : result.sourceBinding !== null ? "repair" : "staged",
     itemId: result.itemId,
     reviewAttemptId: randomUUID(),
     issuedAt: new Date().toISOString(),
@@ -1304,6 +1346,7 @@ export function issueReviewAttempt(workspace, contractPath, buildReportPath, sou
     buildReportHash: result.buildReportHash,
     stagedTreeHash: result.stagedTreeHash,
     ...(result.sourceBinding === null ? {} : { sourceBinding: result.sourceBinding }),
+    ...(result.committedCandidate === null ? {} : { committedCandidate: result.committedCandidate }),
   };
   const locator = reviewAttemptLocator(result.itemId);
   try {
@@ -1318,25 +1361,25 @@ export function issueReviewAttempt(workspace, contractPath, buildReportPath, sou
   return { ok: true, ...attempt, locator, errors: [] };
 }
 
-export function verifyHandoffChain(workspace, contractPath, buildReportPath, reviewReportPath, source = null) {
-  return verifyHandoffContext(workspace, contractPath, buildReportPath, reviewReportPath, source);
+export function verifyHandoffChain(workspace, contractPath, buildReportPath, reviewReportPath, source = null, committed = null) {
+  return verifyHandoffContext(workspace, contractPath, buildReportPath, reviewReportPath, source, committed);
 }
 
 export function verifyCommittedHandoffChain(workspace, contractPath, buildReportPath, reviewReportPath, candidate) {
-  if (!candidate || !TREE_HASH_RE.test(candidate.commit ?? "") || !TREE_HASH_RE.test(candidate.tree ?? "") ||
-    !TREE_HASH_RE.test(candidate.baseCommit ?? "")) return { ok: false, errors: ["committed candidate is invalid"] };
+  if (!validCommittedCandidate({ commit: candidate?.commit, tree: candidate?.tree, baseCommit: candidate?.baseCommit })) {
+    return { ok: false, errors: ["committed candidate is invalid"] };
+  }
   try {
     runGit(workspace, ["merge-base", "--is-ancestor", candidate.baseCommit, candidate.commit], "utf8");
-    const parent = runGit(workspace, ["rev-parse", `${candidate.commit}^1`], "utf8").trim();
-    if (!TREE_HASH_RE.test(parent)) return { ok: false, errors: ["reviewed item parent is unavailable"] };
-    return verifyHandoffContext(workspace, contractPath, buildReportPath, reviewReportPath,
-      { sourceRoot: workspace, baseCommit: parent }, candidate);
+    const current = resolveCommittedCandidate(workspace, candidate.commit);
+    if (current.tree !== candidate.tree) return { ok: false, errors: ["committed candidate tree changed"] };
+    return verifyHandoffContext(workspace, contractPath, buildReportPath, reviewReportPath, null, current, true);
   } catch {
     return { ok: false, errors: ["committed item ancestry is unavailable"] };
   }
 }
 
-function verifyHandoffContext(workspace, contractPath, buildReportPath, reviewReportPath, source = null, committed = null) {
+function verifyHandoffContext(workspace, contractPath, buildReportPath, reviewReportPath, source = null, committed = null, allowStagedCommit = false) {
   const buildContext = verifyBuildContext(workspace, contractPath, buildReportPath, source, committed);
   const errors = [...buildContext.errors];
   let review;
@@ -1374,6 +1417,13 @@ function verifyHandoffContext(workspace, contractPath, buildReportPath, reviewRe
     try {
       attempt = loadReviewAttempt(workspace, review.value.itemId);
       if ((attempt.sourceBinding ?? null) !== buildContext.sourceBinding) errors.push("review attempt source binding does not match the repair worktree and base");
+      if (committed !== null && !allowStagedCommit && attempt.mode !== "committed") {
+        errors.push("explicit committed verification requires a committed-mode review attempt");
+      }
+      if (attempt.committedCandidate !== undefined &&
+        ["commit", "tree", "baseCommit"].some((key) => attempt.committedCandidate[key] !== buildContext.committedCandidate?.[key])) {
+        errors.push("review attempt committed candidate does not match the current candidate");
+      }
       if (attempt.itemId !== review.value.itemId) {
         errors.push("review attempt itemId does not match the review report");
       }

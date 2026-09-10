@@ -33,6 +33,49 @@ the existing review flow. Omitting its artifacts produces no item-completion
 evidence and must not be used to represent that item as complete. A root commit
 without a first parent cannot carry this item-diff handoff evidence.
 
+## Review After A Committed-HEAD Gate
+
+When the repository's canonical gate requires a committed candidate, preserve
+that exact commit and use the explicit committed form of all three commands:
+
+```text
+node <immutable-plugin-root>/src/cli.mjs handoff pre-review <contract> <build-report> --committed <full-commit-id>
+node <immutable-plugin-root>/src/cli.mjs handoff issue-review <contract> <build-report> --committed <full-commit-id>
+node <immutable-plugin-root>/src/cli.mjs handoff verify <contract> <build-report> <review-report> --committed <full-commit-id>
+```
+
+The ID must be the current HEAD, with a first parent. The index must equal its
+tree, the worktree must be clean, and the report's changed files must exactly
+match the commit's first-parent diff. These commands do not restage changes,
+rewrite reports, move HEAD, or replace independent review or gate evidence.
+Without the option, staged-review behavior is unchanged; an empty staged diff
+never silently selects a committed candidate.
+
+New attempts use schema version 2 with a required `mode`: `staged`, `repair`,
+or `committed`. Committed mode requires a closed `committedCandidate` containing
+the commit, tree, and immediate parent (`baseCommit`); deleting it is invalid,
+not a switch to staged mode. Repair mode instead requires its source binding,
+and staged mode carries neither context. The existing `handoff
+record-model` request does not change: the owning Worker publishes both model
+receipts against that issued context. Publication and final verification reject
+changed candidate identities, even if a replacement commit has the same tree.
+The release compiler distinguishes the item's immediate parent from its manifest's
+campaign ancestry base. Explicit `verify --committed` requires a committed-mode
+attempt. The compiler also accepts completed staged-review evidence for the
+existing review-before-commit workflow; that evidence does not retroactively
+acquire a commit-identity binding.
+
+Legacy version 1 attempts and their completed evidence remain readable and
+compilable. New model-receipt publication requires version 2: reissue any unfinished
+legacy review attempt, observe both models afresh and perform a fresh independent
+review. An old attempt is not upgraded in place. Use committed mode when reviewing
+an already-committed HEAD. Existing expiry, role, workflow and model requirements
+remain in force. These are consistency controls within cooperative local
+governance, not external attestation of a mutable history or protection against
+arbitrary rewrites by another process running as the same OS user.
+
+## Artifact Capture
+
 Each supplied artifact has a role, locator, and SHA-256. The plan uses its fixed
 location; handoffs, checkpoints, and model receipts use their existing canonical
 locations. Metadata observations live at

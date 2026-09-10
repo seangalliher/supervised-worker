@@ -7,10 +7,9 @@ import path from "node:path";
 import test from "node:test";
 
 import { compileCampaignRelease, compileOpenedCampaignRelease, renderCampaignReleaseMarkdown, serializeCampaignRelease, validateCompiledRelease } from "../src/campaign-release.mjs";
-import { canonicalPlanHash, sha256 } from "../src/core.mjs";
+import { canonicalPlanHash, observeCampaignTransition, sha256 } from "../src/core.mjs";
 import { detectDoctorIncident } from "../src/doctor.mjs";
 import { doctorGit } from "../src/doctor-repair.mjs";
-import { issueReviewAttempt } from "../src/handoff.mjs";
 import { acceptWorkflowRoles, DEFAULT_ROLES, resolveWorkflowRoles } from "../src/workflow.mjs";
 import { observeReleaseDoctorInventory } from "../src/release-inputs.mjs";
 import { createWorkerAuthorityFixture } from "./worker-authority-fixture.mjs";
@@ -101,8 +100,9 @@ test("complete measured timings stay separate and incomplete observations become
   });
 });
 
-test("post-commit handoff compilation binds model evidence and separates item from campaign completion", () => {
-  fixture(({ root, input, authority, manifest, plan }) => {
+for (const reviewMode of ["legacy-staged", "staged", "committed"]) {
+test(`${reviewMode} handoff compilation binds published model evidence and separates item from campaign completion`, () => {
+  fixture(({ root, input, authority, worker, manifest, plan }) => {
     writeFileSync(path.join(root, "earlier-item.txt"), "a previously completed item\n");
     doctorGit(root, ["add", "earlier-item.txt"]);
     doctorGit(root, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false", "commit", "-m", "earlier item"]);
@@ -126,28 +126,58 @@ test("post-commit handoff compilation binds model evidence and separates item fr
     const build = { ...load("build-report"), itemId, contractHash: contractReference.sha256, testedTreeHash: tree, changedFiles: contract.targetFiles,
       checks: [...contract.focusedChecks, contract.broadGate].map((command) => ({ command, outcome: "passed", evidence: { kind: "test-output", locator: "fixture:check" } })) };
     const buildReference = save("build-report", build);
-    const attempt = issueReviewAttempt(root, path.join(root, contractReference.locator), path.join(root, buildReference.locator));
+    const itemParent = doctorGit(root, ["rev-parse", "HEAD"]).trim();
+    const commitCandidate = () => {
+      doctorGit(root, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false", "commit", "-m", "reviewed candidate"]);
+      manifest.candidate.commit = doctorGit(root, ["rev-parse", "HEAD"]).trim();
+      manifest.candidate.tree = tree;
+    };
+    if (reviewMode === "committed") commitCandidate();
+    const modeArguments = reviewMode === "committed" ? ["--committed", manifest.candidate.commit] : [];
+    const runHandoff = (args, request) => {
+      const result = spawnSync(process.execPath, [path.join(worker.installRoot, "src", "cli.mjs"), "handoff", ...args], {
+        cwd: root, env: { ...process.env, SUPERVISED_WORKER_HOST_AUTHORITY: worker.inventoryPath },
+        input: request === undefined ? undefined : JSON.stringify(request), encoding: "utf8", timeout: 30_000,
+      });
+      assert.equal(result.status, 0, result.stdout || result.stderr);
+      return JSON.parse(result.stdout);
+    };
+    const paths = [path.join(root, contractReference.locator), path.join(root, buildReference.locator)];
+    assert.equal(runHandoff(["pre-review", ...paths, ...modeArguments]).ok, true);
+    const attempt = runHandoff(["issue-review", ...paths, ...modeArguments]);
     assert.equal(attempt.ok, true, attempt.errors.join("\n"));
+    assert.equal(attempt.schemaVersion, 2);
+    assert.equal(attempt.mode, reviewMode === "committed" ? "committed" : "staged");
+    assert.deepEqual(attempt.committedCandidate, reviewMode === "committed"
+      ? { commit: manifest.candidate.commit, tree, baseCommit: itemParent } : undefined);
     const review = { ...load("review-report"), itemId, contractHash: contractReference.sha256, buildReportHash: buildReference.sha256,
       stagedTreeHash: tree, reviewAttemptId: attempt.reviewAttemptId, createdAt: attempt.issuedAt, consumers: contract.consumers };
     const modelReferences = [];
     for (const role of ["builder", "reviewer"]) {
-      const locator = `.supervised-worker/runtime/model-receipts/${sha256(itemId)}/${role}.json`;
       const value = { schemaVersion: 2, itemId, role, agentSelector: DEFAULT_ROLES[role], model: review.modelResolution[role].model,
         family: review.modelResolution[role].family, workflowHash: null, reviewAttemptId: attempt.reviewAttemptId,
         buildReportHash: buildReference.sha256, stagedTreeHash: tree, observedBy: "supervised-worker:seangalliher-supervised-worker",
-        observedAt: attempt.issuedAt, host: "copilot-cli", sessionHash: "a".repeat(64), source: "host" };
-      const bytes = Buffer.from(JSON.stringify(value));
-      mkdirSync(path.dirname(path.join(root, locator)), { recursive: true });
-      writeFileSync(path.join(root, locator), bytes);
-      const reference = { locator, sha256: sha256(bytes) };
+        observedAt: new Date().toISOString(), host: "vscode", sessionHash: sha256(input.session_id), source: "host" };
+      const publication = runHandoff(["record-model"], { ...input, expected: observeCampaignTransition(root, input), receipt: value });
+      assert.equal(publication.ok, true);
+      assert.equal(publication.provenance, "worker-recorded");
+      const reference = { locator: publication.locator, sha256: publication.sha256 };
+      assert.equal(sha256(readFileSync(path.join(root, reference.locator))), reference.sha256);
       review.modelResolution[role].evidence = { kind: "host-model", ...reference };
       modelReferences.push({ role: `model-${role}`, reference });
     }
+    review.createdAt = new Date().toISOString();
     const reviewReference = save("review-report", review);
-    doctorGit(root, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false", "commit", "-m", "reviewed candidate"]);
-    manifest.candidate.commit = doctorGit(root, ["rev-parse", "HEAD"]).trim();
-    manifest.candidate.tree = tree;
+    if (reviewMode === "legacy-staged") {
+      const attemptPath = path.join(root, attempt.locator);
+      const legacy = JSON.parse(readFileSync(attemptPath));
+      legacy.schemaVersion = 1;
+      delete legacy.mode;
+      writeFileSync(attemptPath, JSON.stringify(legacy));
+    }
+    assert.equal(runHandoff(["verify", ...paths, path.join(root, reviewReference.locator), ...modeArguments]).ok, true);
+    if (reviewMode !== "committed") commitCandidate();
+    assert.equal(doctorGit(root, ["diff", "--cached", "--name-only"]).trim(), "");
     plan.items[0].status = "banked";
     const bytes = Buffer.from(JSON.stringify(plan));
     writeFileSync(path.join(root, ".supervised-worker", "plan.json"), bytes);
@@ -166,6 +196,15 @@ test("post-commit handoff compilation binds model evidence and separates item fr
     assert.throws(() => compileCampaignRelease(root, input, manifest, authority), /RELEASE_HANDOFF_VERIFICATION_FAILED/, "expired item evidence must fail rather than be silently dropped");
     writeFileSync(attemptPath, attemptBytes);
     assert.doesNotThrow(() => compileCampaignRelease(root, input, manifest, authority));
+    if (reviewMode === "committed") {
+      doctorGit(root, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false", "commit", "--amend", "-m", "same tree, different commit"]);
+      const rewritten = doctorGit(root, ["rev-parse", "HEAD"]).trim();
+      assert.notEqual(rewritten, manifest.candidate.commit);
+      assert.equal(doctorGit(root, ["rev-parse", "HEAD^{tree}"]).trim(), tree);
+      manifest.candidate.commit = rewritten;
+      assert.throws(() => compileCampaignRelease(root, input, manifest, authority), /RELEASE_HANDOFF_VERIFICATION_FAILED/);
+      return;
+    }
     writeFileSync(path.join(root, modelReferences[0].reference.locator), "{}");
     assert.throws(() => compileCampaignRelease(root, input, manifest, authority), /ARTIFACT_CHANGED/);
   });
@@ -277,3 +316,4 @@ test("recovery evidence is inventoried without Doctor and cannot become recorded
     assert.throws(() => compileCampaignRelease(root, input, manifest, authority), /INVENTORY_CHANGED/);
   });
 });
+}

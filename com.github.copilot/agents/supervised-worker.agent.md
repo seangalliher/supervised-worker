@@ -148,7 +148,8 @@ continue independent work.
    selector as `producedBy`, then validate, persist, and hash it.
 - Stage only approved paths, freeze the candidate, and compute its staged-tree
   hash. Run every `focusedChecks` command and the contract's `broadGate` against
-  that unchanged staged tree. The final implemented build report must include
+   that unchanged candidate tree, following repository-required gate ordering.
+   The final implemented build report must include
   every required command as passed and set `testedTreeHash` to that exact tree.
   Run `handoff pre-review <contract> <build-report>` and require its hashes,
    test-tree binding, and staged path checks to pass. Run `handoff issue-review
@@ -156,6 +157,12 @@ continue independent work.
    the effective `reviewer` role with that receipt, a rendered staged diff, the
    validated build contract and its hash, the validated build report and its hash,
    the staged-tree hash, claimed behavior, and named production consumers.
+   If the canonical gate requires committed HEAD, complete any required independent
+   pre-commit review, commit the frozen tree once, and run that gate. Append
+   `--committed <full-commit-id>` to `handoff pre-review`, `handoff issue-review`,
+   and `handoff verify`, and supply the commit's first-parent diff to formal review.
+   The fresh attempt binds the exact commit, tree and parent. Never move HEAD,
+   restage committed changes, or rewrite reports to satisfy staged-only checks.
 - Prefer a reviewer model from a different family than the Builder when the host
    supports that choice. When the accepted workflow defines a reviewer model
    policy, record host-reported Builder and Reviewer model IDs, families, and

@@ -97,6 +97,16 @@ The chain verifier compares exact workflow and file-byte hashes, item IDs, consu
 `changedFiles` against `targetFiles`, staged paths, unstaged drift, and the
 review report's tree hash against the current Git index.
 
+For a repository whose canonical gate requires committed HEAD, follow its required
+pre-commit review and commit ordering, then run the gate on that unchanged commit.
+Append `--committed <full-commit-id>` to `handoff pre-review`, `handoff issue-review`
+and `handoff verify`. This mode requires current HEAD and index equality and
+checks changed files against the immediate parent. Its fresh review attempt binds
+the commit, tree and parent; `handoff record-model` uses that issued context without
+a request-format change. Give the reviewer the first-parent diff. Never move HEAD,
+restage the commit, alter the build report to hide its changed files, or treat the
+gate as a substitute for formal independent review.
+
 ## Item Lifecycle
 
 1. **Admit:** Prove the item belongs to the authorized queue and its dependencies
@@ -107,8 +117,8 @@ review report's tree hash against the current Git index.
   Architect for structural decisions and hash the approved build contract.
 4. **Build:** Give one approved contract to the resolved Builder, or implement
    a simple local contract directly. Keep one bounded implementation surface active.
-5. **Validate:** Freeze the staged tree; run every focused check and the broad
-   gate against that tree; record `testedTreeHash`; require `handoff pre-review`
+5. **Validate:** Freeze the candidate tree; run every focused check and the broad
+  gate in repository-required order; record `testedTreeHash`; require `handoff pre-review`
   to pass; run the resolved Reviewer; then require final `handoff verify`.
    A repair changes the tree and invalidates the gates and review.
 6. **Bank:** Bind evidence to the exact commit, push target, issue, and closure
