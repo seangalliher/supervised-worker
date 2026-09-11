@@ -149,7 +149,8 @@ test("local campaign receipt deterministically summarizes a valid plan and empty
   }
 });
 
-test("checkpoint producers cross ledger, campaign export, validation, and reconciliation without leaking details", () => {
+for (const version of [1, 2]) {
+test(`checkpoint v${version} producers cross ledger, campaign export, validation, and reconciliation without leaking details`, () => {
   const cwd = temporaryWorkspace();
   try {
     const plan = writeCampaignPlan(cwd);
@@ -161,7 +162,18 @@ test("checkpoint producers cross ledger, campaign export, validation, and reconc
     assert.deepEqual(handleHook(tool, "PreToolUse"), {});
     assert.deepEqual(handleHook(tool, "PostToolUse"), {});
     assert.deepEqual(handleHook({ ...tool, tool_name: "Bash", tool_use_id: "PRIVATE_CHECKPOINT_INVOCATION" }, "PreToolUse"), {});
+    if (version === 2) {
+      const baseFile = path.join(state, "runs", `${sha256(source.session_id)}.jsonl`);
+      const original = readFileSync(baseFile);
+      const boundary = original.indexOf(0x0a) + 1;
+      assert.ok(boundary > 0 && boundary < original.length);
+      writeFileSync(baseFile, original.subarray(0, boundary));
+      writeFileSync(baseFile.replace(/\.jsonl$/, ".000001.jsonl"), original.subarray(boundary));
+      assert.equal(summarizeRunLedger(cwd).status, "available");
+      assert.equal(summarizeRunLedger(cwd).sessionCount, 1);
+    }
     const checkpoint = checkpointSession(cwd, { session_id: source.session_id, planHash: canonicalPlanHash(plan), attachmentHash });
+    assert.equal(JSON.parse(readFileSync(path.join(state, "checkpoints", `${checkpoint.checkpointHash}.json`))).schemaVersion, version);
     assert.equal(resumeSession(cwd, { session_id: "PRIVATE_SUCCESSOR", planHash: canonicalPlanHash(plan), checkpointHash: checkpoint.checkpointHash }).status, "resumed");
     const receipt = createLocalCampaignReceipt(cwd, root);
     assert.deepEqual(receipt.runLedger, summarizeRunLedger(cwd));
@@ -170,6 +182,8 @@ test("checkpoint producers cross ledger, campaign export, validation, and reconc
     assert.equal(receipt.plan.localCompletionShape, false);
     assert.equal(summarizePlan(cwd).complete, false);
     assert.equal(receipt.runLedger.recordCount, 6);
+    assert.equal(receipt.runLedger.sessionCount, 2);
+    assert.equal(Object.hasOwn(receipt.runLedger, "physicalFileCount"), false);
     assert.deepEqual(receipt.runLedger.eventCounts.map(({ event }) => event), ["checkpoint_persisted", "checkpoint_resumed", "tool_completed", "tool_started"]);
     for (const fact of Object.values(receipt.providerFacts)) {
       assert.equal(fact.status, "unavailable");
@@ -188,6 +202,7 @@ test("checkpoint producers cross ledger, campaign export, validation, and reconc
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+}
 
 test("new ledger variants enforce strict correlation and checkpoint binding field types", () => {
   const cwd = temporaryWorkspace();
@@ -436,6 +451,58 @@ test("ledger limits and filename-session mismatches fail closed", () => {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test("segmented ledger hashing retains physical order while counting logical sessions once", () => {
+  const cwd = createCampaignWorkspace();
+  const session = "a".repeat(64);
+  try {
+    const base = `${JSON.stringify(ledgerRecord(session, "pre_compact", "2020-01-01T00:00:00Z", { trigger: "manual" }))}\n`;
+    const tail = `${JSON.stringify(ledgerRecord(session, "pre_compact", "2020-01-01T00:00:01Z", { trigger: "auto" }))}\n`;
+    writeLedger(cwd, session, base);
+    assert.equal(summarizeRunLedger(cwd).hash, expectedLedgerHash([[`${session}.jsonl`, base]]));
+    writeFileSync(path.join(cwd, ".supervised-worker", "runs", `${session}.000001.jsonl`), tail);
+    const ledger = summarizeRunLedger(cwd);
+    assert.equal(ledger.status, "available");
+    assert.equal(ledger.sessionCount, 1);
+    assert.equal(ledger.recordCount, 2);
+    assert.equal(ledger.hash, expectedLedgerHash([[`${session}.jsonl`, base], [`${session}.000001.jsonl`, tail]]));
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+for (const invalidLayout of ["missing-base", "gap", "zero", "unpadded", "overpadded", "temporary", "empty", "partial", "duplicate", "hard-link"]) {
+  test(`segmented journal rejects ${invalidLayout} without fabricating empty observations`, () => {
+    const cwd = createCampaignWorkspace();
+    const session = "a".repeat(64);
+    try {
+      const directory = path.join(cwd, ".supervised-worker", "runs");
+      const record = ledgerRecord(session, "pre_compact", "2020-01-01T00:00:00Z", { trigger: "manual" });
+      const base = `${JSON.stringify(record)}\n`;
+      const tail = `${JSON.stringify({ ...record, trigger: "auto" })}\n`;
+      writeLedger(cwd, session, base);
+      assert.equal(summarizeRunLedger(cwd).status, "available", "The valid baseline must be observed first");
+      let name = `${session}.000001.jsonl`;
+      if (invalidLayout === "gap") name = `${session}.000002.jsonl`;
+      if (invalidLayout === "zero") name = `${session}.000000.jsonl`;
+      if (invalidLayout === "unpadded") name = `${session}.1.jsonl`;
+      if (invalidLayout === "overpadded") name = `${session}.0000001.jsonl`;
+      if (invalidLayout === "temporary") name += ".123.11111111-1111-4111-8111-111111111111.tmp";
+      if (invalidLayout === "hard-link") linkSync(path.join(directory, `${session}.jsonl`), path.join(directory, name));
+      else writeFileSync(path.join(directory, name), invalidLayout === "empty" ? "" : invalidLayout === "partial"
+        ? tail.trimEnd() : invalidLayout === "duplicate" ? `${JSON.stringify(reverseObjectKeys(record))}\n` : tail);
+      if (invalidLayout === "missing-base") rmSync(path.join(directory, `${session}.jsonl`));
+      const receipt = createLocalCampaignReceipt(cwd, root);
+      assert.equal(receipt.runLedger.status, "unavailable");
+      assert.equal(receipt.runLedger.reason, "run-ledger-invalid");
+      assert.equal(receipt.runLedger.recordCount, null);
+      assert.equal(receipt.runLedger.sessionCount, null);
+      assert.equal(summarizePlan(cwd).operations.status, "unavailable");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+}
 
 test("canonical serialization ignores object insertion order and provider claims stay fixed", () => {
   const example = JSON.parse(

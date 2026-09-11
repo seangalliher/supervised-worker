@@ -88,6 +88,21 @@ test("checkpoint runtime and published schema accept producer artifacts and reje
     const schema = ajv.compile(JSON.parse(readFileSync(path.join(root, "schemas", "checkpoint.schema.json"))));
     assert.equal(schema(artifact), true, JSON.stringify(schema.errors));
     assert.deepEqual(validateCheckpoint(artifact), []);
+    const segmented = structuredClone(artifact);
+    segmented.schemaVersion = 2;
+    segmented.ledgerPosition = { ...segmented.ledgerPosition, byteOffset: 16_777_216,
+      recordCount: 1_048_576, prefixHash: "d".repeat(64) };
+    assert.equal(schema(segmented), true, JSON.stringify(schema.errors));
+    assert.deepEqual(validateCheckpoint(segmented), []);
+    for (const invalid of [
+      { ...segmented, schemaVersion: 1 },
+      { ...segmented, schemaVersion: 3 },
+      { ...segmented, ledgerPosition: { ...segmented.ledgerPosition, byteOffset: 16_777_217 } },
+      { ...segmented, ledgerPosition: { ...segmented.ledgerPosition, recordCount: 1_048_577 } },
+    ]) {
+      assert.equal(schema(invalid), false, JSON.stringify(invalid));
+      assert.ok(validateCheckpoint(invalid).length > 0);
+    }
     for (const mutate of [
       (value) => { value.raw = "PRIVATE_CONTENT"; },
       (value) => { value.context.continuation = "PRIVATE_CONTENT"; },
@@ -125,6 +140,16 @@ test("standards registration detects a missing or weakened checkpoint schema", (
     assert.match(validateStandards(target).join("\n"), /checkpoint schema accepted unsafe state/);
     rmSync(path.join(target, "schemas", "checkpoint.schema.json"));
     assert.match(validateStandards(target).join("\n"), /expected exactly these published schemas/);
+  } finally {
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("standards registration detects a weakened legacy checkpoint offset bound", () => {
+  const target = fixture();
+  try {
+    mutateJson(target, "schemas/checkpoint.schema.json", (schema) => { delete schema.allOf; });
+    assert.match(validateStandards(target).join("\n"), /checkpoint schema accepted unsafe state: legacy offset beyond base/);
   } finally {
     rmSync(target, { recursive: true, force: true });
   }

@@ -101,6 +101,28 @@ function checkpointFaultSetup(includeStop = true, routed = true) {
     const ledgerFile = path.join(repositoryRoot, ".supervised-worker", "runs", sha256(sessionId) + ".jsonl");
     const baseline = originalReadFileSync(ledgerFile, "utf8").trim().split("\\n").map(JSON.parse);
     assert.equal(baseline.filter((record) => record.event === "tool_started").length, 1);
+    const readSessionBytes = () => Buffer.concat([ledgerFile,
+      ...originalReaddirSync(path.dirname(ledgerFile)).filter((name) => name !== path.basename(ledgerFile) &&
+        name.startsWith(sha256(sessionId) + ".") && name.endsWith(".jsonl")).sort()
+        .map((name) => path.join(path.dirname(ledgerFile), name))].map((file) => Buffer.from(originalReadFileSync(file, "utf8"), "utf8")));
+    const seedNearCapacity = () => {
+      const chunks = [originalReadFileSync(ledgerFile)];
+      let length = chunks[0].length;
+      let sequence = 0;
+      while (length < 1_048_496) {
+        let line = JSON.stringify({ schemaVersion: 1, at: new Date(Date.UTC(2020, 0, 1) + sequence++).toISOString(),
+          event: "pre_compact", session: sha256(sessionId), trigger: "manual" });
+        const remaining = 1_048_496 - length;
+        assert.ok(remaining >= Buffer.byteLength(line) + 1);
+        if (remaining < (Buffer.byteLength(line) + 1) * 2) line = line.padEnd(remaining - 1);
+        const bytes = Buffer.from(line + "\\n");
+        chunks.push(bytes);
+        length += bytes.length;
+      }
+      originalWriteFileSync(ledgerFile, Buffer.concat(chunks));
+      assert.equal(originalLstatSync(ledgerFile).size, 1_048_496);
+      assert.equal(summarizeRunLedger(repositoryRoot).status, "available", "capacity fixture must be valid before injection");
+    };
     const request = { session_id: sessionId, ${routed ? "transcript_path: transcriptPath," : ""} planHash: canonicalPlanHash(plan), attachmentHash: sha256(attachmentBefore) };
     const descriptorPaths = new Map();
     fs.openSync = (filePath, ...args) => {
@@ -154,6 +176,40 @@ test("routine observations avoid the repository lifecycle lock", () => {
       assert.equal(completion.session, start.session);
       assert.equal(handleHook({ ...input, tool_use_id: "guarded-plan-write" }, "PreToolUse").permissionDecision, "deny");
       assert.equal(repositoryLockAttempts, 1, "plan mutation must still require its lifecycle guard");
+      assert.deepEqual(originalReadFileSync(attachmentFile), attachmentBefore);
+    ${filesystemCleanup()}
+  `);
+});
+
+test("journal admission accounts for unrelated sessions without opening their contents", () => {
+  runIsolated(`
+    ${filesystemPrelude("journal-admission-io")}
+    try {
+      ${checkpointFaultSetup(false, false)}
+      const otherFiles = new Set();
+      for (let index = 0; index < 32; index++) {
+        const session = sha256("historical-session-" + index);
+        const file = path.join(path.dirname(ledgerFile), session + ".jsonl");
+        originalWriteFileSync(file, JSON.stringify({ schemaVersion: 1, at: "2020-01-01T00:00:00.000Z",
+          event: "pre_compact", session, trigger: "manual" }) + "\\n");
+        otherFiles.add(file);
+      }
+      assert.equal(summarizeRunLedger(repositoryRoot).sessionCount, 33);
+      const trackedOpenSync = fs.openSync;
+      let activeOpens = 0;
+      let unrelatedOpens = 0;
+      fs.openSync = (file, ...options) => {
+        const target = path.resolve(String(file));
+        if (target === ledgerFile) activeOpens++;
+        if (otherFiles.has(target)) unrelatedOpens++;
+        return trackedOpenSync(file, ...options);
+      };
+      syncBuiltinESMExports();
+      const tool = { ...input, tool_name: "Read", tool_use_id: "accounting-probe", tool_input: {} };
+      assert.deepEqual(handleHook(tool, "PreToolUse"), {});
+      assert.deepEqual(handleHook(tool, "PostToolUse"), {});
+      assert.ok(activeOpens > 0, "the open instrumentation must observe the actual journal path");
+      assert.equal(unrelatedOpens, 0, "aggregate admission must inspect sizes and identities, not reread unrelated contents");
       assert.deepEqual(originalReadFileSync(attachmentFile), attachmentBefore);
     ${filesystemCleanup()}
   `);
@@ -225,7 +281,9 @@ const journalHookChildProgram = String.raw`
     return originalAppend(filePath, bytes, ...args);
   };
   fs.renameSync = (source, destination) => {
-    if (path.resolve(String(destination)) !== ledgerFile) return originalRename(source, destination);
+    if (path.dirname(path.resolve(String(destination))) !== path.dirname(ledgerFile) ||
+      !path.basename(String(destination)).startsWith(core.sha256(options.input.session_id) + ".") ||
+      !String(destination).endsWith(".jsonl")) return originalRename(source, destination);
     const record = JSON.parse(fs.readFileSync(source, "utf8").trimEnd().split("\n").at(-1));
     const result = originalRename(source, destination);
     publications.push(record);
@@ -331,7 +389,7 @@ function journalHookChildrenSetup() {
       }
       await Promise.all(children.map((actor) => actor.exited));
     };
-    const readRecords = () => originalReadFileSync(ledgerFile, "utf8").trim().split("\\n").map(JSON.parse);
+    const readRecords = () => readSessionBytes().toString("utf8").trim().split("\\n").map(JSON.parse);
     const owner = JSON.parse(attachmentBefore);
     const observation = (hostId) => ({ ...input, tool_name: "read_file", tool_use_id: hostId,
       tool_input: { filePath: path.join(repositoryRoot, hostId + ".txt") } });
@@ -355,7 +413,7 @@ function journalHookChildrenSetup() {
     };
     const assertPublications = (before, publications) => {
       const suffix = Buffer.from(publications.map((record) => JSON.stringify(record) + "\\n").join(""));
-      assert.deepEqual(originalReadFileSync(ledgerFile), Buffer.concat([before, suffix]),
+      assert.deepEqual(readSessionBytes(), Buffer.concat([before, suffix]),
         "all acknowledged publications and the original prefix must survive byte-for-byte");
     };
     const overlap = async (firstInput, firstEvent, heldEvent, secondInput, secondEvent) => {
@@ -416,7 +474,8 @@ test("multiprocess journal serial hook children acknowledge exact records", () =
   `, 60_000);
 });
 
-test("multiprocess journal forced overlap preserves starts and makes duplicate Posts idempotent", () => {
+for (const segmented of [false, true]) {
+test(`multiprocess journal forced overlap preserves starts and makes duplicate Posts idempotent (segmented=${segmented})`, () => {
   runIsolated(`
     ${filesystemPrelude("multiprocess-journal-overlap")}
     try {
@@ -424,6 +483,7 @@ test("multiprocess journal forced overlap preserves starts and makes duplicate P
       ${journalHookChildrenSetup()}
       try {
         assert.equal(owner.routeGeneration, null);
+        if (${segmented}) seedNearCapacity();
         const firstTool = observation("parallel-first");
         const secondTool = observation("parallel-second");
         const before = originalReadFileSync(ledgerFile);
@@ -454,12 +514,14 @@ test("multiprocess journal forced overlap preserves starts and makes duplicate P
           assert.equal(records.filter((record) => record.event === "tool_completed" &&
             record.operationId === start.operationId).length, 1);
         }
+        if (${segmented}) assert.deepEqual(originalReadFileSync(ledgerFile), before);
       } finally {
         await stopHookChildren();
       }
     ${filesystemCleanup()}
   `, 60_000);
 });
+}
 
 for (const legacyFirst of [true, false]) {
   test(`multiprocess journal serializes legacy and durable writers (legacyFirst=${legacyFirst})`, () => {
@@ -582,7 +644,7 @@ function observedHandoffFaultSetup(kind = "build-report", routed = true) {
     };
     const artifactPath = path.join(artifactDirectory, artifactKind + ".json");
     fs.writeFileSync(artifactPath, JSON.stringify(artifact));
-    const records = () => originalReadFileSync(ledgerFile, "utf8").trim().split("\\n").map(JSON.parse);
+    const records = () => readSessionBytes().toString("utf8").trim().split("\\n").map(JSON.parse);
     const helperRequest = (hostId, retryOf = null) => ({ session_id: sessionId,
       ${routed ? "transcript_path: transcriptPath," : ""} tool_use_id: hostId, retryOf });
     const startHelper = (hostId) => {
@@ -594,12 +656,15 @@ function observedHandoffFaultSetup(kind = "build-report", routed = true) {
   `;
 }
 
-test("observed handoff validation retries once with unchanged inputs", () => {
+for (const segmented of [false, true]) {
+test(`observed handoff validation retries once with unchanged inputs (segmented=${segmented})`, () => {
   runIsolated(`
     ${filesystemPrelude("observed-handoff-once")}
     try {
       ${observedHandoffFaultSetup()}
       const parent = startHelper("PRIVATE_ORIGINAL_HOST");
+      if (${segmented}) seedNearCapacity();
+      const sealedBase = originalReadFileSync(ledgerFile);
       const lifecycleDirectory = path.join(repositoryRoot, ".supervised-worker", "locks", "lifecycle");
       let lifecycleAttempts = 0;
       fs.mkdirSync = (directory, ...options) => {
@@ -658,9 +723,11 @@ test("observed handoff validation retries once with unchanged inputs", () => {
         assert.ok(checkpoint.context.operations.orphans.some((operation) =>
           operation.operationId === operationId && operation.observationStatus === "outcome-unknown"));
       }
+      if (${segmented}) assert.deepEqual(originalReadFileSync(ledgerFile), sealedBase);
     ${filesystemCleanup()}
   `, 30_000);
 });
+}
 
 test("observed handoff validation breaks the circuit after a second missing result", () => {
   runIsolated(`
@@ -865,7 +932,7 @@ function deniedRetryFaultSetup(routed = true) {
   return `
     ${checkpointFaultSetup(false, routed)}
     const { requestDeniedToolRetry } = await import(${JSON.stringify(coreUrl)});
-    const records = () => originalReadFileSync(ledgerFile, "utf8").trim().split("\\n").map(JSON.parse);
+    const records = () => readSessionBytes().toString("utf8").trim().split("\\n").map(JSON.parse);
     const deniedTool = { ...input, tool_name: "run_in_terminal", tool_use_id: "PRIVATE_DENIED_HOST_ID",
       tool_input: { command: "PRIVATE_MUTATING_COMMAND", options: { flags: ["PRIVATE_FLAG"], mode: "PRIVATE_MODE" }, timeout: 500 } };
     const retryRequest = (denial) => ({ ...request, sourceOperationId: denial.operationId });
@@ -971,12 +1038,15 @@ test("multiprocess journal admits one hash-stable helper retry", () => {
   `, 60_000);
 });
 
-test("denied retry consumes one permit only for the complete normalized request hash", () => {
+for (const segmented of [false, true]) {
+test(`denied retry consumes one permit only for the complete normalized request hash (segmented=${segmented})`, () => {
   runIsolated(`
     ${filesystemPrelude("denied-retry-normalized")}
     try {
       ${deniedRetryFaultSetup()}
       const denial = denyNextStart();
+      if (${segmented}) seedNearCapacity();
+      const sealedBase = originalReadFileSync(ledgerFile);
       const expectedHash = sha256("supervised-worker-tool-request-v1\\0" + JSON.stringify({
         arguments: { command: "PRIVATE_MUTATING_COMMAND", options: { flags: ["PRIVATE_FLAG"], mode: "PRIVATE_MODE" }, timeout: 500 },
         toolName: "run_in_terminal",
@@ -1017,9 +1087,11 @@ test("denied retry consumes one permit only for the complete normalized request 
       const checkpoint = checkpointSession(repositoryRoot, request);
       assert.deepEqual(checkpoint.context.operations.orphans.map((operation) => operation.operationId), [unrelatedStart.operationId]);
       assert.doesNotMatch(originalReadFileSync(ledgerFile, "utf8"), /PRIVATE_/);
+      if (${segmented}) assert.deepEqual(originalReadFileSync(ledgerFile), sealedBase);
     ${filesystemCleanup()}
   `, 30_000);
 });
+}
 
 test("denied retry keeps the circuit open after a second denied start", () => {
   runIsolated(`
@@ -1228,21 +1300,26 @@ test("denied retry gives no replay authority to unknown or legacy operations", (
   `);
 });
 
+for (const segmented of [false, true]) {
 for (const fault of [
   "receipt-temporary-write", "receipt-fsync", "receipt-publication", "receipt-temporary-readback", "receipt-readback",
-  "source-ledger-flush", "ledger-append", "tombstone-temporary-write", "tombstone-publication", "tombstone-readback", "route-cleanup",
+  "source-ledger-flush", "ledger-temporary-write", "ledger-append", "ledger-fsync", "ledger-publication",
+  "ledger-temporary-readback", "ledger-readback", "tombstone-temporary-write", "tombstone-publication", "tombstone-readback", "route-cleanup",
 ]) {
-  test(`checkpoint ${fault} failure preserves source authority or its resumable tombstone`, () => {
+  test(`checkpoint ${fault} failure preserves source authority or its resumable tombstone (segmented=${segmented})`, () => {
     runIsolated(`
       ${filesystemPrelude(`checkpoint-${fault}`)}
       try {
         ${checkpointFaultSetup()}
+        if (${segmented}) seedNearCapacity();
+        const sealedBase = originalReadFileSync(ledgerFile);
         const fault = ${JSON.stringify(fault)};
         let fired = false;
         const fail = () => { fired = true; throw new Error("PRIVATE_FAULT_CONTENT"); };
         fs.writeFileSync = (filePath, ...args) => {
           const name = String(filePath);
           if (!fired && fault === "receipt-temporary-write" && inReceipts(name) && name.endsWith(".tmp")) fail();
+          if (!fired && fault === "ledger-temporary-write" && inRuns(name) && name.endsWith(".tmp")) fail();
           if (!fired && fault === "tombstone-temporary-write" && name.startsWith(attachmentFile + ".") && String(args[0]).includes('"checkpointed"')) fail();
           return originalWriteFileSync(filePath, ...args);
         };
@@ -1250,6 +1327,7 @@ for (const fault of [
           const name = descriptorPaths.get(descriptor);
           if (!fired && fault === "receipt-fsync" && inReceipts(name)) fail();
           if (!fired && fault === "source-ledger-flush" && name === ledgerFile) fail();
+          if (!fired && fault === "ledger-fsync" && inRuns(name) && name.endsWith(".tmp")) fail();
           return originalFsyncSync(descriptor);
         };
         fs.appendFileSync = (filePath, ...args) => {
@@ -1259,6 +1337,7 @@ for (const fault of [
         fs.renameSync = (source, destination) => {
           const name = path.resolve(String(destination));
           if (!fired && fault === "receipt-publication" && inReceipts(name)) fail();
+          if (!fired && fault === "ledger-publication" && inRuns(name) && name.endsWith(".jsonl")) fail();
           if (!fired && fault === "tombstone-publication" && name === attachmentFile) fail();
           if (!fired && fault === "route-cleanup" && name === routeFile && JSON.parse(originalReadFileSync(source)).status === "released") fail();
           return originalRenameSync(source, destination);
@@ -1267,6 +1346,9 @@ for (const fault of [
           const name = descriptorPaths.get(descriptor);
           if (!fired && fault === "receipt-temporary-readback" && inReceipts(name) && name.endsWith(".tmp")) fail();
           if (!fired && fault === "receipt-readback" && inReceipts(name) && name.endsWith(".json")) fail();
+          if (!fired && fault === "ledger-temporary-readback" && inRuns(name) && name.endsWith(".tmp")) fail();
+          if (!fired && fault === "ledger-readback" && inRuns(name) && name.endsWith(".jsonl") &&
+            JSON.parse(originalReadFileSync(name, "utf8").trimEnd().split("\\n").at(-1)).event === "checkpoint_persisted") fail();
           if (!fired && fault === "tombstone-readback" && name === attachmentFile && JSON.parse(originalReadFileSync(name, "utf8")).status === "checkpointed") fail();
           return originalReadSync(descriptor, ...args);
         };
@@ -1275,6 +1357,7 @@ for (const fault of [
         assert.equal(fired, true, "the intended boundary must be reached");
         assert.deepEqual(originalReadFileSync(planPath(repositoryRoot)), planBefore);
         const attachment = JSON.parse(originalReadFileSync(attachmentFile));
+        if (${segmented}) assert.deepEqual(originalReadFileSync(ledgerFile), sealedBase);
         const logicallyDetached = ["tombstone-readback", "route-cleanup"].includes(fault);
         assert.equal(attachment.status, logicallyDetached ? "checkpointed" : "active");
         assert.equal(JSON.parse(originalReadFileSync(routeFile)).status, "active");
@@ -1292,6 +1375,52 @@ for (const fault of [
             assert.throws(() => resumeSession(repositoryRoot, { session_id: "not-an-owner", planHash: request.planHash, checkpointHash: receipt.slice(0, 64) }));
             assert.deepEqual(originalReadFileSync(attachmentFile), attachmentBefore);
           }
+        }
+      ${filesystemCleanup()}
+    `);
+  });
+}
+}
+
+for (const interference of ["foreign-temporary", "foreign-writer-temporary", "replaced-base"]) {
+  test(`segmented checkpoint rejects ${interference} before journal publication`, () => {
+    runIsolated(`
+      ${filesystemPrelude(`segmented-interference-${interference}`)}
+      try {
+        ${checkpointFaultSetup(false)}
+        seedNearCapacity();
+        const sealedBase = originalReadFileSync(ledgerFile);
+        const originalIdentity = originalLstatSync(ledgerFile, { bigint: true }).ino;
+        const foreignFile = ${interference === "foreign-writer-temporary"
+          ? 'ledgerFile + "." + process.pid + ".11111111-1111-4111-8111-111111111111.tmp"'
+          : 'path.join(path.dirname(ledgerFile), "foreign.tmp")'};
+        const segmentFile = ledgerFile.replace(/\\.jsonl$/, ".000001.jsonl");
+        let fired = false;
+        fs.appendFileSync = (filePath, bytes, ...options) => {
+          const result = originalAppendFileSync(filePath, bytes, ...options);
+          if (!fired && inRuns(filePath) && JSON.parse(String(bytes)).event === "checkpoint_persisted") {
+            fired = true;
+            if (${JSON.stringify(interference)} !== "replaced-base") originalWriteFileSync(foreignFile, "PRIVATE_CRASH_EVIDENCE");
+            else {
+              const replacement = path.join(repositoryRoot, "replacement.jsonl");
+              originalWriteFileSync(replacement, sealedBase);
+              originalRenameSync(replacement, ledgerFile);
+              assert.notEqual(originalLstatSync(ledgerFile, { bigint: true }).ino, originalIdentity);
+            }
+          }
+          return result;
+        };
+        syncBuiltinESMExports();
+        assert.throws(() => checkpointSession(repositoryRoot, request));
+        assert.equal(fired, true, "the active segment temporary write must reach the interference point");
+        assert.deepEqual(originalReadFileSync(ledgerFile), sealedBase);
+        assert.deepEqual(originalReadFileSync(attachmentFile), attachmentBefore);
+        assert.equal(originalExistsSync(segmentFile), false, "the unvalidated segment must not be published");
+        const temporaryNames = originalReaddirSync(path.dirname(ledgerFile)).filter((name) => name.endsWith(".tmp"));
+        assert.deepEqual(temporaryNames, ${interference !== "replaced-base" ? '[path.basename(foreignFile)]' : "[]"});
+        if (${JSON.stringify(interference)} !== "replaced-base") {
+          assert.equal(originalReadFileSync(foreignFile, "utf8"), "PRIVATE_CRASH_EVIDENCE");
+          assert.equal(summarizeRunLedger(repositoryRoot).reason, "run-ledger-invalid");
         }
       ${filesystemCleanup()}
     `);

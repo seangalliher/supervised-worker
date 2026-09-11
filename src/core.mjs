@@ -132,7 +132,7 @@ const RUN_LEDGER_MAX_FILES = 256;
 const RUN_LEDGER_MAX_FILE_BYTES = 1_048_576;
 const RUN_LEDGER_MAX_TOTAL_BYTES = 16_777_216;
 const RUN_LEDGER_MAX_RECORD_BYTES = 16_384;
-const RUN_LEDGER_FILE_PATTERN = /^[0-9a-f]{64}\.jsonl$/;
+const RUN_LEDGER_FILE_PATTERN = /^([0-9a-f]{64})(?:\.([0-9]{6}))?\.jsonl$/;
 const RUN_LEDGER_COMMON_KEYS = new Set(["schemaVersion", "at", "event", "session"]);
 const HANDOFF_HELPER_ID = "handoff.validate.v1";
 const HANDOFF_HELPER_FIELDS = [
@@ -3144,7 +3144,7 @@ function durableWriteBytes(cwd, filePath, bytes, maximumBytes, immutable = false
     }
     assertSafeStatePath(cwd, filePath);
     if (immutable && existsSync(filePath)) throw new Error("immutable state publication conflicted");
-    if (beforePublish !== null) beforePublish();
+    if (beforePublish !== null) beforePublish(temporaryPath);
     renameSync(temporaryPath, filePath);
     if (!readBoundedStateBytes(cwd, filePath, maximumBytes).bytes.equals(bytes)) {
       throw new Error("durable state publication read-back failed");
@@ -3155,8 +3155,8 @@ function durableWriteBytes(cwd, filePath, bytes, maximumBytes, immutable = false
   }
 }
 
-function parseRunLedgerBytes(bytes, expectedSession) {
-  if (bytes.length > RUN_LEDGER_MAX_FILE_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
+function parseRunLedgerBytes(bytes, expectedSession, maximumBytes = RUN_LEDGER_MAX_FILE_BYTES) {
+  if (bytes.length > maximumBytes) throw runLedgerFailure("run-ledger-limit-exceeded");
   if (bytes.length === 0 || bytes.at(-1) !== 0x0a) throw runLedgerFailure("run-ledger-invalid");
   const records = [];
   const canonicalRecords = new Set();
@@ -3182,53 +3182,116 @@ function parseRunLedgerBytes(bytes, expectedSession) {
   return records;
 }
 
-function readSessionLedger(cwd, hash, journalGuard, flush = false) {
-  journalGuard(cwd);
-  const filePath = path.join(stateDirectory(cwd), "runs", `${hash}.jsonl`);
-  assertSafeStatePath(cwd, filePath);
-  if (!existsSync(filePath)) return { bytes: Buffer.alloc(0), records: [], exists: false };
-  const snapshot = readBoundedStateBytes(cwd, filePath, RUN_LEDGER_MAX_FILE_BYTES, flush);
-  journalGuard(cwd);
-  return { ...snapshot, records: parseRunLedgerBytes(snapshot.bytes, hash), exists: true };
+function journalLayout(names) {
+  if (names.length > RUN_LEDGER_MAX_FILES) throw runLedgerFailure("run-ledger-limit-exceeded");
+  const sessions = new Map();
+  for (const name of names) {
+    const match = RUN_LEDGER_FILE_PATTERN.exec(name);
+    if (!match || match[2] === "000000") throw runLedgerFailure("run-ledger-invalid");
+    const segments = sessions.get(match[1]) ?? [];
+    segments.push({ name, index: match[2] === undefined ? 0 : Number(match[2]) });
+    sessions.set(match[1], segments);
+  }
+  for (const segments of sessions.values()) {
+    segments.sort((left, right) => left.index - right.index);
+    if (segments.some((segment, index) => segment.index !== index)) throw runLedgerFailure("run-ledger-invalid");
+  }
+  return sessions;
 }
 
-function requireJournalAdmission(cwd, hash, bytes, journalGuard) {
+function readJournalInventory(cwd, journalGuard, ignoredTemporary = null) {
   journalGuard(cwd);
   const directory = path.join(stateDirectory(cwd), "runs");
   assertSafeStatePath(cwd, directory);
-  const names = existsSync(directory) ? readdirSync(directory).sort() : [];
-  if (names.some((name) => !RUN_LEDGER_FILE_PATTERN.test(name))) throw runLedgerFailure("run-ledger-invalid");
-  const fileName = `${hash}.jsonl`;
-  if (names.length + (names.includes(fileName) ? 0 : 1) > RUN_LEDGER_MAX_FILES) {
-    throw runLedgerFailure("run-ledger-limit-exceeded");
+  let names = existsSync(directory) ? readdirSync(directory).sort() : [];
+  if (ignoredTemporary !== null) {
+    const temporary = /^([0-9a-f]{64}(?:\.[0-9]{6})?\.jsonl)\.([1-9][0-9]*)\.([0-9a-f-]{36})\.tmp$/.exec(path.basename(ignoredTemporary));
+    if (path.dirname(ignoredTemporary) !== directory || temporary === null ||
+      temporary[2] !== String(process.pid) || !uuid(temporary[3])) throw runLedgerFailure("run-ledger-invalid");
+    names = names.filter((name) => name !== path.basename(ignoredTemporary));
   }
+  return { directory, names, sessions: journalLayout(names) };
+}
+
+function readSessionLedger(cwd, hash, journalGuard, flush = false, ignoredTemporary = null) {
+  const inventory = readJournalInventory(cwd, journalGuard, ignoredTemporary);
+  const layout = inventory.sessions.get(hash) ?? [];
+  const segments = [];
+  let length = 0;
+  for (const segment of layout) {
+    const filePath = path.join(inventory.directory, segment.name);
+    const snapshot = readBoundedStateBytes(cwd, filePath, RUN_LEDGER_MAX_FILE_BYTES,
+      flush && segment.index === layout.length - 1);
+    length += snapshot.bytes.length;
+    if (length > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
+    parseRunLedgerBytes(snapshot.bytes, hash);
+    segments.push({ ...segment, ...snapshot });
+  }
+  if (JSON.stringify(readJournalInventory(cwd, journalGuard, ignoredTemporary).names) !== JSON.stringify(inventory.names)) {
+    throw runLedgerFailure("run-ledger-changed-during-read");
+  }
+  for (const segment of segments) {
+    if (!sameRunLedgerStats(segment.stats, lstatSync(path.join(inventory.directory, segment.name), { bigint: true }))) {
+      throw runLedgerFailure("run-ledger-changed-during-read");
+    }
+  }
+  const bytes = Buffer.concat(segments.map((segment) => segment.bytes));
+  journalGuard(cwd);
+  return { bytes, records: segments.length === 0 ? [] : parseRunLedgerBytes(bytes, hash, RUN_LEDGER_MAX_TOTAL_BYTES),
+    exists: segments.length > 0, segments, inventory: inventory.names };
+}
+
+function requireJournalAdmission(cwd, fileName, bytes, journalGuard, ignoredTemporary = null) {
+  const { directory, names } = readJournalInventory(cwd, journalGuard, ignoredTemporary);
+  if (bytes.length > RUN_LEDGER_MAX_FILE_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
+  journalLayout(names.includes(fileName) ? names : [...names, fileName]);
   let aggregateBytes = bytes.length;
   for (const name of names) {
     if (name === fileName) continue;
-    journalGuard(cwd);
-    const snapshot = readBoundedStateBytes(cwd, path.join(directory, name), RUN_LEDGER_MAX_FILE_BYTES);
-    aggregateBytes += snapshot.bytes.length;
+    const filePath = path.join(directory, name);
+    assertSafeStatePath(cwd, filePath);
+    const stats = lstatSync(filePath, { bigint: true });
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1n) throw runLedgerFailure("run-ledger-invalid");
+    if (stats.size > BigInt(RUN_LEDGER_MAX_FILE_BYTES)) throw runLedgerFailure("run-ledger-limit-exceeded");
+    aggregateBytes += Number(stats.size);
     if (aggregateBytes > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
   }
+  journalGuard(cwd);
   if (aggregateBytes > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
 }
 
-function appendJournalRecord(cwd, hash, event, detail, journalGuard, beforePublish = null) {
+function prepareJournalAppend(cwd, hash, event, detail, journalGuard, recordedAt = new Date().toISOString()) {
   const snapshot = readSessionLedger(cwd, hash, journalGuard);
-  const record = { schemaVersion: 1, at: new Date().toISOString(), event, session: hash, ...detail };
+  const record = { schemaVersion: 1, at: recordedAt, event, session: hash, ...detail };
   requireRunLedgerRecord(record, hash);
   const suffix = Buffer.from(`${JSON.stringify(record)}\n`);
-  const bytes = Buffer.concat([snapshot.bytes, suffix]);
-  parseRunLedgerBytes(bytes, hash);
-  requireJournalAdmission(cwd, hash, bytes, journalGuard);
+  if (snapshot.bytes.length + suffix.length > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
+  parseRunLedgerBytes(Buffer.concat([snapshot.bytes, suffix]), hash, RUN_LEDGER_MAX_TOTAL_BYTES);
+  const tail = snapshot.segments.at(-1);
+  const rollover = tail !== undefined && tail.bytes.length + suffix.length > RUN_LEDGER_MAX_FILE_BYTES;
+  const index = tail === undefined ? 0 : tail.index + (rollover ? 1 : 0);
+  const fileName = index === 0 ? `${hash}.jsonl` : `${hash}.${String(index).padStart(6, "0")}.jsonl`;
+  const bytes = Buffer.concat([rollover || tail === undefined ? Buffer.alloc(0) : tail.bytes, suffix]);
+  requireJournalAdmission(cwd, fileName, bytes, journalGuard);
+  return { snapshot, record, fileName, bytes, suffix };
+}
+
+function appendJournalRecord(cwd, hash, event, detail, journalGuard, beforePublish = null, recordedAt = undefined) {
+  const { snapshot, record, fileName, bytes, suffix } = prepareJournalAppend(cwd, hash, event, detail, journalGuard, recordedAt);
   durableWriteBytes(
-    cwd, path.join(stateDirectory(cwd), "runs", `${hash}.jsonl`),
-    bytes, RUN_LEDGER_MAX_FILE_BYTES, false, suffix, () => {
-      const current = readSessionLedger(cwd, hash, journalGuard);
-      if (current.exists !== snapshot.exists || !current.bytes.equals(snapshot.bytes) ||
-        (snapshot.exists && !sameRunLedgerStats(snapshot.stats, current.stats))) {
+    cwd, path.join(stateDirectory(cwd), "runs", fileName),
+    bytes, RUN_LEDGER_MAX_FILE_BYTES, false, suffix, (temporaryPath) => {
+      if (!readBoundedStateBytes(cwd, temporaryPath, RUN_LEDGER_MAX_FILE_BYTES).bytes.equals(bytes)) {
         throw runLedgerFailure("run-ledger-changed-during-read");
       }
+      const current = readSessionLedger(cwd, hash, journalGuard, false, temporaryPath);
+      if (current.exists !== snapshot.exists || !current.bytes.equals(snapshot.bytes) ||
+        JSON.stringify(current.inventory) !== JSON.stringify(snapshot.inventory) ||
+        current.segments.length !== snapshot.segments.length || current.segments.some((segment, position) =>
+          segment.name !== snapshot.segments[position].name || !sameRunLedgerStats(segment.stats, snapshot.segments[position].stats))) {
+        throw runLedgerFailure("run-ledger-changed-during-read");
+      }
+      requireJournalAdmission(cwd, fileName, bytes, journalGuard, temporaryPath);
       if (beforePublish !== null) beforePublish();
       journalGuard(cwd);
     },
@@ -3238,10 +3301,10 @@ function appendJournalRecord(cwd, hash, event, detail, journalGuard, beforePubli
   return record;
 }
 
-function appendDurableLedger(cwd, input, event, detail, journalGuard, beforePublish = null) {
+function appendDurableLedger(cwd, input, event, detail, journalGuard, beforePublish = null, recordedAt = undefined) {
   const hash = sessionHash(input);
   if (hash === null) throw new Error("durable ledger requires a session identity");
-  return appendJournalRecord(cwd, hash, event, detail, journalGuard, beforePublish);
+  return appendJournalRecord(cwd, hash, event, detail, journalGuard, beforePublish, recordedAt);
 }
 
 function boundedToolName(input) {
@@ -3527,7 +3590,7 @@ export function validateCheckpoint(value) {
     return ["checkpoint must contain exactly the published fields"];
   }
   const errors = [];
-  if (value.schemaVersion !== 1 || value.kind !== "session-checkpoint") errors.push("checkpoint kind or version is invalid");
+  if (![1, 2].includes(value.schemaVersion) || value.kind !== "session-checkpoint") errors.push("checkpoint kind or version is invalid");
   if (!uuid(value.checkpointId)) errors.push("checkpointId must be a UUID");
   if (!isDateTime(value.createdAt) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.createdAt) ||
     !Number.isFinite(Date.parse(value.createdAt)) || new Date(value.createdAt).toISOString() !== value.createdAt) {
@@ -3540,7 +3603,7 @@ export function validateCheckpoint(value) {
   const position = value.ledgerPosition;
   if (!exactObject(position, ["path", "byteOffset", "recordCount", "prefixHash"]) ||
     position.path !== `runs/${value.sessionHash}.jsonl` ||
-    !boundedCounter(position.byteOffset, RUN_LEDGER_MAX_FILE_BYTES) ||
+    !boundedCounter(position.byteOffset, value.schemaVersion === 2 ? RUN_LEDGER_MAX_TOTAL_BYTES : RUN_LEDGER_MAX_FILE_BYTES) ||
     !boundedCounter(position.recordCount, RUN_LEDGER_MAX_FILE_BYTES) || !digest(position.prefixHash) ||
     ((position.byteOffset === 0) !== (position.recordCount === 0)) ||
     (position.byteOffset === 0 && position.prefixHash !== sha256(Buffer.alloc(0)))) {
@@ -3991,12 +4054,16 @@ function requireCheckpointLedger(cwd, receipt, hash, journalGuard, flush = true)
     checkpointFailure("checkpoint source ledger is corrupt, partial, unsafe, or exceeds its bound");
   }
   const position = receipt.ledgerPosition;
-  const prefix = snapshot.bytes.subarray(0, position.byteOffset);
+  const sourceBytes = receipt.schemaVersion === 1 ? snapshot.segments[0]?.bytes ?? Buffer.alloc(0) : snapshot.bytes;
+  const sourceRecords = receipt.schemaVersion === 1 && snapshot.exists
+    ? parseRunLedgerBytes(sourceBytes, receipt.sessionHash) : snapshot.records;
+  const prefix = sourceBytes.subarray(0, position.byteOffset);
   if (!snapshot.exists || prefix.length !== position.byteOffset || sha256(prefix) !== position.prefixHash ||
-    (prefix.length > 0 && parseRunLedgerBytes(prefix, receipt.sessionHash).length !== position.recordCount)) {
+    (prefix.length > 0 && parseRunLedgerBytes(prefix, receipt.sessionHash,
+      receipt.schemaVersion === 2 ? RUN_LEDGER_MAX_TOTAL_BYTES : RUN_LEDGER_MAX_FILE_BYTES).length !== position.recordCount)) {
     checkpointFailure("checkpoint source ledger prefix does not match the receipt");
   }
-  const event = snapshot.records[position.recordCount];
+  const event = sourceRecords[position.recordCount];
   if (event?.event !== "checkpoint_persisted" || event.checkpointHash !== hash ||
     event.planHash !== receipt.planHash || event.attachmentHash !== receipt.attachmentHash ||
     event.claimGeneration !== receipt.claimGeneration || event.routeGeneration !== receipt.routeGeneration) {
@@ -4074,9 +4141,16 @@ export function checkpointSession(cwd, request, authority = undefined) {
       ledgerPosition: { path: `runs/${attachment.sessionHash}.jsonl`, byteOffset: ledger.bytes.length, recordCount: ledger.records.length, prefixHash: sha256(ledger.bytes) },
       context: checkpointContext(plan, readStopSnapshot(root, attachment.sessionHash), operations),
     };
+    const persistence = { checkpointHash: "0".repeat(64), planHash: receipt.planHash, attachmentHash: snapshot.hash,
+      routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration };
+    const persistenceBytes = Buffer.byteLength(`${JSON.stringify({ schemaVersion: 1, at: receipt.createdAt,
+      event: "checkpoint_persisted", session: attachment.sessionHash, ...persistence })}\n`);
+    if (ledger.segments.length > 1 || ledger.bytes.length + persistenceBytes > RUN_LEDGER_MAX_FILE_BYTES) receipt.schemaVersion = 2;
     if (validateCheckpoint(receipt).length > 0) checkpointFailure("checkpoint context exceeds its typed artifact limits");
     const bytes = Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`);
     const hash = sha256(bytes);
+    persistence.checkpointHash = hash;
+    prepareJournalAppend(root, attachment.sessionHash, "checkpoint_persisted", persistence, journalGuard, receipt.createdAt);
     const requireSource = () => {
       requireGuards();
       requireAttachmentSnapshot(root, snapshot);
@@ -4085,10 +4159,7 @@ export function checkpointSession(cwd, request, authority = undefined) {
     transitionWriteBytes(journalGuard, root, path.join(stateDirectory(root), "checkpoints", `${hash}.json`), bytes, MAX_CHECKPOINT_BYTES, true, requireSource);
     requireAttachmentSnapshot(root, snapshot);
     requireActivePlan(root, request.planHash);
-    appendDurableLedger(root, input, "checkpoint_persisted", {
-      checkpointHash: hash, planHash: receipt.planHash, attachmentHash: snapshot.hash,
-      routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration,
-    }, journalGuard, requireSource);
+    appendDurableLedger(root, input, "checkpoint_persisted", persistence, journalGuard, requireSource, receipt.createdAt);
     requireCheckpointLedger(root, receipt, hash, journalGuard);
     requireAttachmentSnapshot(root, snapshot);
     const tombstone = {
@@ -4124,8 +4195,8 @@ function allSessionOperations(cwd, journalGuard, flush = true) {
   if (ledger.status !== "available") {
     return unavailableOperations(ledger.reason === "run-ledger-absent" ? "ledger-absent" : "ledger-invalid");
   }
-  const directory = path.join(stateDirectory(cwd), "runs");
-  const records = readdirSync(directory).sort().flatMap((name) => readSessionLedger(cwd, name.slice(0, 64), journalGuard, flush).records);
+  const sessions = [...readJournalInventory(cwd, journalGuard).sessions.keys()].sort();
+  const records = sessions.flatMap((session) => readSessionLedger(cwd, session, journalGuard, flush).records);
   if (summarizeRunLedgerHeld(cwd, journalGuard).hash !== ledger.hash) checkpointFailure("ownerless recovery ledger changed while observing it");
   return inspectOperations(records);
 }
@@ -4195,6 +4266,13 @@ export function resumeSession(cwd, request, authority = undefined) {
       if (routing.exists && !["released", "provisional"].includes(routing.locator.status)) {
         checkpointFailure("resume requires a fresh, interrupted provisional, or explicitly released successor session route");
       }
+      prepareJournalAppend(root, sessionHash(input), "checkpoint_resumed", {
+        checkpointHash: request.checkpointHash, planHash: request.planHash,
+        sourceSessionHash: receipt?.sessionHash ?? sessionHash(input),
+        routeGeneration: routing.context === null ? null : "00000000-0000-4000-8000-000000000000",
+        claimGeneration: "00000000-0000-4000-8000-000000000000",
+        observationStatus: context.operations.status, observationReason: context.operations.reason,
+      }, journalGuard);
       restoreStopSnapshot(root, input, context.stopState, journalGuard);
       const route = bindSessionLocator(input, root, journalGuard);
       if (route.conflict) checkpointFailure("resume successor routing conflicts with current ownership");
@@ -4247,12 +4325,18 @@ export function resumeSession(cwd, request, authority = undefined) {
 export function applyCampaignPlan(cwd, request, authority) {
   requireVerifiedWorkerAuthority(authority, cwd, request);
   sessionRequestAuthorities.set(request, authority);
-  return withSessionLifecycle(cwd, request, "plan", (root, input, _routing, requireGuards, journalGuard) => {
+  return withSessionLifecycle(cwd, request, "plan", (root, input, routing, requireGuards, journalGuard) => {
     const existing = readAttachment(root);
     if (existing === null && loadPlan(root).exists) checkpointFailure("an existing ownerless plan requires explicit resume");
     if (existing !== null && (existing.sessionHash !== sessionHash(input) || existing.workerAuthorityHash !== authority.grantHash)) {
       checkpointFailure("plan transition requires the current owning Worker capability");
     }
+    prepareJournalAppend(root, sessionHash(input), "plan_transitioned", {
+      planHash: canonicalPlanHash(request.plan), priorPlanHash: request.expected.planHash, authorityHash: authority.grantHash,
+      routeGeneration: routing.context === null ? existing?.routeGeneration ?? null
+        : existing?.routeGeneration ?? "00000000-0000-4000-8000-000000000000",
+      claimGeneration: existing?.claimGeneration ?? "00000000-0000-4000-8000-000000000000",
+    }, journalGuard);
     const claim = claimSession(root, input, false, journalGuard);
     if (!claim.claimed || claim.conflict) checkpointFailure("plan transition could not claim its expected source state");
     const bytes = Buffer.from(`${JSON.stringify(request.plan, null, 2)}\n`);
@@ -4409,7 +4493,10 @@ function releaseStop(cwd, input, event, detail, output, journalGuard) {
     if (!detachSession(cwd, input, intendedAttachment, journalGuard)) {
       throw new Error("expected attachment disappeared during Stop cleanup");
     }
-    appendLedger(cwd, input, event, detail, journalGuard);
+    if (!appendLedger(cwd, input, event, detail, journalGuard)) {
+      return allowStopOutput(input,
+        `${output.reason ?? "Supervised Worker released its attachment."} The Stop event could not be recorded in the bounded journal. No durable completion or checkpoint is confirmed; preserve existing evidence and revalidate storage before recovery.`);
+    }
     return output;
   } catch {
     appendLedger(cwd, input, "ownership_cleanup_failed", { attemptedEvent: event }, journalGuard);
@@ -4708,9 +4795,12 @@ function handleHookUnsafe(input, eventName, cwd, inspectedTargets, journalGuard)
     }
     case "PreCompact":
       if (!isAttached(cwd, input)) return {};
-      appendLedger(cwd, input, "pre_compact", {
+      if (!appendLedger(cwd, input, "pre_compact", {
         trigger: ["auto", "manual"].includes(input?.trigger) ? input.trigger : "unknown",
-      }, journalGuard);
+      }, journalGuard)) {
+        return contextOutput(input, "PreCompact",
+          "Supervised Worker could not record compaction metadata in the bounded journal. No checkpoint was created; preserve existing evidence and revalidate storage before continuing.");
+      }
       return {};
     case "Stop":
       return handleStop(input, cwd, journalGuard);
@@ -4872,7 +4962,9 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
         }
       }
       return deniedToolOutput(effectiveCwd, input, attempt,
-        "Supervised Worker could not durably admit the tool start or denied retry. Inspect local ledger state before retrying.", journalGuard);
+        error?.runLedgerReason === "run-ledger-limit-exceeded"
+          ? "Supervised Worker journal storage limit reached; the tool was not admitted. Preserve existing journals and revalidate aggregate byte and physical-file capacity before recovery."
+          : "Supervised Worker could not durably admit the tool start or denied retry. Inspect local ledger state before retrying.", journalGuard);
     }
   };
   try {
@@ -5174,12 +5266,7 @@ function summarizeRunLedgerHeld(cwd, journalGuard) {
       throw runLedgerFailure("run-ledger-invalid");
     }
     const names = readdirSync(directory).sort();
-    if (names.length > RUN_LEDGER_MAX_FILES) {
-      throw runLedgerFailure("run-ledger-limit-exceeded");
-    }
-    if (names.some((name) => !RUN_LEDGER_FILE_PATTERN.test(name))) {
-      throw runLedgerFailure("run-ledger-invalid");
-    }
+    const sessions = journalLayout(names);
 
     const files = [];
     const canonicalRecords = new Set();
@@ -5315,7 +5402,7 @@ function summarizeRunLedgerHeld(cwd, journalGuard) {
       integrity: "plugin-verified-local",
       reason: null,
       hash: hashRunLedger(files),
-      sessionCount: files.length,
+      sessionCount: sessions.size,
       recordCount,
       eventCounts: [...eventCounts]
         .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
@@ -5344,8 +5431,8 @@ function checkpointStatus(cwd, journalGuard) {
       if (summary.status !== "available") {
         operations = unavailableOperations(summary.reason === "run-ledger-absent" ? "ledger-absent" : "ledger-invalid");
       } else {
-        const records = readdirSync(path.join(stateDirectory(cwd), "runs")).sort()
-          .flatMap((name) => readSessionLedger(cwd, name.slice(0, 64), journalGuard).records);
+        const records = [...readJournalInventory(cwd, journalGuard).sessions.keys()].sort()
+          .flatMap((session) => readSessionLedger(cwd, session, journalGuard).records);
         operations = summarizeRunLedgerHeld(cwd, journalGuard).hash === summary.hash ? inspectOperations(records) : unavailableOperations("ledger-invalid");
       }
     }

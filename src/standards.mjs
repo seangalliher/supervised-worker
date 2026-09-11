@@ -388,12 +388,25 @@ function validateCheckpointGates(validate, errors) {
     errors.push("checkpoint valid baseline was rejected by schema or runtime");
     return;
   }
+  const segmented = structuredClone(baseline);
+  segmented.schemaVersion = 2;
+  segmented.ledgerPosition = { ...segmented.ledgerPosition, byteOffset: 16_777_216,
+    recordCount: 1_048_576, prefixHash: "d".repeat(64) };
+  if (!validate(segmented) || validateCheckpoint(segmented).length > 0) {
+    errors.push("checkpoint valid segmented baseline was rejected by schema or runtime");
+  }
   for (const [name, mutate] of [
     ["unknown context", (value) => { value.context.instructions = "not permitted"; }],
     ["wrapped digest", (value) => { value.planHash = [value.planHash]; }],
     ["wrapped UUID", (value) => { value.checkpointId = [value.checkpointId]; }],
     ["unsafe path", (value) => { value.ledgerPosition.path = "../outside.jsonl"; }],
     ["negative offset", (value) => { value.ledgerPosition.byteOffset = -1; }],
+    ["unsupported version", (value) => { value.schemaVersion = 3; }],
+    ["legacy offset beyond base", (value) => { value.ledgerPosition = { ...segmented.ledgerPosition }; }],
+    ["segmented offset beyond root", (value) => { value.schemaVersion = 2;
+      value.ledgerPosition = { ...segmented.ledgerPosition, byteOffset: 16_777_217 }; }],
+    ["segmented record count beyond bound", (value) => { value.schemaVersion = 2;
+      value.ledgerPosition = { ...segmented.ledgerPosition, recordCount: 1_048_577 }; }],
     ["unknown presented as empty", (value) => { value.context.operations.orphans = []; }],
     ["untyped Stop state", (value) => { value.context.stopState = {}; }],
   ]) {

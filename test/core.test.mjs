@@ -153,6 +153,24 @@ function checkpointFixture(routed = false, cwd = workspace()) {
   return { cwd, plan, source, storageRoot, request, attachment, attachmentFile, attachmentBytes, ledgerFile };
 }
 
+function fillSessionJournal(filePath, session, size, sequenceStart = 0) {
+  const buffers = [readFileSync(filePath)];
+  let length = buffers[0].length;
+  let sequence = sequenceStart;
+  while (length < size) {
+    let line = JSON.stringify({ schemaVersion: 1, at: new Date(Date.UTC(2020, 0, 1) + sequence++).toISOString(),
+      event: "pre_compact", session, trigger: "manual" });
+    const remaining = size - length;
+    assert.ok(remaining >= Buffer.byteLength(line) + 1);
+    if (remaining < (Buffer.byteLength(line) + 1) * 2) line = line.padEnd(remaining - 1);
+    const bytes = Buffer.from(`${line}\n`);
+    buffers.push(bytes);
+    length += bytes.length;
+  }
+  writeFileSync(filePath, Buffer.concat(buffers));
+  assert.equal(lstatSync(filePath).size, size);
+}
+
 function writerPayloadCases() {
   return [
     ["create", (target) => ({ path: target })],
@@ -2628,6 +2646,203 @@ test("checkpoint rejects linked state and noncanonical roots without touching th
   assert.deepEqual(readFileSync(attachmentFile), attachmentBytes);
 });
 
+test("journal rollover preserves a full base while admitting a same-session tool", () => {
+  const { cwd, source, attachmentFile, ledgerFile } = checkpointFixture();
+  fillSessionJournal(ledgerFile, sha256(source.session_id), 1_048_496);
+  assert.equal(summarizeRunLedger(cwd).status, "available", "The exact capacity fixture must be a valid journal");
+  const baseBytes = readFileSync(ledgerFile);
+  const baseIdentity = lstatSync(ledgerFile, { bigint: true }).ino;
+  const ownerBytes = readFileSync(attachmentFile);
+  const input = { ...source, tool_name: "Read", tool_use_id: "cross-capacity-read", tool_input: {} };
+  const result = handleHook(input, "PreToolUse");
+  assert.notEqual(result.permissionDecision, "deny", JSON.stringify(result));
+  const segment = ledgerFile.replace(/\.jsonl$/, ".000001.jsonl");
+  assert.equal(existsSync(segment), true);
+  assert.deepEqual(handleHook(input, "PostToolUse"), {});
+  const records = readFileSync(segment, "utf8").trimEnd().split("\n").map(JSON.parse);
+  assert.equal(records.length, 2);
+  assert.equal(records[0].event, "tool_started");
+  assert.equal(records[1].event, "tool_completed");
+  assert.equal(records[1].success, true);
+  assert.equal(records[1].operationId, records[0].operationId);
+  assert.equal(records[1].invocationHash, records[0].invocationHash);
+  assert.deepEqual(readFileSync(ledgerFile), baseBytes);
+  assert.equal(lstatSync(ledgerFile, { bigint: true }).ino, baseIdentity);
+  assert.deepEqual(readFileSync(attachmentFile), ownerBytes);
+  const summary = summarizeRunLedger(cwd);
+  assert.equal(summary.status, "available");
+  assert.equal(summary.sessionCount, 1);
+  assert.equal(summarizePlan(cwd).operations.orphans.length, 0);
+});
+
+test("journal exact-fit start keeps its completion correlated across two rollovers", () => {
+  const { cwd, source, ledgerFile, attachmentFile } = checkpointFixture();
+  const initial = readFileSync(ledgerFile, "utf8").trimEnd().split("\n").map(JSON.parse);
+  const tool = { ...source, tool_name: "Read", tool_use_id: "exact-fit-read", tool_input: {} };
+  const startLength = Buffer.byteLength(`${JSON.stringify({ ...initial[0], toolName: tool.tool_name })}\n`);
+  fillSessionJournal(ledgerFile, sha256(source.session_id), 1_048_576 - startLength);
+  assert.equal(summarizeRunLedger(cwd).status, "available");
+  const ownerBytes = readFileSync(attachmentFile);
+  assert.deepEqual(handleHook(tool, "PreToolUse"), {});
+  assert.equal(lstatSync(ledgerFile).size, 1_048_576, "The start must exactly fill the base");
+  const firstSegment = ledgerFile.replace(/\.jsonl$/, ".000001.jsonl");
+  assert.equal(existsSync(firstSegment), false, "An exact fit must not roll early");
+  const sealedBase = readFileSync(ledgerFile);
+  assert.deepEqual(handleHook(tool, "PostToolUse"), {});
+  const completion = JSON.parse(readFileSync(firstSegment, "utf8").trimEnd());
+  const start = JSON.parse(sealedBase.toString("utf8").trimEnd().split("\n").at(-1));
+  assert.equal(completion.operationId, start.operationId);
+  assert.equal(completion.invocationHash, start.invocationHash);
+  assert.equal(completion.success, true);
+  const completionBytes = readFileSync(firstSegment);
+  assert.deepEqual(handleHook(tool, "PostToolUse"), {});
+  assert.deepEqual(readFileSync(firstSegment), completionBytes, "A duplicate terminal must remain idempotent");
+  fillSessionJournal(firstSegment, sha256(source.session_id), 1_048_496, 100_000);
+  assert.equal(summarizeRunLedger(cwd).status, "available");
+  const sealedFirstSegment = readFileSync(firstSegment);
+  const next = { ...tool, tool_use_id: "second-rollover-read" };
+  assert.deepEqual(handleHook(next, "PreToolUse"), {});
+  assert.deepEqual(handleHook(next, "PostToolUse"), {});
+  const secondSegment = ledgerFile.replace(/\.jsonl$/, ".000002.jsonl");
+  assert.equal(existsSync(secondSegment), true);
+  assert.deepEqual(readFileSync(ledgerFile), sealedBase);
+  assert.deepEqual(readFileSync(firstSegment), sealedFirstSegment);
+  assert.deepEqual(readFileSync(attachmentFile), ownerBytes);
+  assert.equal(summarizeRunLedger(cwd).sessionCount, 1);
+  assert.equal(summarizePlan(cwd).operations.orphans.length, 0);
+});
+
+test("legacy checkpoint base-prefix proof remains valid after later segments exist", () => {
+  const { cwd, source, request, ledgerFile } = checkpointFixture();
+  const checkpoint = checkpointSession(cwd, request);
+  const receiptFile = path.join(cwd, ".supervised-worker", "checkpoints", `${checkpoint.checkpointHash}.json`);
+  const receiptBytes = readFileSync(receiptFile);
+  assert.equal(JSON.parse(receiptBytes).schemaVersion, 1);
+  const originalBase = readFileSync(ledgerFile);
+  const segment = ledgerFile.replace(/\.jsonl$/, ".000001.jsonl");
+  writeFileSync(segment, `${JSON.stringify({ schemaVersion: 1, at: "2020-01-01T00:00:00.000Z",
+    event: "pre_compact", session: sha256(source.session_id), trigger: "manual" })}\n`);
+  assert.equal(summarizeRunLedger(cwd).status, "available");
+  assert.equal(resumeSession(cwd, { session_id: "legacy-prefix-successor", planHash: request.planHash,
+    checkpointHash: checkpoint.checkpointHash }).status, "resumed");
+  assert.deepEqual(readFileSync(ledgerFile), originalBase);
+  assert.deepEqual(readFileSync(receiptFile), receiptBytes);
+});
+
+test("journal physical-file limit denies effects and lifecycle publication without discarding history", () => {
+  const { cwd, source, request, ledgerFile, attachmentFile } = checkpointFixture();
+  fillSessionJournal(ledgerFile, sha256(source.session_id), 1_048_496);
+  const directory = path.dirname(ledgerFile);
+  for (let index = 0; index < 255; index++) {
+    const session = sha256(`bounded-other-session-${index}`);
+    writeFileSync(path.join(directory, `${session}.jsonl`), `${JSON.stringify({ schemaVersion: 1,
+      at: "2020-01-01T00:00:00.000Z", session, event: "pre_compact", trigger: "auto" })}\n`);
+  }
+  assert.equal(summarizeRunLedger(cwd).sessionCount, 256);
+  const owner = readFileSync(attachmentFile);
+  const base = readFileSync(ledgerFile);
+  const tool = { ...source, tool_name: "Read", tool_use_id: "file-limit", tool_input: {} };
+  const denied = handleHook(tool, "PreToolUse");
+  assert.equal(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /journal storage limit reached/);
+  assert.match(handleHook({ ...source, trigger: "manual" }, "PreCompact").additionalContext, /No checkpoint was created/);
+  assert.throws(() => checkpointSession(cwd, request));
+  assert.deepEqual(readFileSync(attachmentFile), owner);
+  assert.equal(existsSync(path.join(cwd, ".supervised-worker", "checkpoints")), false);
+  assert.equal(releaseAttachment(cwd).released, true);
+  assert.throws(() => resumeSession(cwd, { session_id: "file-limit-successor", planHash: request.planHash, checkpointHash: null }));
+  assert.equal(existsSync(attachmentFile), false, "Predictable capacity failure must not publish a new owner");
+  assert.deepEqual(readFileSync(ledgerFile), base);
+  assert.equal(readdirSync(directory).length, 256);
+});
+
+test("segmented journal retains its complete valid history at the aggregate byte ceiling", () => {
+  const { cwd, source, ledgerFile, attachmentFile } = checkpointFixture();
+  const files = [];
+  for (let index = 0; index < 16; index++) {
+    const file = index === 0 ? ledgerFile : ledgerFile.replace(/\.jsonl$/, `.${String(index).padStart(6, "0")}.jsonl`);
+    if (index > 0) writeFileSync(file, "");
+    fillSessionJournal(file, sha256(source.session_id), 1_048_576, index * 100_000);
+    files.push({ file, hash: sha256(readFileSync(file)) });
+  }
+  assert.equal(files.reduce((total, { file }) => total + lstatSync(file).size, 0), 16_777_216);
+  const before = summarizeRunLedger(cwd);
+  assert.equal(before.status, "available", "A full but valid aggregate must remain inspectable");
+  assert.equal(before.sessionCount, 1);
+  const ownerBytes = readFileSync(attachmentFile);
+  const input = { ...source, tool_name: "Read", tool_use_id: "aggregate-full", tool_input: {} };
+  const denied = handleHook(input, "PreToolUse");
+  assert.equal(denied.permissionDecision, "deny");
+  assert.match(denied.permissionDecisionReason, /journal storage limit reached/);
+  assert.equal(readdirSync(path.dirname(ledgerFile)).length, 16);
+  for (const { file, hash } of files) assert.equal(sha256(readFileSync(file)), hash);
+  assert.deepEqual(readFileSync(attachmentFile), ownerBytes);
+  assert.deepEqual(summarizeRunLedger(cwd), before);
+});
+
+for (const kind of ["hard-link", "directory", "oversized"]) {
+  test(`journal admission rejects an unsafe ${kind} in a different session`, () => {
+    const { cwd, source, ledgerFile, attachmentFile } = checkpointFixture();
+    const otherSession = sha256("admission-sibling-session");
+    const otherFile = path.join(path.dirname(ledgerFile), `${otherSession}.jsonl`);
+    writeFileSync(otherFile, `${JSON.stringify({ schemaVersion: 1, at: "2020-01-01T00:00:00.000Z",
+      event: "pre_compact", session: otherSession, trigger: "manual" })}\n`);
+    const control = { ...source, tool_name: "Read", tool_use_id: "valid-sibling-control", tool_input: {} };
+    assert.deepEqual(handleHook(control, "PreToolUse"), {});
+    assert.deepEqual(handleHook(control, "PostToolUse"), {});
+    assert.equal(summarizeRunLedger(cwd).sessionCount, 2);
+    const ownerBytes = readFileSync(attachmentFile);
+    const baseBytes = readFileSync(ledgerFile);
+    if (kind === "hard-link") {
+      linkSync(otherFile, path.join(cwd, "linked-evidence.jsonl"));
+      assert.equal(lstatSync(otherFile).nlink, 2);
+    } else if (kind === "directory") {
+      rmSync(otherFile);
+      mkdirSync(otherFile);
+      assert.equal(lstatSync(otherFile).isDirectory(), true);
+    } else {
+      writeFileSync(otherFile, Buffer.alloc(1_048_577, 0x20));
+      assert.equal(lstatSync(otherFile).size, 1_048_577);
+    }
+    const before = lstatSync(otherFile, { bigint: true });
+    const denied = handleHook({ ...control, tool_use_id: "unsafe-sibling-attempt" }, "PreToolUse");
+    assert.equal(denied.permissionDecision, "deny");
+    assert.match(denied.permissionDecisionReason, /no retry permit/);
+    assert.deepEqual(readFileSync(ledgerFile), baseBytes);
+    assert.deepEqual(readFileSync(attachmentFile), ownerBytes);
+    const after = lstatSync(otherFile, { bigint: true });
+    for (const property of ["dev", "ino", "nlink", "size", "mtimeNs"]) assert.equal(after[property], before[property]);
+  });
+}
+
+for (const rollover of ["before-checkpoint", "persistence-event"]) {
+  test(`segmented checkpoint preserves a logical prefix when rollover occurs at ${rollover}`, () => {
+    const { cwd, source, request, ledgerFile, attachmentFile } = checkpointFixture();
+    fillSessionJournal(ledgerFile, sha256(source.session_id), 1_048_496);
+    assert.equal(summarizeRunLedger(cwd).status, "available");
+    const original = readFileSync(ledgerFile);
+    if (rollover === "before-checkpoint") {
+      const tool = { ...source, tool_name: "Read", tool_use_id: "segmented-checkpoint-read", tool_input: {} };
+      assert.deepEqual(handleHook(tool, "PreToolUse"), {});
+      assert.deepEqual(handleHook(tool, "PostToolUse"), {});
+    }
+    const checkpoint = checkpointSession(cwd, { ...request, attachmentHash: sha256(readFileSync(attachmentFile)) });
+    assert.equal(checkpoint.status, "checkpointed");
+    const receipt = JSON.parse(readFileSync(path.join(cwd, ".supervised-worker", "checkpoints", `${checkpoint.checkpointHash}.json`)));
+    assert.equal(receipt.schemaVersion, 2);
+    assert.deepEqual(validateCheckpoint(receipt), []);
+    assert.equal(receipt.ledgerPosition.byteOffset > 1_048_576, rollover === "before-checkpoint");
+    const records = Buffer.concat([original, readFileSync(ledgerFile.replace(/\.jsonl$/, ".000001.jsonl"))]);
+    assert.equal(sha256(records.subarray(0, receipt.ledgerPosition.byteOffset)), receipt.ledgerPosition.prefixHash);
+    const recovered = resumeSession(cwd, { session_id: `segment-checkpoint-successor-${rollover}`,
+      planHash: request.planHash, checkpointHash: checkpoint.checkpointHash });
+    assert.equal(recovered.status, "resumed");
+    assert.equal(recovered.context.operations.status, "observed");
+    assert.equal(recovered.context.operations.orphans.length, 0);
+    assert.deepEqual(readFileSync(ledgerFile), original);
+  });
+}
+
 test("ownerless recovery preserves unknown operations and never repeats a side effect", () => {
   const { cwd, source, request, attachmentFile } = checkpointFixture();
   assert.equal(handleHook({ ...source, stop_hook_active: false }, "Stop").decision, "block");
@@ -2790,7 +3005,8 @@ test("missing ledger observation is unavailable rather than a verified empty orp
   assert.match(handleHook({ cwd, session_id: "unobserved-recovery" }, "SessionStart").additionalContext, /"status":"unavailable"/);
 });
 
-test("checkpoint and resume preserve staged, unstaged, untracked work and index identity", () => {
+for (const segmented of [false, true]) {
+test(`checkpoint and resume preserve staged, unstaged, untracked work and index identity (segmented=${segmented})`, () => {
   const cwd = workspace();
   const git = (...args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   git("init", "--quiet");
@@ -2806,7 +3022,8 @@ test("checkpoint and resume preserve staged, unstaged, untracked work and index 
   };
   assert.match(before.status, /AM tracked\.txt/);
   assert.match(before.status, /\?\? untracked\.txt/);
-  const { request } = checkpointFixture(false, cwd);
+  const { request, ledgerFile, source } = checkpointFixture(false, cwd);
+  if (segmented) fillSessionJournal(ledgerFile, sha256(source.session_id), 1_048_496);
   assert.throws(() => checkpointSession(cwd, { ...request, attachmentHash: "0".repeat(64) }));
   const checkpoint = checkpointSession(cwd, request);
   const next = { session_id: "dirty-git-successor", planHash: request.planHash, checkpointHash: checkpoint.checkpointHash };
@@ -2820,6 +3037,7 @@ test("checkpoint and resume preserve staged, unstaged, untracked work and index 
   assert.equal(readFileSync(path.join(cwd, "tracked.txt"), "utf8"), "unstaged\n");
   assert.equal(readFileSync(path.join(cwd, "untracked.txt"), "utf8"), "untracked\n");
 });
+}
 
 test("run ledger summary consumes appendLedger records without exposing detail", () => {
   const cwd = workspace();
@@ -2903,6 +3121,33 @@ test("Stop hook allows a mechanically complete plan", () => {
   attachPlan(cwd);
   assert.deepEqual(handleHook(stopInput(cwd), "Stop"), {});
 });
+
+for (const state of ["complete", "inactive", "absent"]) {
+  test(`Stop reports failed journal publication for an otherwise silent ${state} plan`, () => {
+    const cwd = workspace();
+    writePlan(cwd);
+    attachPlan(cwd);
+    assert.equal(summarizeRunLedger(cwd).status, "available");
+    if (state === "complete") {
+      writePlan(cwd, { mode: "complete", items: [{ id: "issue-1", title: "First issue", status: "banked" }],
+        completion: { enumeration: { status: "complete", source: "fixture enumeration",
+          checkedAt: "2026-09-01T00:00:00Z", remainingActionable: 0 },
+        evidence: [{ kind: "test", locator: "logs/gates/receipt.json" }] } });
+      assert.equal(summarizePlan(cwd).complete, true);
+    } else if (state === "inactive") writePlan(cwd, { mode: "inactive" });
+    else rmSync(planPath(cwd));
+    const runs = path.join(cwd, ".supervised-worker", "runs");
+    rmSync(runs, { recursive: true });
+    writeFileSync(runs, "unavailable fixture journal");
+    const output = handleHook(stopInput(cwd), "Stop");
+    assert.equal(output.decision, "allow");
+    assert.match(output.systemMessage, /^Supervised Worker released its attachment\./);
+    assert.match(output.systemMessage, /Stop event could not be recorded/);
+    assert.match(output.systemMessage, /No durable completion or checkpoint is confirmed/);
+    assert.doesNotMatch(JSON.stringify(output), /undefined/);
+    assert.equal(existsSync(path.join(cwd, ".supervised-worker", "attachment.json")), false);
+  });
+}
 
 test("completion evidence does not pass while plan mode remains active", () => {
   const cwd = workspace();
@@ -3139,7 +3384,11 @@ test("ledger failure cannot prevent bounded Stop release", () => {
   writeFileSync(runs, "not a directory");
   assert.equal(handleHook(stopInput(cwd), "Stop").hookSpecificOutput.decision, "block");
   assert.equal(handleHook(stopInput(cwd, true), "Stop").hookSpecificOutput.decision, "block");
-  assert.match(handleHook(stopInput(cwd, true), "Stop").systemMessage, /bounded retry limit/);
+  const output = handleHook(stopInput(cwd, true), "Stop");
+  assert.match(output.systemMessage, /bounded retry limit/);
+  assert.match(output.systemMessage, /Stop event could not be recorded/);
+  assert.match(output.systemMessage, /No durable completion or checkpoint is confirmed/);
+  assert.equal(existsSync(path.join(cwd, ".supervised-worker", "attachment.json")), false);
 });
 
 test("malformed attached plan gives bounded SessionStart guidance", () => {

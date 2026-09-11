@@ -100,6 +100,53 @@ test("complete measured timings stay separate and incomplete observations become
   });
 });
 
+test("installed CLI checkpoints and resumes segmented history before compiling its bound receipt", () => {
+  fixture(({ root, input, worker, manifest, plan }) => {
+    const state = path.join(root, ".supervised-worker");
+    const baseFile = path.join(state, "runs", `${sha256(input.session_id)}.jsonl`);
+    const baseBytes = readFileSync(baseFile);
+    const segmentFile = baseFile.replace(/\.jsonl$/, ".000001.jsonl");
+    const segmentBytes = Buffer.from(`${JSON.stringify({ schemaVersion: 1, at: "2020-01-01T00:00:00.000Z",
+      event: "pre_compact", session: sha256(input.session_id), trigger: "manual" })}\n`);
+    writeFileSync(segmentFile, segmentBytes);
+    const invoke = (args, request) => {
+      const result = spawnSync(process.execPath, [path.join(worker.installRoot, "src", "cli.mjs"), ...args], {
+        cwd: root, input: JSON.stringify(request), encoding: "utf8", timeout: 20_000,
+        env: { ...process.env, SUPERVISED_WORKER_HOST_AUTHORITY: worker.inventoryPath },
+      });
+      assert.equal(result.error, undefined, result.error?.message);
+      assert.equal(result.status, 0, result.stdout || result.stderr);
+      return JSON.parse(result.stdout);
+    };
+    const checkpoint = invoke(["checkpoint"], { ...input, planHash: canonicalPlanHash(plan),
+      attachmentHash: sha256(readFileSync(path.join(state, "attachment.json"))) });
+    assert.equal(checkpoint.status, "checkpointed");
+    const checkpointPath = path.join(state, "checkpoints", `${checkpoint.checkpointHash}.json`);
+    const checkpointBytes = readFileSync(checkpointPath);
+    const saved = JSON.parse(checkpointBytes);
+    assert.equal(saved.schemaVersion, 2);
+    assert.equal(saved.ledgerPosition.prefixHash, sha256(Buffer.concat([baseBytes, segmentBytes])));
+    const successor = { session_id: "segmented-cli-successor" };
+    worker.select(successor);
+    const resumed = invoke(["resume"], { ...successor, planHash: canonicalPlanHash(plan), checkpointHash: checkpoint.checkpointHash });
+    assert.equal(resumed.status, "resumed");
+    assert.equal(resumed.context.operations.status, "observed");
+    assert.equal(resumed.context.operations.orphans.length, 0);
+    const attachment = JSON.parse(readFileSync(path.join(state, "attachment.json")));
+    assert.equal(attachment.sessionHash, sha256(successor.session_id));
+    assert.equal(attachment.workerAuthorityHash, worker.authority().grantHash);
+    assert.deepEqual(readFileSync(baseFile), baseBytes);
+    assert.deepEqual(readFileSync(checkpointPath), checkpointBytes);
+    manifest.artifacts.push({ role: "checkpoint", reference: {
+      locator: `.supervised-worker/checkpoints/${checkpoint.checkpointHash}.json`, sha256: checkpoint.checkpointHash } });
+    manifest.doctorInventoryHash = observeReleaseDoctorInventory(root, successor, worker.authority()).doctorInventoryHash;
+    const compiled = invoke(["campaign", "compile", "--format", "json"], { ...successor, manifest });
+    assert.equal(compiled.dispositions.campaign, "incomplete");
+    assert.equal(compiled.dispositions.hostSession, "checkpoint-recorded");
+    assert.deepEqual(validateCompiledRelease(compiled), []);
+  });
+});
+
 for (const reviewMode of ["legacy-staged", "staged", "committed"]) {
 test(`${reviewMode} handoff compilation binds published model evidence and separates item from campaign completion`, () => {
   fixture(({ root, input, authority, worker, manifest, plan }) => {
@@ -275,11 +322,13 @@ test("Doctor-inclusive receipt compiles through the installed CLI without compan
   });
 });
 
-test("checkpoint disposition binds its exact plan and bytes without declaring campaign completion", () => {
+for (const version of [1, 2]) {
+test(`checkpoint v${version} disposition binds its exact plan and bytes without declaring campaign completion`, () => {
   fixture(({ root, input, authority, manifest, plan }) => {
-    const value = { schemaVersion: 1, kind: "session-checkpoint", checkpointId: randomUUID(), createdAt: "2026-09-07T00:00:00.000Z",
+    const value = { schemaVersion: version, kind: "session-checkpoint", checkpointId: randomUUID(), createdAt: "2026-09-07T00:00:00.000Z",
       planHash: canonicalPlanHash(plan), sessionHash: sha256(input.session_id), routeGeneration: null, claimGeneration: null, attachmentHash: "a".repeat(64),
-      ledgerPosition: { path: `runs/${sha256(input.session_id)}.jsonl`, byteOffset: 0, recordCount: 0, prefixHash: sha256("") },
+      ledgerPosition: { path: `runs/${sha256(input.session_id)}.jsonl`, byteOffset: version === 1 ? 0 : 1_048_577,
+        recordCount: version === 1 ? 0 : 2, prefixHash: version === 1 ? sha256("") : "d".repeat(64) },
       context: { counts: { pending: 0, in_progress: 1, banked: 0, parked: 0 }, itemHashes: [sha256(`supervised-worker-checkpoint-item-v1\0${plan.items[0].id}`)], stopState: null,
         operations: { status: "observed", reason: null, orphans: [], uncorrelatedCompletions: 0 } } };
     const bytes = Buffer.from(JSON.stringify(value));
@@ -295,6 +344,7 @@ test("checkpoint disposition binds its exact plan and bytes without declaring ca
     assert.throws(() => compileCampaignRelease(root, input, manifest, authority));
   });
 });
+}
 
 test("recovery evidence is inventoried without Doctor and cannot become recorded resolution", () => {
   fixture(({ root, input, authority, manifest }) => {

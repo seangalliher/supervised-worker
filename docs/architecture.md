@@ -188,13 +188,41 @@ is required because that release added Agent Plugins v1 manifest support.
 ### Helper
 
 Routine starts and completions share one journal transaction with legacy event
-appenders. It covers correlation, complete-file read/modify/publication, fsync,
+appenders. It covers correlation, tail-file read/modify/publication, fsync,
 read-back, and admission under the existing record, file-count, file-size, and
 aggregate bounds. No acknowledged prefix is truncated or overwritten by a
 concurrent writer. Checkpoint capture holds this boundary through its exact
 `checkpoint_persisted` watermark and ownership tombstone. A completion that wins
 the boundary is included; a checkpoint that wins retains an outcome-unknown
 operation. Late hooks cannot rewrite a receipt or satisfy another claim.
+
+Each session has one logical journal, starting at `runs/<session-hash>.jsonl`.
+When the next complete record would exceed that file's 1 MiB limit, publication
+creates `runs/<session-hash>.000001.jsonl`, followed by contiguous six-digit
+segments. An exact fit stays in the current tail. Records are never split or
+padded; sealed predecessors keep their bytes and filesystem identities. There
+is no segment manifest, historical rename, deletion, or rollover event.
+
+Readers validate base-first logical order, contiguous segment names, complete
+records, single-link regular files, stable identities, and canonical-record
+uniqueness across the stream. Missing bases, gaps, invalid names, partial tails,
+and foreign temporary files make the observation unavailable. Publication
+revalidates the complete session inventory, bytes and identities, ignoring only
+its own validated temporary file. The aggregate hash retains its existing
+physical-name ordering and framing; legacy-only inventories keep their hashes.
+`sessionCount` counts distinct logical sessions, not physical files.
+
+Each append reads and validates its full bounded logical session history and
+rechecks it before publication. Cost therefore grows with that session's retained
+bytes; near 16 MiB, individual synchronous hooks can take several seconds, paid
+on both start and completion. This preserves full correlation and prefix checks,
+not constant-time execution. Unrelated sessions contribute safe file-size checks
+to admission without having their contents reread. Host hook timeouts still
+apply; segmentation is not a latency or uninterrupted-execution guarantee.
+
+Compared with a base-only reader, a crash-left temporary file now also prevents
+logical-session reads and checkpoint proof verification, not just appends. It
+remains evidence for explicit recovery; readers do not silently discard it.
 
 `observation retry-denied` accepts bounded JSON containing the owning session,
 optional transcript anchor, source operation UUID, plan hash, and attachment
@@ -474,6 +502,20 @@ snapshot or null, and bounded operation observations. Runtime validation also
 checks relational constraints such as count totals, source filename, prefix
 hash/count, and the persistence event at that exact watermark.
 
+Checkpoint version 1 retains its base-file prefix and 1 MiB offset bound.
+Version 2 uses that same path as a logical stream identifier and allows an
+offset up to the unchanged 16 MiB aggregate bound. Both versions retain the
+1,048,576-record watermark limit. The producer emits version 2 whenever either
+the prefix or its `checkpoint_persisted` record requires a segment. Verification
+follows the next logical record across boundaries; a version 1 proof still
+verifies against its original base after later segments exist.
+
+Once retained history contains segments, keep a segment-capable immutable helper.
+Older validators reject version 2 receipts, but older base-only readers can
+overlook segment files. A fresh session alone does not make downgrade compatible.
+Do not delete history to enable rollback; preserve the compatible installation
+for every campaign that retains segmented journals.
+
 Explicit resume requires a fresh session different from the source. It validates
 the receipt, tombstone, unchanged active plan, and source ledger binding,
 restores the Stop snapshot before publishing active ownership with fresh claim
@@ -504,14 +546,23 @@ retains its existing flush and revalidation of the prior journals. Valid unknown
 operations and uncorrelated completion counts are carried without double counting;
 unavailable history remains explicitly unavailable.
 
-Journal capacity is finite: 1 MiB per session file, 16 MiB across the runs root,
-and at most 256 files. Recovery does not truncate or rotate history and does not
-raise those limits. After a bounded Stop has released ownership, a verified fresh
-session can use ownerless resume and a new journal if the existing history and
-aggregate limits permit it. This is recovery, not automatic capacity prevention.
-If combined orphan references exceed the checkpoint's 256-reference bound, the
-checkpoint fails rather than silently dropping references. Capacity handoff and
-unknown-outcome reconciliation require separately governed work.
+Journal capacity is finite: 1 MiB per physical file, 16 MiB across committed
+journal files in the runs root, at most 256 physical files, and 16 KiB per record
+excluding its line terminator. Segmentation prevents per-file exhaustion while
+aggregate capacity remains; it does not raise these limits or discard history.
+Predictable capacity failures deny new tool starts and are checked before
+checkpoint-receipt, plan-transition, and fresh-owner publication. Post-effect
+persistence failures remain unconfirmed and grant no automatic replay authority.
+
+There is no reserved space guaranteeing terminal or checkpoint recording at
+aggregate saturation. Stop and PreCompact report journal failures visibly;
+bounded Stop may still release ownership without a durable event or checkpoint.
+After release, a verified fresh session can use ownerless resume only if the
+existing history and aggregate limits permit it. This is not unlimited storage
+or guaranteed uninterrupted queue execution. If combined orphan references
+exceed the checkpoint's 256-reference bound, checkpointing fails rather than
+silently dropping references. Capacity handoff and unknown-outcome reconciliation
+require separately governed work.
 
 Receipt, flush, or pre-detachment event failure leaves the original attachment
 and route authoritative. After tombstone publication, a route-cleanup failure
