@@ -2,13 +2,17 @@ import assert from "node:assert/strict";
 import {
   cpSync,
   existsSync,
+  linkSync,
+  lstatSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
   realpathSync,
   readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -22,9 +26,12 @@ import { fileURLToPath } from "node:url";
 import { ALL_TOOL_MATCHER, sha256 } from "../src/core.mjs";
 import {
   buildInstalledHookManifest,
+  capturePluginSourceVerification,
   defaultInstallBase,
   installLocalPlugin,
+  releasePluginSourceVerification,
   resolvePluginSourceIdentity,
+  verifyPluginSourceVerification,
 } from "../src/install.mjs";
 import { spawnProcessTreeSync } from "./process-tree.mjs";
 import { createWorkerAuthorityFixture } from "./worker-authority-fixture.mjs";
@@ -122,6 +129,189 @@ test("default install base stays in per-user application data", () => {
     }),
     "/Users/example/Library/Application Support/SupervisedWorker/plugins",
   );
+});
+
+test("immutable verification scopes are opaque, bounded to their lifetime and strongly recheck bytes", () => {
+  const base = temporaryDirectory("sw-install-verification-");
+  try {
+    const { installRoot } = installLocalPlugin(root, { baseDirectory: path.join(base, "install") });
+    const handle = capturePluginSourceVerification(installRoot);
+    assert.equal(Object.isFrozen(handle), true);
+    const source = verifyPluginSourceVerification(handle);
+    assert.equal(Object.isFrozen(source), true);
+    assert.deepEqual(source, resolvePluginSourceIdentity(installRoot));
+    for (const invalid of [null, undefined, {}, { ...handle }]) assert.throws(() => verifyPluginSourceVerification(invalid), /unavailable/);
+    const require = createRequire(import.meta.url);
+    const filesystem = require("node:fs");
+    const originalRead = filesystem.readFileSync;
+    const runtime = path.join(installRoot, "src", "core.mjs");
+    let reads = 0;
+    filesystem.readFileSync = (file, ...options) => {
+      if (file === runtime) reads++;
+      return originalRead(file, ...options);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.deepEqual(verifyPluginSourceVerification(handle), source);
+      assert.equal(reads, 0);
+      assert.deepEqual(verifyPluginSourceVerification(handle, true), source);
+      assert.equal(reads, 1, "The strong boundary must read actual immutable bytes");
+    } finally {
+      filesystem.readFileSync = originalRead;
+      syncBuiltinESMExports();
+      releasePluginSourceVerification(handle);
+    }
+    assert.throws(() => verifyPluginSourceVerification(handle), /unavailable/);
+    assert.throws(() => releasePluginSourceVerification(handle), /unavailable/);
+    assert.throws(() => capturePluginSourceVerification(root), /immutable installation/);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+for (const change of ["same-size-restored-mtime", "replace", "add", "delete", "hard-link", "directory-link", "record", "root", "base"]) {
+  test(`immutable verification scope rejects ${change} without adopting a new baseline`, () => {
+    const base = temporaryDirectory("sw-install-drift-");
+    try {
+      const { installRoot } = installLocalPlugin(root, { baseDirectory: path.join(base, "install") });
+      const file = path.join(installRoot, "README.md");
+      const timestamp = new Date("2020-01-01T00:00:00.000Z");
+      utimesSync(file, timestamp, timestamp);
+      const before = lstatSync(file, { bigint: true });
+      const original = readFileSync(file);
+      const handle = capturePluginSourceVerification(installRoot);
+      assert.equal(verifyPluginSourceVerification(handle).sourceKind, "immutable-install-record");
+      if (change === "same-size-restored-mtime") {
+        const modified = Buffer.from(original);
+        modified[0] ^= 1;
+        writeFileSync(file, modified);
+        utimesSync(file, timestamp, timestamp);
+        assert.equal(lstatSync(file, { bigint: true }).mtimeNs, before.mtimeNs);
+        assert.equal(lstatSync(file, { bigint: true }).size, before.size);
+        assert.notDeepEqual(readFileSync(file), original);
+      } else if (change === "replace") {
+        const replacement = path.join(base, "replacement");
+        writeFileSync(replacement, original);
+        renameSync(replacement, file);
+        assert.notEqual(lstatSync(file, { bigint: true }).ino, before.ino);
+      } else if (change === "add") writeFileSync(path.join(installRoot, "added"), "extra");
+      else if (change === "delete") rmSync(file);
+      else if (change === "hard-link") linkSync(file, path.join(base, "linked-readme"));
+      else if (change === "directory-link") {
+        const target = path.join(base, "linked-directory");
+        mkdirSync(target);
+        symlinkSync(target, path.join(installRoot, "linked-directory"), process.platform === "win32" ? "junction" : "dir");
+      } else if (change === "record") {
+        const record = path.join(installRoot, "install-record.json");
+        writeFileSync(record, `${readFileSync(record, "utf8")} `);
+      } else if (change === "root") {
+        renameSync(installRoot, path.join(base, "old-root"));
+        cpSync(path.join(base, "old-root"), installRoot, { recursive: true });
+      } else {
+        const parent = path.dirname(installRoot);
+        renameSync(parent, path.join(base, "old-base"));
+        cpSync(path.join(base, "old-base"), parent, { recursive: true });
+      }
+      let originalFailure;
+      assert.throws(() => verifyPluginSourceVerification(handle), (error) => { originalFailure = error; return true; });
+      assert.throws(() => verifyPluginSourceVerification(handle, true), (error) => error === originalFailure);
+      releasePluginSourceVerification(handle);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+}
+
+test("immutable strong verification detects changed bytes even when metadata appears unchanged", () => {
+  const base = temporaryDirectory("sw-install-strong-");
+  const filesystem = createRequire(import.meta.url)("node:fs");
+  const originalStat = filesystem.lstatSync;
+  let handle;
+  try {
+    const { installRoot } = installLocalPlugin(root, { baseDirectory: path.join(base, "install") });
+    const file = path.join(installRoot, "README.md");
+    const plain = originalStat(file);
+    const big = originalStat(file, { bigint: true });
+    handle = capturePluginSourceVerification(installRoot);
+    const modified = Buffer.from(readFileSync(file));
+    modified[0] ^= 1;
+    writeFileSync(file, modified);
+    let masked = 0;
+    filesystem.lstatSync = (target, options) => {
+      if (path.resolve(String(target)) === file) { masked++; return options?.bigint ? big : plain; }
+      return originalStat(target, options);
+    };
+    syncBuiltinESMExports();
+    assert.doesNotThrow(() => verifyPluginSourceVerification(handle));
+    assert.ok(masked > 0, "The fixture must actually conceal the changed file metadata");
+    assert.throws(() => verifyPluginSourceVerification(handle, true), /immutable record/);
+  } finally {
+    filesystem.lstatSync = originalStat;
+    syncBuiltinESMExports();
+    if (handle) releasePluginSourceVerification(handle);
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("immutable verification falls back to bytes when file identity metadata is unavailable", () => {
+  const base = temporaryDirectory("sw-install-metadata-");
+  const filesystem = createRequire(import.meta.url)("node:fs");
+  const originalStat = filesystem.lstatSync;
+  const originalRead = filesystem.readFileSync;
+  let handle;
+  try {
+    const { installRoot } = installLocalPlugin(root, { baseDirectory: path.join(base, "install") });
+    const file = path.join(installRoot, "src", "core.mjs");
+    filesystem.lstatSync = (target, options) => {
+      const stats = originalStat(target, options);
+      if (target === file && options?.bigint) stats.ino = 0n;
+      return stats;
+    };
+    syncBuiltinESMExports();
+    handle = capturePluginSourceVerification(installRoot);
+    let reads = 0;
+    filesystem.readFileSync = (target, ...options) => {
+      if (target === file) reads++;
+      return originalRead(target, ...options);
+    };
+    syncBuiltinESMExports();
+    assert.equal(verifyPluginSourceVerification(handle).sourceKind, "immutable-install-record");
+    assert.equal(reads, 1, "Missing stable identity must force a fresh byte check");
+  } finally {
+    filesystem.lstatSync = originalStat;
+    filesystem.readFileSync = originalRead;
+    syncBuiltinESMExports();
+    if (handle) releasePluginSourceVerification(handle);
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("immutable verification refuses a snapshot changed during its initial byte scan", () => {
+  const base = temporaryDirectory("sw-install-capture-");
+  const filesystem = createRequire(import.meta.url)("node:fs");
+  const originalRead = filesystem.readFileSync;
+  try {
+    const { installRoot } = installLocalPlugin(root, { baseDirectory: path.join(base, "install") });
+    const file = path.join(installRoot, "README.md");
+    let fired = false;
+    filesystem.readFileSync = (target, ...options) => {
+      const bytes = originalRead(target, ...options);
+      if (!fired && target === file) {
+        fired = true;
+        const modified = Buffer.from(bytes);
+        modified[0] ^= 1;
+        writeFileSync(file, modified);
+      }
+      return bytes;
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => capturePluginSourceVerification(installRoot), /changed during verification/);
+    assert.equal(fired, true);
+  } finally {
+    filesystem.readFileSync = originalRead;
+    syncBuiltinESMExports();
+    rmSync(base, { recursive: true, force: true });
+  }
 });
 
 test("installed Unix launchers use absolute trusted paths without cwd fallback", () => {

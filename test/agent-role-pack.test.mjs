@@ -126,6 +126,20 @@ test("Worker tool declarations include native delegation before campaign admissi
   }
 });
 
+test("Worker execution guidance bounds overlap and preserves gate and continuation requirements", () => {
+  for (const id of ["seangalliher-supervised-worker", "supervised-worker"]) {
+    const { body } = readAgent(id);
+    assert.match(body, /at most two read-only calls per parallel batch/);
+    assert.match(body, /include\s+that limit in each companion request/);
+    assert.match(body, /still-valid exact-tree receipts/);
+    assert.match(body, /A changed tree invalidates its gate/);
+    assert.match(body, /do not duplicate watchers/i);
+    assert.match(body, /Do not\s+checkpoint merely because CI is pending/);
+    assert.match(body, /full checkpoint hash and the absolute path/);
+    assert.match(body, /Review, compatibility,\s+required checks, provider success and verified closure remain mandatory/);
+  }
+});
+
 test("companion inline handoff templates pass the runtime validator", () => {
   for (const id of [
     "seangalliher-supervised-architect",

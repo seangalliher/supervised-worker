@@ -23,7 +23,7 @@ import { performance } from "node:perf_hooks";
 
 import { parseWorkflowJson, resolveWorkflowRoles, WORKFLOW_CONFIG_PATH } from "./workflow.mjs";
 import { captureHandoffValidation, requireModelReceiptPublication, validateModelReceiptValue } from "./handoff.mjs";
-import { requireVerifiedWorkerAuthority, verifyWorkerAuthority } from "./authority.mjs";
+import { requireFullWorkerAuthority, requireVerifiedWorkerAuthority, verifyWorkerAuthority, withWorkerAuthorityVerification } from "./authority.mjs";
 import { doctorInvocationRequest } from "./doctor-invocation.mjs";
 
 export const STATE_DIRECTORY = ".supervised-worker";
@@ -66,6 +66,7 @@ const LIFECYCLE_SYSCALLS = new Set([
 const sessionLockWaitCell = new Int32Array(
   new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
 );
+const journalPublicationVerifiers = new WeakMap();
 const WINDOWS_DRIVE_CHECK_TIMEOUT_MS = 500;
 const WINDOWS_PATH_CHECK_BUDGET_MS = 1_500;
 const MAX_WINDOWS_DRIVES_PER_OPERATION = 3;
@@ -3155,11 +3156,10 @@ function durableWriteBytes(cwd, filePath, bytes, maximumBytes, immutable = false
   }
 }
 
-function parseRunLedgerBytes(bytes, expectedSession, maximumBytes = RUN_LEDGER_MAX_FILE_BYTES) {
+function parseRunLedgerBytes(bytes, expectedSession, maximumBytes = RUN_LEDGER_MAX_FILE_BYTES, canonicalRecords = new Set()) {
   if (bytes.length > maximumBytes) throw runLedgerFailure("run-ledger-limit-exceeded");
   if (bytes.length === 0 || bytes.at(-1) !== 0x0a) throw runLedgerFailure("run-ledger-invalid");
   const records = [];
-  const canonicalRecords = new Set();
   let start = 0;
   for (let index = 0; index < bytes.length; index += 1) {
     if (bytes[index] !== 0x0a) continue;
@@ -3213,7 +3213,7 @@ function readJournalInventory(cwd, journalGuard, ignoredTemporary = null) {
   return { directory, names, sessions: journalLayout(names) };
 }
 
-function readSessionLedger(cwd, hash, journalGuard, flush = false, ignoredTemporary = null) {
+function readSessionLedgerBytes(cwd, hash, journalGuard, flush = false, ignoredTemporary = null) {
   const inventory = readJournalInventory(cwd, journalGuard, ignoredTemporary);
   const layout = inventory.sessions.get(hash) ?? [];
   const segments = [];
@@ -3224,7 +3224,6 @@ function readSessionLedger(cwd, hash, journalGuard, flush = false, ignoredTempor
       flush && segment.index === layout.length - 1);
     length += snapshot.bytes.length;
     if (length > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
-    parseRunLedgerBytes(snapshot.bytes, hash);
     segments.push({ ...segment, ...snapshot });
   }
   if (JSON.stringify(readJournalInventory(cwd, journalGuard, ignoredTemporary).names) !== JSON.stringify(inventory.names)) {
@@ -3237,8 +3236,15 @@ function readSessionLedger(cwd, hash, journalGuard, flush = false, ignoredTempor
   }
   const bytes = Buffer.concat(segments.map((segment) => segment.bytes));
   journalGuard(cwd);
-  return { bytes, records: segments.length === 0 ? [] : parseRunLedgerBytes(bytes, hash, RUN_LEDGER_MAX_TOTAL_BYTES),
-    exists: segments.length > 0, segments, inventory: inventory.names };
+  return { bytes, exists: segments.length > 0, segments, inventory: inventory.names };
+}
+
+function readSessionLedger(cwd, hash, journalGuard, flush = false, ignoredTemporary = null) {
+  const snapshot = readSessionLedgerBytes(cwd, hash, journalGuard, flush, ignoredTemporary);
+  const canonicalRecords = new Set();
+  const records = snapshot.segments.flatMap((segment) =>
+    parseRunLedgerBytes(segment.bytes, hash, RUN_LEDGER_MAX_FILE_BYTES, canonicalRecords));
+  return { ...snapshot, records, canonicalRecords };
 }
 
 function requireJournalAdmission(cwd, fileName, bytes, journalGuard, ignoredTemporary = null) {
@@ -3266,7 +3272,7 @@ function prepareJournalAppend(cwd, hash, event, detail, journalGuard, recordedAt
   requireRunLedgerRecord(record, hash);
   const suffix = Buffer.from(`${JSON.stringify(record)}\n`);
   if (snapshot.bytes.length + suffix.length > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
-  parseRunLedgerBytes(Buffer.concat([snapshot.bytes, suffix]), hash, RUN_LEDGER_MAX_TOTAL_BYTES);
+  parseRunLedgerBytes(suffix, hash, RUN_LEDGER_MAX_FILE_BYTES, snapshot.canonicalRecords);
   const tail = snapshot.segments.at(-1);
   const rollover = tail !== undefined && tail.bytes.length + suffix.length > RUN_LEDGER_MAX_FILE_BYTES;
   const index = tail === undefined ? 0 : tail.index + (rollover ? 1 : 0);
@@ -3284,7 +3290,7 @@ function appendJournalRecord(cwd, hash, event, detail, journalGuard, beforePubli
       if (!readBoundedStateBytes(cwd, temporaryPath, RUN_LEDGER_MAX_FILE_BYTES).bytes.equals(bytes)) {
         throw runLedgerFailure("run-ledger-changed-during-read");
       }
-      const current = readSessionLedger(cwd, hash, journalGuard, false, temporaryPath);
+      const current = readSessionLedgerBytes(cwd, hash, journalGuard, false, temporaryPath);
       if (current.exists !== snapshot.exists || !current.bytes.equals(snapshot.bytes) ||
         JSON.stringify(current.inventory) !== JSON.stringify(snapshot.inventory) ||
         current.segments.length !== snapshot.segments.length || current.segments.some((segment, position) =>
@@ -3294,10 +3300,12 @@ function appendJournalRecord(cwd, hash, event, detail, journalGuard, beforePubli
       requireJournalAdmission(cwd, fileName, bytes, journalGuard, temporaryPath);
       if (beforePublish !== null) beforePublish();
       journalGuard(cwd);
+      journalPublicationVerifiers.get(journalGuard)?.();
     },
   );
   journalGuard(cwd);
   if (beforePublish !== null) beforePublish();
+  journalPublicationVerifiers.get(journalGuard)?.();
   return record;
 }
 
@@ -4934,38 +4942,52 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
       throw new Error("routed attachment requires its workspace-scoped session lock");
     }
     if (!guarded && eventName !== "PreToolUse") return {};
-    let attempt = null;
-    try {
-      const execute = () => eventName === "PreToolUse" && forcedDenial !== null
-        ? preToolDecision(input, "deny", forcedDenial)
-        : handleHookUnsafe(input, eventName, effectiveCwd, inspectedTargets, journalGuard);
-      const operation = eventName === "Stop" ? "stop" : eventName === "PreToolUse" ? "claim" : "promote";
-      const output = repositoryLocks.length === 0 ? execute()
-        : withCampaignTransition(operation, effectiveCwd, input, transitionExpected, journalGuard, execute);
-      if (eventName === "PreToolUse") {
-        if (guarded) attempt = captureToolAttempt(effectiveCwd, input, journalGuard);
-        if (output.permissionDecision === "deny") {
-          return deniedToolOutput(effectiveCwd, input, attempt, output.permissionDecisionReason, journalGuard);
+    const executeObservedHook = () => {
+      let attempt = null;
+      try {
+        const execute = () => eventName === "PreToolUse" && forcedDenial !== null
+          ? preToolDecision(input, "deny", forcedDenial)
+          : handleHookUnsafe(input, eventName, effectiveCwd, inspectedTargets, journalGuard);
+        const operation = eventName === "Stop" ? "stop" : eventName === "PreToolUse" ? "claim" : "promote";
+        const output = repositoryLocks.length === 0 ? execute()
+          : withCampaignTransition(operation, effectiveCwd, input, transitionExpected, journalGuard, execute);
+        if (eventName === "PreToolUse") {
+          if (guarded) attempt = captureToolAttempt(effectiveCwd, input, journalGuard);
+          if (output.permissionDecision === "deny") {
+            return deniedToolOutput(effectiveCwd, input, attempt, output.permissionDecisionReason, journalGuard);
+          }
+          recordToolStart(effectiveCwd, input, journalGuard, attempt);
         }
-        recordToolStart(effectiveCwd, input, journalGuard, attempt);
+        if (guarded) journalGuard(effectiveCwd);
+        return output;
+      } catch (error) {
+        if (eventName !== "PreToolUse") throw error;
+        if (attempt === null && guarded && attachment !== null) {
+          try {
+            requireAttachmentSnapshot(effectiveCwd, attachmentSnapshot);
+            attempt = captureToolAttempt(effectiveCwd, input, journalGuard);
+          } catch {
+            attempt = null;
+          }
+        }
+        return deniedToolOutput(effectiveCwd, input, attempt,
+          error?.runLedgerReason === "run-ledger-limit-exceeded"
+            ? "Supervised Worker journal storage limit reached; the tool was not admitted. Preserve existing journals and revalidate aggregate byte and physical-file capacity before recovery."
+            : "Supervised Worker could not durably admit the tool start or denied retry. Inspect local ledger state before retrying.", journalGuard);
       }
-      if (guarded) journalGuard(effectiveCwd);
-      return output;
-    } catch (error) {
-      if (eventName !== "PreToolUse") throw error;
-      if (attempt === null && guarded && attachment !== null) {
+    };
+    if (authority?.assurance === "local-scoped" && observation !== null && attachment?.status === "active" &&
+      ["PreToolUse", "PostToolUse", "PostToolUseFailure"].includes(eventName)) {
+      return withWorkerAuthorityVerification(authority, effectiveCwd, input, () => {
+        journalPublicationVerifiers.set(journalGuard, () => requireFullWorkerAuthority(authority, effectiveCwd, input));
         try {
-          requireAttachmentSnapshot(effectiveCwd, attachmentSnapshot);
-          attempt = captureToolAttempt(effectiveCwd, input, journalGuard);
-        } catch {
-          attempt = null;
+          return executeObservedHook();
+        } finally {
+          journalPublicationVerifiers.delete(journalGuard);
         }
-      }
-      return deniedToolOutput(effectiveCwd, input, attempt,
-        error?.runLedgerReason === "run-ledger-limit-exceeded"
-          ? "Supervised Worker journal storage limit reached; the tool was not admitted. Preserve existing journals and revalidate aggregate byte and physical-file capacity before recovery."
-          : "Supervised Worker could not durably admit the tool start or denied retry. Inspect local ledger state before retrying.", journalGuard);
+      });
     }
+    return executeObservedHook();
   };
   try {
     return withLifecycleCleanup(action, heldLocks, releaseContext);
@@ -4981,7 +5003,8 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
     const primaryOutput = lifecycleError?.primaryResult ?? error?.transitionResult;
     const primaryContext = primaryOutput?.permissionDecisionReason ?? primaryOutput?.reason ?? primaryOutput?.additionalContext;
     const detail = lifecycleError === null ? (error?.transitionCode
-      ? ` ${error.transitionCode}. ${primaryContext ?? "The expected campaign state changed; no cleanup or completion is confirmed."}` : "") :
+      ? ` ${error.transitionCode}.${error.transitionCode === "WORKER_AUTHORITY_VERIFICATION_FAILED"
+        ? " Immutable installation or accepted authority could not be reverified during the hook." : ""} ${primaryContext ?? "The expected campaign state changed; no cleanup or completion is confirmed."}` : "") :
       ` ${lifecycleError.message}${primaryContext ? ` Primary hook context before cleanup: ${primaryContext}` : ""}` +
       `${lifecycleError.primaryError === null ? "" : " The primary hook operation also failed."}` +
       " Any prior state changes have not been rolled back; do not replay side effects automatically.";
@@ -4989,7 +5012,9 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
       return report(preToolDecision(
         input,
         "deny",
-        `Supervised Worker could not verify local lifecycle state, so the invocation was denied.${detail} Denial journaling is unconfirmed; no retry permit is available.`,
+        `Supervised Worker could not verify local lifecycle state, so the invocation was denied.${detail}${
+          detail.includes("Denial journaling is unconfirmed; no retry permit is available.")
+            ? "" : " Denial journaling is unconfirmed; no retry permit is available."}`,
       ));
     }
     if (eventName === "Stop" && primaryOutput?.decision === "block" && lifecycleError.primaryError === null) {

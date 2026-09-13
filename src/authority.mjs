@@ -2,10 +2,17 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 
-import { resolvePluginSourceIdentity } from "./install.mjs";
+import {
+  capturePluginSourceVerification,
+  releasePluginSourceVerification,
+  resolvePluginSourceIdentity,
+  verifyPluginSourceVerification,
+} from "./install.mjs";
 import { parseWorkflowJson, resolveWorkflowRoles } from "./workflow.mjs";
 
 const verifiedAuthorities = new WeakMap();
+const authorityInstallations = new WeakMap();
+const authorityVerificationScopes = new WeakMap();
 const MAX_AUTHORITY_BYTES = 16_384;
 const MAX_AUTHORITY_LIFETIME_MS = 86_400_000;
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -76,13 +83,13 @@ function authorityBinding(cwd, input, pluginRoot, inventoryPath) {
   return { authority, grantHash: hash(JSON.stringify(authority)), inventoryHash: hash(inventoryBytes) };
 }
 
-function localAuthorityBinding(cwd, input, pluginRoot, workflow = resolveWorkflowRoles(cwd, { requireAcceptance: true })) {
+function localAuthorityBinding(cwd, input, pluginRoot, workflow = resolveWorkflowRoles(cwd, { requireAcceptance: true }), sourceIdentity = undefined) {
   if (!workflow.ok || !workflow.configured || !workflow.accepted ||
       workflow.authorityAssurance !== "local-scoped") {
     throw new Error("local-scoped authority requires an explicitly accepted workflow hash");
   }
   const repositoryRoot = realpathSync(cwd);
-  const source = resolvePluginSourceIdentity(pluginRoot);
+  const source = sourceIdentity ?? resolvePluginSourceIdentity(pluginRoot);
   if (source.sourceKind !== "immutable-install-record") throw new Error("local-scoped authority requires an immutable installation");
   const sessionId = input?.session_id ?? input?.sessionId;
   const transcriptPath = input?.transcript_path ?? input?.transcriptPath;
@@ -132,8 +139,11 @@ export function verifyWorkerAuthority(cwd, input, pluginRoot, inventoryPath = pr
   if (workflow.authorityAssurance === "local-scoped") {
     const binding = localAuthorityBinding(cwd, input, pluginRoot, workflow);
     const authority = Object.freeze({ ...binding.authority, grantHash: binding.grantHash });
-    verifiedAuthorities.set(authority, () => {
-      if (localAuthorityBinding(cwd, input, pluginRoot).grantHash !== binding.grantHash) {
+    authorityInstallations.set(authority, pluginRoot);
+    verifiedAuthorities.set(authority, (full = false) => {
+      const scope = authorityVerificationScopes.get(authority);
+      const source = scope === undefined ? undefined : verifyPluginSourceVerification(scope, full);
+      if (localAuthorityBinding(cwd, input, pluginRoot, undefined, source).grantHash !== binding.grantHash) {
         throw new Error("accepted local-scoped authority changed during the transition");
       }
     });
@@ -153,11 +163,46 @@ export function verifyWorkerAuthority(cwd, input, pluginRoot, inventoryPath = pr
   return authority;
 }
 
-export function requireVerifiedWorkerAuthority(authority, cwd, input) {
+function requireWorkerAuthority(authority, cwd, input, full) {
   const verify = verifiedAuthorities.get(authority);
   if (verify === undefined || authority.sessionHash !== hash(input?.session_id ?? input?.sessionId ?? "") ||
     authority.repositoryHash !== hash(pathKey(realpathSync(cwd)))) {
     throw new Error("Worker transition requires a verified repository- and session-bound authority");
   }
-  verify();
+  verify(full);
+}
+
+export function requireVerifiedWorkerAuthority(authority, cwd, input) {
+  requireWorkerAuthority(authority, cwd, input, false);
+}
+
+export function requireFullWorkerAuthority(authority, cwd, input) {
+  requireWorkerAuthority(authority, cwd, input, true);
+}
+
+export function withWorkerAuthorityVerification(authority, cwd, input, action) {
+  const pluginRoot = authorityInstallations.get(authority);
+  if (pluginRoot === undefined || authorityVerificationScopes.has(authority) || typeof action !== "function") {
+    throw new Error("operation verification requires an unscoped local Worker authority");
+  }
+  const scope = capturePluginSourceVerification(pluginRoot);
+  authorityVerificationScopes.set(authority, scope);
+  try {
+    requireVerifiedWorkerAuthority(authority, cwd, input);
+    const result = action();
+    if (result !== null && (typeof result === "object" || typeof result === "function") && typeof result.then === "function") {
+      throw new Error("operation verification requires a synchronous result");
+    }
+    try {
+      requireFullWorkerAuthority(authority, cwd, input);
+    } catch (error) {
+      error.transitionResult = result;
+      error.transitionCode = "WORKER_AUTHORITY_VERIFICATION_FAILED";
+      throw error;
+    }
+    return result;
+  } finally {
+    authorityVerificationScopes.delete(authority);
+    releasePluginSourceVerification(scope);
+  }
 }

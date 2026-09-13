@@ -196,6 +196,29 @@ concurrent writer. Checkpoint capture holds this boundary through its exact
 the boundary is included; a checkpoint that wins retains an outcome-unknown
 operation. Late hooks cannot rewrite a receipt or satisfy another claim.
 
+Already-active routine Local PreToolUse/PostToolUse/PostToolUseFailure hooks use
+one synchronous, install-owned verification scope after acquiring their guards.
+The scope pins the complete immutable inventory and file identities, modes,
+link counts, sizes, modification and change timestamps. Every existing authority
+check still verifies mutable workflow, workspace, session and selected-role
+bindings. Full immutable bytes are checked at scope capture, immediately before
+and after journal publication, and before returning. Zero device/inode identifiers
+or unavailable bigint stat fields trigger full byte verification; drift never
+refreshes the baseline.
+Scopes are opaque, revoked in finally, and never persisted or shared between
+processes. The wrapper rejects thenable results, not arbitrary deferred work
+scheduled by a callback; its shipped routine-hook callback performs synchronous
+work only. Each scope belongs to one verified authority object. Host-attested,
+protected-state, provisional, Doctor and other lifecycle
+paths retain full verification. This is cooperative Local assurance, not a
+malicious-same-user security boundary or a host-wide inventory guarantee.
+
+Each session read parses complete physical segments once using a shared set for
+canonical duplicate detection. An append validates only its new record, then
+rereads and compares the exact original bytes, inventory and identities before
+publication. Unchanged bytes are not parsed repeatedly within that append.
+No lock wait, hook timeout, journal cap, authority or retry allowance is enlarged.
+
 Each session has one logical journal, starting at `runs/<session-hash>.jsonl`.
 When the next complete record would exceed that file's 1 MiB limit, publication
 creates `runs/<session-hash>.000001.jsonl`, followed by contiguous six-digit

@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { requireVerifiedWorkerAuthority, verifyWorkerAuthority } from "../src/authority.mjs";
+import { requireFullWorkerAuthority, requireVerifiedWorkerAuthority, verifyWorkerAuthority, withWorkerAuthorityVerification } from "../src/authority.mjs";
 import { applyCampaignPlan, canonicalPlanHash, checkpointSession, handlePluginHook, observeCampaignTransition, resumeSession, sha256 } from "../src/core.mjs";
 import { detectDoctorIncident, executeDoctorIntent, grantDoctorAction, inspectDoctorIncident } from "../src/doctor.mjs";
 import { doctorHash } from "../src/doctor-state.mjs";
@@ -52,13 +52,13 @@ function withLocalFixture(action) {
   }
 }
 
-function localHookChild(fixture, mode, hostId) {
+function localHookChild(fixture, mode, hostId, event = "PreToolUse") {
   const sessionLock = path.join(fixture.storage, "supervised-worker", "session-locks", sha256(fixture.input.session_id));
   const journalLock = path.join(fixture.cwd, ".supervised-worker", "locks", "journal");
   const input = { ...fixture.input, tool_name: "read_file", tool_use_id: hostId,
     tool_input: { filePath: path.join(fixture.cwd, "README.md"), startLine: 1, endLine: 1 } };
   const child = spawn(process.execPath, [fileURLToPath(new URL("./local-hook-child-fixture.mjs", import.meta.url)),
-    JSON.stringify({ installRoot: fixture.installRoot, input, mode, event: "PreToolUse", sessionLock, journalLock })],
+    JSON.stringify({ installRoot: fixture.installRoot, input, mode, event, sessionLock, journalLock })],
   { cwd: fixture.cwd, stdio: ["pipe", "ignore", "pipe", "ipc"] });
   const messages = [];
   let stderr = "";
@@ -107,6 +107,154 @@ function admitLocalFixture(fixture) {
     items: [{ id: "one", title: "One", status: "in_progress" }], completion: null };
   assert.equal(applyCampaignPlan(fixture.cwd, { ...request, expected: observeCampaignTransition(fixture.cwd, request), plan }, authority).status, "applied");
 }
+
+test("local hook verifies immutable runtime bytes without rereading them for every journal guard", () => {
+  withLocalFixture((fixture) => {
+    admitLocalFixture(fixture);
+    const target = path.resolve(fixture.installRoot, "src", "core.mjs");
+    const originalRead = fs.readFileSync;
+    let runtimeReads = 0;
+    fs.readFileSync = (file, ...options) => {
+      if (typeof file === "string" && path.resolve(file).toLowerCase() === target.toLowerCase()) runtimeReads++;
+      return originalRead(file, ...options);
+    };
+    syncBuiltinESMExports();
+    try {
+      const input = { ...fixture.input, tool_name: "read_file", tool_use_id: "bounded-runtime-verification",
+        tool_input: { filePath: path.join(fixture.cwd, "README.md") } };
+      assert.deepEqual(handlePluginHook(input, "PreToolUse", fixture.installRoot), {});
+      assert.ok(runtimeReads > 0, "The probe must observe actual immutable byte verification");
+      assert.ok(runtimeReads <= 7, `Entry, held-lock, scope, publication and return checks reread the runtime ${runtimeReads} times`);
+    } finally {
+      fs.readFileSync = originalRead;
+      syncBuiltinESMExports();
+    }
+  });
+});
+
+test("local operation verification cannot escape its synchronous scope or impersonate authority", () => {
+  withLocalFixture(({ cwd, input, installRoot, accept }) => {
+    accept();
+    const authority = verifyWorkerAuthority(cwd, input, installRoot, "");
+    const result = withWorkerAuthorityVerification(authority, cwd, input, () => {
+      appendFileSync(input.transcript_path, '{"event":"growth"}\n');
+      requireVerifiedWorkerAuthority(authority, cwd, input);
+      requireFullWorkerAuthority(authority, cwd, input);
+      assert.throws(() => withWorkerAuthorityVerification(authority, cwd, input, () => null), /unscoped/);
+      return "verified";
+    });
+    assert.equal(result, "verified");
+    assert.throws(() => withWorkerAuthorityVerification({ ...authority }, cwd, input, () => null), /unscoped/);
+    assert.throws(() => withWorkerAuthorityVerification(authority, cwd, { ...input, session_id: "wrong" }, () => null), /session-bound/);
+    assert.throws(() => withWorkerAuthorityVerification(authority, cwd, input, () => Promise.resolve()), /synchronous/);
+    assert.throws(() => withWorkerAuthorityVerification(authority, cwd, input, () => { throw new Error("fixture-action"); }), /fixture-action/);
+    assert.equal(withWorkerAuthorityVerification(authority, cwd, input, () => "fresh-scope"), "fresh-scope");
+  });
+});
+
+for (const change of ["workspace", "workflow", "runtime"]) {
+  test(`local scoped verification still rejects ${change} drift at return`, () => {
+    withLocalFixture(({ cwd, input, storage, workflowPath, installRoot, accept }) => {
+      accept();
+      const authority = verifyWorkerAuthority(cwd, input, installRoot, "");
+      let fired = false;
+      assert.throws(() => withWorkerAuthorityVerification(authority, cwd, input, () => {
+        fired = true;
+        const target = change === "workspace" ? path.join(storage, "workspace.json")
+          : change === "workflow" ? workflowPath : path.join(installRoot, "src", "core.mjs");
+        appendFileSync(target, "\n");
+        return "must-not-return";
+      }));
+      assert.equal(fired, true);
+      assert.throws(() => requireVerifiedWorkerAuthority(authority, cwd, input));
+    });
+  });
+}
+
+test("local journal publication checks immutable bytes even with masked metadata", () => {
+  withLocalFixture((fixture) => {
+    admitLocalFixture(fixture);
+    const target = path.join(fixture.installRoot, "README.md");
+    const originalStat = fs.lstatSync;
+    const originalAppend = fs.appendFileSync;
+    const plain = originalStat(target);
+    const big = originalStat(target, { bigint: true });
+    const ledger = path.join(fixture.cwd, ".supervised-worker", "runs", `${sha256(fixture.input.session_id)}.jsonl`);
+    const before = readFileSync(ledger);
+    let fired = false;
+    fs.lstatSync = (file, options) => path.resolve(String(file)) === target
+      ? options?.bigint ? big : plain : originalStat(file, options);
+    fs.appendFileSync = (file, bytes, ...options) => {
+      const result = originalAppend(file, bytes, ...options);
+      if (!fired && path.dirname(String(file)) === path.dirname(ledger) && JSON.parse(String(bytes)).event === "tool_started") {
+        fired = true;
+        const modified = Buffer.from(readFileSync(target));
+        modified[0] ^= 1;
+        writeFileSync(target, modified);
+      }
+      return result;
+    };
+    syncBuiltinESMExports();
+    try {
+      const output = handlePluginHook({ ...fixture.input, tool_name: "read_file", tool_use_id: "masked-publication",
+        tool_input: { filePath: path.join(fixture.cwd, "README.md") } }, "PreToolUse", fixture.installRoot);
+      assert.equal(fired, true, "The immutable file must change after temporary journal bytes were written");
+      assert.equal(output.permissionDecision, "deny");
+      assert.deepEqual(readFileSync(ledger), before, "The full check must reject before canonical journal publication");
+    } finally {
+      fs.lstatSync = originalStat;
+      fs.appendFileSync = originalAppend;
+      syncBuiltinESMExports();
+    }
+  });
+});
+
+test("local return verification preserves a denial after immutable drift follows journal publication", () => {
+  withLocalFixture((fixture) => {
+    admitLocalFixture(fixture);
+    const target = path.join(fixture.installRoot, "README.md");
+    const originalStat = fs.lstatSync;
+    const originalRename = fs.renameSync;
+    const plain = originalStat(target);
+    const big = originalStat(target, { bigint: true });
+    const ledger = path.join(fixture.cwd, ".supervised-worker", "runs", `${sha256(fixture.input.session_id)}.jsonl`);
+    const before = readFileSync(ledger);
+    let fired = false;
+    fs.lstatSync = (file, options) => path.resolve(String(file)) === target
+      ? options?.bigint ? big : plain : originalStat(file, options);
+    fs.renameSync = (source, destination, ...options) => {
+      const result = originalRename(source, destination, ...options);
+      if (!fired && destination === ledger) {
+        fired = true;
+        const modified = Buffer.from(readFileSync(target));
+        modified[0] ^= 1;
+        writeFileSync(target, modified);
+      }
+      return result;
+    };
+    syncBuiltinESMExports();
+    try {
+      const output = handlePluginHook({ ...fixture.input, tool_name: "read_file", tool_use_id: "masked-after-publication",
+        tool_input: { filePath: path.join(fixture.cwd, "README.md") } }, "PreToolUse", fixture.installRoot);
+      assert.equal(fired, true, "Drift must occur after the actual canonical journal rename");
+      const after = readFileSync(ledger);
+      assert.deepEqual(after.subarray(0, before.length), before);
+      const suffix = after.subarray(before.length).toString("utf8").trimEnd().split("\n").map(JSON.parse);
+      assert.equal(suffix.length, 1);
+      assert.equal(suffix[0].event, "tool_started");
+      assert.equal(output.permissionDecision, "deny");
+      assert.match(output.permissionDecisionReason, /The tool did not execute/);
+      assert.match(output.permissionDecisionReason, /Inspect local ledger state before retrying/);
+      assert.match(output.permissionDecisionReason, /WORKER_AUTHORITY_VERIFICATION_FAILED/);
+      assert.match(output.permissionDecisionReason, /Immutable installation or accepted authority could not be reverified/);
+      assert.equal(output.permissionDecisionReason.split("Denial journaling is unconfirmed; no retry permit is available.").length, 2);
+    } finally {
+      fs.lstatSync = originalStat;
+      fs.renameSync = originalRename;
+      syncBuiltinESMExports();
+    }
+  });
+});
 
 test("local native Doctor requests recover a dead session lock while ordinary tools remain denied", () => {
   withLocalFixture((fixture) => {
@@ -369,6 +517,84 @@ test("local hook exhausted overlap never reclaims or rewrites a live owner", asy
     assert.deepEqual(readFileSync(ownerPath), bytes);
   });
 });
+
+async function verifySegmentedJournalCorrelation(concurrent) {
+  await withLocalFixture(async (fixture) => {
+    admitLocalFixture(fixture);
+    const input = (hostId) => ({ ...fixture.input, tool_name: "read_file", tool_use_id: hostId,
+      tool_input: { filePath: path.join(fixture.cwd, "README.md"), startLine: 1, endLine: 1 } });
+    for (const hostId of ["previous-success", "previous-failure"]) assert.deepEqual(handlePluginHook(input(hostId), "PreToolUse", fixture.installRoot), {});
+    const session = sha256(fixture.input.session_id);
+    const directory = path.join(fixture.cwd, ".supervised-worker", "runs");
+    const baseFile = path.join(directory, `${session}.jsonl`);
+    let sequence = 0;
+    for (const [index, targetBytes] of [1_048_289, 1_025_000].entries()) {
+      const file = path.join(directory, index === 0 ? `${session}.jsonl` : `${session}.000001.jsonl`);
+      const chunks = [index === 0 ? readFileSync(file) : Buffer.alloc(0)];
+      let length = chunks[0].length;
+      while (length < targetBytes) {
+        const record = JSON.stringify({ schemaVersion: 1, at: new Date(Date.UTC(2020, 0, 1) + sequence++).toISOString(), event: "pre_compact", session, trigger: "manual" });
+        const remaining = targetBytes - length;
+        const size = remaining > 512 + record.length ? 512 : remaining;
+        assert.ok(size >= record.length + 1);
+        const bytes = Buffer.from(`${record.padEnd(size - 1)}\n`);
+        chunks.push(bytes);
+        length += bytes.length;
+      }
+      writeFileSync(file, Buffer.concat(chunks));
+    }
+    const readRecords = () => [baseFile, path.join(directory, `${session}.000001.jsonl`)]
+      .flatMap((file) => readFileSync(file, "utf8").trimEnd().split("\n").map(JSON.parse));
+    assert.equal(readRecords().filter((record) => record.event === "tool_started").length, 2);
+    const ownerFile = path.join(fixture.cwd, ".supervised-worker", "attachment.json");
+    const owner = readFileSync(ownerFile);
+    const sealed = readFileSync(baseFile);
+    const holder = concurrent ? localHookChild(fixture, "holder", "next-first") : null;
+    const contenders = [];
+    try {
+      if (concurrent) {
+        await holder.waitFor("held");
+        contenders.push(localHookChild(fixture, "ordinary", "previous-success", "PostToolUse"));
+        contenders.push(localHookChild(fixture, "ordinary", "previous-failure", "PostToolUseFailure"));
+        contenders.push(localHookChild(fixture, "ordinary", "next-second"));
+        for (const actor of contenders) assert.equal((await actor.waitFor("contended")).scope, "session");
+        holder.child.stdin.end("g");
+        for (const result of await Promise.all([holder, ...contenders].map((actor) => actor.finish()))) assert.deepEqual(result.output, {});
+      } else {
+        for (const [hostId, event] of [["next-first", "PreToolUse"], ["previous-success", "PostToolUse"],
+          ["previous-failure", "PostToolUseFailure"], ["next-second", "PreToolUse"]]) {
+          assert.deepEqual(handlePluginHook(input(hostId), event, fixture.installRoot), {});
+        }
+      }
+      for (const hostId of ["next-first", "next-second", "previous-success"]) assert.deepEqual(handlePluginHook(input(hostId), "PostToolUse", fixture.installRoot), {});
+      const records = readRecords();
+      const starts = records.filter((record) => record.event === "tool_started");
+      assert.equal(starts.length, 4);
+      assert.equal(new Set(starts.map((record) => record.operationId)).size, 4);
+      const ownerValue = JSON.parse(owner);
+      for (const start of starts) {
+        const completions = records.filter((record) => record.event === "tool_completed" && record.operationId === start.operationId);
+        assert.equal(completions.length, 1);
+        assert.equal(completions[0].invocationHash, start.invocationHash);
+        assert.equal(start.claimGeneration, ownerValue.claimGeneration);
+        assert.equal(start.routeGeneration, ownerValue.routeGeneration);
+        assert.equal(completions[0].success, start.invocationHash !== sha256("supervised-worker-tool-invocation-v1\0previous-failure"));
+      }
+      assert.deepEqual(readFileSync(ownerFile), owner);
+      assert.deepEqual(readFileSync(baseFile), sealed);
+    } finally {
+      const actors = [holder, ...contenders].filter(Boolean);
+      for (const actor of actors) if (actor.child.exitCode === null && actor.child.signalCode === null) actor.child.kill();
+      await Promise.all(actors.map((actor) => actor.exited));
+    }
+  });
+}
+
+for (const concurrent of [false, true]) {
+  test(`installed Local ${concurrent ? "concurrent" : "sequential"} mixed completions and starts preserve correlation with a segmented journal`, {
+    skip: concurrent && process.platform !== "win32",
+  }, () => verifySegmentedJournalCorrelation(concurrent));
+}
 
 test("local admission requires exact workflow acceptance and labels its limited provenance", () => {
   withLocalFixture(({ cwd, input, installRoot, accept }) => {

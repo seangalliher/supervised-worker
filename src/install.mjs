@@ -32,6 +32,7 @@ const INSTALL_ENTRIES = [
   "src",
 ];
 const INSTALL_FORMAT_VERSION = 5;
+const sourceVerifications = new WeakMap();
 const INSTALL_RECORD_KEYS = new Set([
   "schemaVersion",
   "installFormatVersion",
@@ -457,6 +458,72 @@ export function resolvePluginSourceIdentity(pluginRoot) {
     sourceKind: "immutable-install-record",
     provenance: "plugin-verified-local",
   };
+}
+
+function sourceVerificationSnapshot(root) {
+  const entries = [];
+  let reliable = true;
+  const fields = ["dev", "ino", "mode", "nlink", "size", "mtimeNs", "ctimeNs"];
+  const inspect = (file, relative, recurse) => {
+    const stats = lstatSync(file, { bigint: true });
+    if (stats.isSymbolicLink() || (!stats.isFile() && !stats.isDirectory()) ||
+      (stats.isFile() && stats.nlink !== 1n)) throw new Error("immutable verification found an unsafe entry");
+    if (stats.isDirectory() && !pathEquals(file, realpathSync(file))) throw new Error("immutable verification path changed");
+    if (stats.dev === 0n || stats.ino === 0n || fields.some((field) => typeof stats[field] !== "bigint")) reliable = false;
+    entries.push([relative, ...fields.map((field) => stats[field]?.toString() ?? null)]);
+    if (recurse && stats.isDirectory()) {
+      for (const name of readdirSync(file).sort()) inspect(path.join(file, name), `${relative}/${name}`, true);
+    }
+  };
+  const base = path.dirname(root);
+  const baseStats = lstatSync(base, { bigint: true });
+  if (!baseStats.isDirectory() || baseStats.isSymbolicLink() || !pathEquals(base, realpathSync(base))) {
+    throw new Error("immutable verification base changed");
+  }
+  entries.push(["base", baseStats.dev.toString(), baseStats.ino.toString(), baseStats.mode.toString()]);
+  if (baseStats.dev === 0n || baseStats.ino === 0n) reliable = false;
+  inspect(root, ".", true);
+  return { fingerprint: JSON.stringify(entries), reliable };
+}
+
+export function capturePluginSourceVerification(pluginRoot) {
+  const root = path.resolve(pluginRoot);
+  if (!existsSync(path.join(root, "install-record.json"))) throw new Error("verification scope requires an immutable installation");
+  const before = sourceVerificationSnapshot(root);
+  const source = Object.freeze(resolvePluginSourceIdentity(root));
+  if (source.sourceKind !== "immutable-install-record") throw new Error("verification scope requires an immutable installation");
+  const recordHash = createHash("sha256").update(readFileSync(path.join(root, "install-record.json"))).digest("hex");
+  const after = sourceVerificationSnapshot(root);
+  if (before.fingerprint !== after.fingerprint) throw new Error("immutable installation changed during verification");
+  const handle = Object.freeze({ kind: "plugin-source-verification" });
+  sourceVerifications.set(handle, { root, source, recordHash, snapshot: after, failure: null });
+  return handle;
+}
+
+export function verifyPluginSourceVerification(handle, full = false) {
+  const captured = sourceVerifications.get(handle);
+  if (captured === undefined) throw new Error("immutable verification scope is unavailable");
+  if (captured.failure !== null) throw captured.failure;
+  try {
+    const current = sourceVerificationSnapshot(captured.root);
+    if (current.fingerprint !== captured.snapshot.fingerprint) throw new Error("immutable installation changed during operation");
+    if (full || !captured.snapshot.reliable || !current.reliable) {
+      const source = resolvePluginSourceIdentity(captured.root);
+      const recordHash = createHash("sha256").update(readFileSync(path.join(captured.root, "install-record.json"))).digest("hex");
+      if (JSON.stringify(source) !== JSON.stringify(captured.source) || recordHash !== captured.recordHash ||
+        sourceVerificationSnapshot(captured.root).fingerprint !== captured.snapshot.fingerprint) {
+        throw new Error("immutable installation changed during operation");
+      }
+    }
+    return captured.source;
+  } catch (error) {
+    captured.failure = error;
+    throw error;
+  }
+}
+
+export function releasePluginSourceVerification(handle) {
+  if (!sourceVerifications.delete(handle)) throw new Error("immutable verification scope is unavailable");
 }
 
 export function defaultInstallBase({

@@ -201,6 +201,34 @@ continue independent work.
 - Push the reviewed commit explicitly and verify the intended remote ref.
 - Close or reclassify an issue only after its own acceptance criteria hold.
 
+## Efficient Execution
+
+In Local mode, use at most two read-only calls per parallel batch and include
+that limit in each companion request. Finish the batch before launching more
+reads. Delayed PostToolUse hooks share the same session lock as new PreToolUse
+hooks, so overlapping batches can exhaust admission even when every reader is
+healthy. Prefer one targeted search with multiple terms and a useful nearby
+file range over many small calls. Do not parallelize durable state mutations.
+
+Run focused checks during edits. Complete required pre-commit review and its
+repairs before the broad gate. Run one broad gate for the frozen candidate;
+reopen still-valid exact-tree receipts instead of rerunning unchanged gates.
+Use repository-approved batch gating only when the repository and handoff
+contract support it. A changed tree invalidates its gate. Review, compatibility,
+required checks, provider success and verified closure remain mandatory.
+
+Ordinary queued or running CI is not itself a blocker. Use one synchronous
+native watcher, no terminal timeout, and a unique plain-output log. If the host
+backgrounds the wait, follow its completion-notification contract with the exact
+execution identity; do not duplicate watchers or treat a reused terminal buffer
+as its result. Continue the release after actual provider completion. Do not
+checkpoint merely because CI is pending or an item has finished. A genuine host
+interruption or authority boundary still requires an honest checkpoint.
+
+For a necessary handoff, print the full checkpoint hash and the absolute path
+to its receipt or existing continuation document. Verify that path exists.
+Never supply only a shortened hash or a relative cross-worktree file reference.
+
 ## Canonical Release Evidence
 
 Use the immutable helper's `campaign inventory` and `campaign compile` commands

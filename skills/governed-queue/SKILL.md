@@ -125,6 +125,26 @@ gate as a substitute for formal independent review.
    state. Preserve durable receipts before deleting temporary workspaces.
 7. **Reconcile:** Re-enumerate the queue and immediately select the next item.
 
+## Execution Cost And Waiting
+
+For Local sessions, bound each read-only parallel batch to two calls and pass
+that limit to companions. Delayed completion hooks overlap new admission hooks
+on the same session lock. Combine targeted searches and read useful file ranges;
+do not launch another batch or a durable mutation while the first is unsettled.
+
+Keep focused validation local to edits. Follow repository review-before-gate
+ordering, repair findings, freeze, and run the broad gate once. Reuse valid
+receipts only for their unchanged tree and required command coverage. Use batch
+gates only where both repository policy and the handoff contract support them;
+never bypass per-item review or verified shipping/closure.
+
+Pending CI is ordinary in-progress work, not a reason to checkpoint a healthy
+owner. Use a single native synchronous watcher with no terminal timeout and a
+unique log. Follow host completion notifications if it is backgrounded, without
+duplicating watchers, busy polling, or claiming success from partial output.
+For a genuine interruption, provide the full checkpoint hash and an existing
+absolute resume path, preserving ownership rules and unknown outcomes.
+
 ## Completion Record
 
 Only after a successful final enumeration, set `mode` to `complete` and add:
