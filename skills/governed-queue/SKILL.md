@@ -57,6 +57,31 @@ behavior. Only a validated owning-session capability enables lifecycle hooks.
 If route or attachment cleanup fails, the hook reports that failure and the
 claim remains recoverable; do not treat that output as a release receipt.
 
+For an ownerless or journal-faulted campaign, use the trusted hook's already
+generated `recoveryInvocation` unchanged. Read-only `recovery inspect` and
+`recovery propose` require verified source/workflow/session provenance but create
+no locks, markers, incidents or grants. Mutation requires current owning
+authority or a separately direct-operator-confirmed, exact-snapshot/action/source/
+workflow/session/expiry authorization. Neither Worker nor Doctor may self-author
+that grant. Reinspect between repository, session and journal scope actions.
+
+Checkpoint v3 and explicit resume follow the exact recovery frontier.
+Ownerless resume requires `frontierHash`; never choose a runtime file by mtime,
+majority, maximum or survival. Lost totals remain explicit unknown, and unknown
+same-progress history grants no extra Stop allowance. Preserve all caches,
+unknown operation identities and permanent fences; never replay unknown effects.
+Capacity-denied work remains denied across sessions even when checkpoint/resume
+fits reserved control headroom. Do not prune, archive, truncate or raise caps.
+
+Use `campaign publish` with the existing manifest for a helper-selected
+`.supervised-worker/releases/<receipt-byte-sha256>.json`. Keep `campaign compile`
+as the read-only stdout interface; never redirect its report into `runs/`.
+An exact authorized foreign-file quarantine uses only
+`.supervised-worker/recovery/quarantine/<action-uuid>/<source-byte-sha256>.quarantined`
+and preserves all journal bytes. Publication is neither banking nor Stop evidence.
+See `docs/reliability-recovery.md` for supported local recovery and qualification
+limits; source tests are not a native campaign or deployment receipt.
+
 Store runtime state under `.supervised-worker/`. Keep that directory out of Git
 unless the user deliberately chooses to publish sanitized evaluation fixtures.
 

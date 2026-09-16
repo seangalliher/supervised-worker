@@ -104,9 +104,12 @@ test("Doctor diagnoses and recovers an exact dead campaign owner without the cam
     const { incident } = detectDoctorIncident(cwd, input, incidentId, "a".repeat(64), authority);
     const inspected = executeDoctorIntent(cwd, input, intentFor(cwd, input, authority, incident, "inspect"), authority);
     assert.equal(inspected.status, "succeeded");
-    assert.equal(inspected.values[0].diagnostics[0].code, "LIFECYCLE_OWNER_DEAD");
+    // Recovery now exposes the ordered scope and selected snapshot explicitly,
+    // rather than letting an unscoped intent choose any freshly observed dead lock.
+    assert.equal(inspected.values[0].owner, "dead");
     const current = inspectDoctorIncident(cwd, input, incidentId, authority).incident;
-    const intent = intentFor(cwd, input, authority, current, "recover", inspected.outcome.outputHashes);
+    const intent = { ...intentFor(cwd, input, authority, current, "recover", inspected.outcome.outputHashes), schemaVersion: 2,
+      recovery: { scope: "repository", snapshotHash: inspected.values[0].snapshotHash } };
     const recovered = executeDoctorIntent(cwd, input, intent, authority);
     assert.equal(recovered.status, "succeeded", JSON.stringify(recovered));
     assert.equal(existsSync(lock), false);

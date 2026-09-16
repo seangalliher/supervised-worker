@@ -2,6 +2,7 @@ import path from "node:path";
 
 import { canonicalPlanHash, sha256, validateCampaignRelease, validateCheckpoint, validatePlan } from "./core.mjs";
 import { validateLocalCampaignReceipt } from "./campaign.mjs";
+import { verifyRepositoryCiObservation } from "./ci-policy.mjs";
 import { doctorHash } from "./doctor-state.mjs";
 import { validateDoctorMatrix } from "./doctor-promotion.mjs";
 import { validateGitHubQueueObservation } from "./github-queue.mjs";
@@ -124,10 +125,15 @@ function compileOpened(captured) {
       if (provider.repositoryHash !== sha256(queue.value.repository.id) || provider.actorHash !== sha256(queue.value.actor.id)) throw new Error("RELEASE_PROVIDER_QUEUE_MISMATCH");
     }
     if (provider.ci !== null) {
-      try {
-        void validateDoctorMatrix(provider.ci, manifest.candidate.commit);
-      } catch {
-        throw new Error("RELEASE_CI_OBSERVATION_INVALID");
+      if (workflow.ciPolicy !== null && workflow.ciPolicy !== undefined) {
+        verifyRepositoryCiObservation(provider.ci, workflow.ciPolicy, workflow.workflowHash, manifest.candidate.commit);
+      } else {
+        if (provider.ci.kind === "repository-ci") throw new Error("RELEASE_CI_POLICY_REQUIRED");
+        try {
+          void validateDoctorMatrix(provider.ci, manifest.candidate.commit);
+        } catch {
+          throw new Error("RELEASE_CI_OBSERVATION_INVALID");
+        }
       }
     }
     if (new Set(provider.closures.map((entry) => entry.itemHash)).size !== provider.closures.length) throw new Error("RELEASE_CLOSURES_DUPLICATED");

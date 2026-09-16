@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervised-worker.dev/schemas/artifact-publication.schema.json",
+  "title": "Canonical Campaign Artifact Publication",
+  "anyOf": [{ "$ref": "#/$defs/request" }, { "$ref": "#/$defs/result" }, { "$ref": "#/$defs/quarantineIntent" }],
+  "$defs": {
+    "releaseLocator": { "type": "string", "pattern": "^\\.supervised-worker/releases/[0-9a-f]{64}\\.json$" },
+    "quarantineAncestorPath": { "type": "string", "pattern": "^(\\.|\\.supervised-worker(/recovery(/quarantine(/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})?)?)?)$" },
+    "quarantineAncestor": {
+      "type": "object", "additionalProperties": false, "required": ["path", "boundary"],
+      "properties": {
+        "path": { "$ref": "#/$defs/quarantineAncestorPath" },
+        "boundary": { "$ref": "lifecycle.schema.json#/$defs/boundary" }
+      }
+    },
+    "quarantineIntent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "actionId", "authorizationHash", "entryHash", "source", "sourceParent", "entries", "locator", "ancestors"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "journal-entry-quarantine" },
+        "actionId": { "$ref": "recovery.schema.json#/$defs/id" }, "authorizationHash": { "$ref": "recovery.schema.json#/$defs/hash" },
+        "entryHash": { "$ref": "recovery.schema.json#/$defs/hash" }, "source": { "$ref": "recovery.schema.json#/$defs/file" },
+        "sourceParent": { "$ref": "lifecycle.schema.json#/$defs/boundary" },
+        "entries": { "type": "array", "minItems": 1, "maxItems": 257, "items": { "$ref": "recovery.schema.json#/$defs/file" } },
+        "locator": { "$ref": "recovery.schema.json#/$defs/quarantineLocator" },
+        "ancestors": {
+          "type": "array", "minItems": 5, "maxItems": 5, "items": false,
+          "prefixItems": [
+            { "allOf": [{ "$ref": "#/$defs/quarantineAncestor" }, { "properties": { "path": { "const": "." } } }] },
+            { "allOf": [{ "$ref": "#/$defs/quarantineAncestor" }, { "properties": { "path": { "const": ".supervised-worker" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/quarantineAncestor" }, { "properties": { "path": { "const": ".supervised-worker/recovery" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/quarantineAncestor" }, { "properties": { "path": { "const": ".supervised-worker/recovery/quarantine" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/quarantineAncestor" }, { "properties": { "path": {
+              "pattern": "^\\.supervised-worker/recovery/quarantine/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            } } }] }
+          ]
+        }
+      }
+    },
+    "request": {
+      "type": "object", "additionalProperties": false, "required": ["session_id", "manifest"],
+      "properties": {
+        "session_id": { "$ref": "recovery.schema.json#/$defs/sessionId" },
+        "transcript_path": { "$ref": "recovery.schema.json#/$defs/transcriptPath" },
+        "manifest": { "$ref": "campaign-release.schema.json#/$defs/input" }
+      }
+    },
+    "result": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["schemaVersion", "kind", "status", "locator", "sha256", "inputHash", "planHash"],
+          "properties": {
+            "schemaVersion": { "const": 1 }, "kind": { "const": "artifact-publication" }, "status": { "enum": ["published", "already-published"] },
+            "locator": { "$ref": "#/$defs/releaseLocator" },
+            "sha256": { "$ref": "recovery.schema.json#/$defs/hash" }, "inputHash": { "$ref": "recovery.schema.json#/$defs/hash" },
+            "planHash": { "$ref": "recovery.schema.json#/$defs/hash" }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["schemaVersion", "kind", "status", "failure"],
+          "properties": {
+            "schemaVersion": { "const": 1 }, "kind": { "const": "artifact-publication" }, "status": { "enum": ["blocked", "conflict", "unconfirmed"] },
+            "failure": { "$ref": "supervisor-failure.schema.json#/$defs/failure" }
+          }
+        }
+      ]
+    }
+  }
+}

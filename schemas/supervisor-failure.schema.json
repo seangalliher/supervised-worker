@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervised-worker.dev/schemas/supervisor-failure.schema.json",
+  "title": "Bounded Supervisor Failure",
+  "$ref": "#/$defs/failure",
+  "$defs": {
+    "code": { "enum": ["JOURNAL_INTEGRITY", "JOURNAL_CAPACITY", "JOURNAL_OBSERVATION_UNCONFIRMED", "RECOVERY_FRONTIER_MISSING", "RECOVERY_LINEAGE_AMBIGUOUS", "RECOVERY_COUNTERS_UNCERTAIN", "RECOVERY_PERSISTENCE_UNCONFIRMED", "RECOVERY_AUTHORIZATION_REQUIRED", "RECOVERY_OPERATION_LIMIT", "RECOVERY_OPERATION_CONFLICT", "DOCTOR_REQUEST_INVALID", "DOCTOR_NATIVE_REQUEST_TOO_LARGE"] },
+    "phase": { "enum": ["admission", "observation", "frontier-publication", "publication", "detach", "resume", "invocation", "recovery"] },
+    "failure": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "code", "phase", "diagnostics", "evidenceReferences", "nextAction"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "supervisor-failure" },
+        "code": { "$ref": "#/$defs/code" }, "phase": { "$ref": "#/$defs/phase" },
+        "diagnostics": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/code" } },
+        "evidenceReferences": { "type": "array", "maxItems": 32, "uniqueItems": true, "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" } },
+        "nextAction": { "enum": ["diagnose", "operator-authorization", "preserve-evidence", "reduce-request"] }
+      }
+    }
+  }
+}

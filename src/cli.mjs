@@ -31,6 +31,11 @@ import {
   validatePlan,
 } from "./core.mjs";
 import { verifyWorkerAuthority } from "./authority.mjs";
+import { applyRecovery, inspectRecovery, proposeRecovery } from "./recovery.mjs";
+import { authorizeRecoveryProposal } from "./recovery-authority.mjs";
+import { formatDoctorInvocation, parseDoctorRequest } from "./doctor-invocation.mjs";
+import { failureFromError, supervisorFailure } from "./supervisor-diagnostics.mjs";
+import { publishCampaignRelease } from "./artifact-publication.mjs";
 import { inspectGitHubQueue, validateGitHubQueueObservation } from "./github-queue.mjs";
 import {
   inspectHandoffFile,
@@ -125,6 +130,8 @@ async function validateRepository() {
     "com.github.copilot/hooks/hooks.json",
     "docs/architecture.md",
     "docs/doctor.md",
+    "docs/lifecycle-transitions.md",
+    "docs/reliability-recovery.md",
     "docs/campaign-release.md",
     "docs/customizing-roles.md",
     "docs/evaluation.md",
@@ -140,6 +147,10 @@ async function validateRepository() {
     "examples/local-campaign-receipt.json",
     "policy/constitution.json",
     "schemas/checkpoint.schema.json",
+    "schemas/recovery.schema.json",
+    "schemas/supervisor-failure.schema.json",
+    "schemas/doctor-invocation.schema.json",
+    "schemas/artifact-publication.schema.json",
     "schemas/campaign-release.schema.json",
     "schemas/doctor.schema.json",
     "schemas/episode.schema.json",
@@ -151,8 +162,30 @@ async function validateRepository() {
     "schemas/procedure.schema.json",
     "schemas/role-handoff.schema.json",
     "schemas/workflow.schema.json",
+    "schemas/transition.schema.json",
     "skills/governed-queue/SKILL.md",
     "src/core.mjs",
+    "src/artifact-publication.mjs",
+    "src/authority.mjs",
+    "src/campaign-release.mjs",
+    "src/ci-policy.mjs",
+    "src/doctor.mjs",
+    "src/doctor-evidence.mjs",
+    "src/doctor-invocation.mjs",
+    "src/doctor-promotion.mjs",
+    "src/doctor-repair.mjs",
+    "src/doctor-rescue.mjs",
+    "src/doctor-routing.mjs",
+    "src/doctor-state.mjs",
+    "src/recovery.mjs",
+    "src/recovery-state.mjs",
+    "src/recovery-authority.mjs",
+    "src/journal-capacity.mjs",
+    "src/supervisor-diagnostics.mjs",
+    "src/release-doctor-history.mjs",
+    "src/release-inputs.mjs",
+    "src/release-recovery.mjs",
+    "src/rescue.mjs",
     "src/campaign.mjs",
     "src/cli.mjs",
     "src/github-queue.mjs",
@@ -422,6 +455,40 @@ async function main() {
     process.stdout.write(`${JSON.stringify(consultation ?? routeDoctorFromHook(input, handlePluginHook(input, argument, root), root))}\n`);
     return;
   }
+  if (command === "recovery") {
+    try {
+      let result;
+      if (argument === "authorize" && argumentsAfter.length === 2) {
+        result = await authorizeRecoveryProposal(process.cwd(), argumentsAfter[0], argumentsAfter[1], root);
+      } else if (["inspect", "propose", "apply"].includes(argument) && argumentsAfter.length === 0) {
+        const request = parseWorkflowJson(await readStdin(8_192));
+        const authority = verifyWorkerAuthority(process.cwd(), request, root);
+        result = argument === "inspect" ? inspectRecovery(process.cwd(), request, authority)
+          : argument === "propose" ? proposeRecovery(process.cwd(), request, authority) : applyRecovery(process.cwd(), request, authority);
+      } else throw new Error("invalid recovery command");
+      process.stdout.write(`${JSON.stringify(result)}\n`);
+      if (["blocked", "conflict", "unconfirmed", "unknown"].includes(result.status)) process.exitCode = 1;
+    } catch (error) {
+      process.stdout.write(`${JSON.stringify({ status: "blocked", failure: failureFromError(error, "recovery") ??
+        supervisorFailure("RECOVERY_AUTHORIZATION_REQUIRED", "recovery") })}\n`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (command === "doctor" && argument === "request" && argumentsAfter.length === 0) {
+    try {
+      const request = parseDoctorRequest((await readStdin(65_536)).toString("utf8"));
+      verifyWorkerAuthority(process.cwd(), request, root);
+      const nodePath = parseWorkflowJson(readFileSync(path.join(root, "install-record.json"))).nodePath;
+      const result = formatDoctorInvocation(process.cwd(), request, root, nodePath);
+      process.stdout.write(`${JSON.stringify(result)}\n`);
+      if (result.status !== "formatted") process.exitCode = 1;
+    } catch {
+      process.stdout.write(`${JSON.stringify({ status: "blocked", failure: supervisorFailure("DOCTOR_REQUEST_INVALID", "invocation") })}\n`);
+      process.exitCode = 1;
+    }
+    return;
+  }
   if (command === "observation" && argument === "retry-denied" && argumentsAfter.length === 0) {
     let request;
     try {
@@ -459,7 +526,9 @@ async function main() {
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       if (result.status !== (command === "checkpoint" ? "checkpointed" : "resumed")) process.exitCode = 1;
     } catch (error) {
-      process.stdout.write(`${JSON.stringify(lifecycleFailureDetails(error) ?? { status: "unconfirmed", error: error.message })}\n`);
+      const result = lifecycleFailureDetails(error) ?? { status: "unconfirmed", error: error.message };
+      const failure = failureFromError(error, command === "resume" ? "resume" : "detach");
+      process.stdout.write(`${JSON.stringify({ ...result, ...(failure === null ? {} : { failure }) })}\n`);
       process.exitCode = 1;
     }
     return;
@@ -498,6 +567,19 @@ async function main() {
       ? rescueLifecycle(process.cwd(), request) : inspectLifecycleLock(process.cwd(), request);
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     if (result.status === "unconfirmed") process.exitCode = 1;
+    return;
+  }
+  if (command === "campaign" && argument === "publish" && argumentsAfter.length === 0) {
+    let result;
+    try {
+      const request = parseWorkflowJson(await readStdin(65_536));
+      result = publishCampaignRelease(process.cwd(), request, verifyWorkerAuthority(process.cwd(), request, root));
+    } catch (error) {
+      result = { schemaVersion: 1, kind: "artifact-publication", status: "blocked",
+        failure: failureFromError(error, "publication") ?? supervisorFailure("RECOVERY_AUTHORIZATION_REQUIRED", "publication") };
+    }
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (!["published", "already-published"].includes(result.status)) process.exitCode = 1;
     return;
   }
   if (command === "campaign") {

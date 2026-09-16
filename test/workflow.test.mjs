@@ -448,3 +448,30 @@ test("missing or malformed review returns errors instead of throwing", () => {
     assert.match(validateWorkflowValue(workflow).join("\n"), /review/);
   }
 });
+
+test("repository CI policy resolves only under its current exact-byte workflow acceptance", () => {
+  const cwd = workspace();
+  try {
+    const workflow = example();
+    workflow.validation.ci = { requiredJobs: [
+      { name: "python-tests", requiredSteps: ["Run tests"] },
+      { name: "ui-tests", requiredSteps: [] },
+    ] };
+    writeWorkflow(cwd, workflow);
+    const initial = resolveWorkflowRoles(cwd);
+    assert.equal(initial.ok, true, initial.errors.join("\n"));
+    assert.equal(initial.accepted, false);
+    assert.deepEqual(initial.ciPolicy, workflow.validation.ci);
+    assert.equal(acceptWorkflowRoles(cwd, initial.workflowHash).accepted, true);
+    assert.equal(resolveWorkflowRoles(cwd, { requireAcceptance: true }).ok, true);
+
+    workflow.validation.ci.requiredJobs.push({ name: "build", requiredSteps: [] });
+    writeWorkflow(cwd, workflow);
+    const changed = resolveWorkflowRoles(cwd, { requireAcceptance: true });
+    assert.notEqual(changed.workflowHash, initial.workflowHash);
+    assert.equal(changed.ok, false);
+    assert.equal(changed.accepted, false);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});

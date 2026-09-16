@@ -4,17 +4,21 @@ import path from "node:path";
 import { verifyWorkerAuthority } from "./authority.mjs";
 import { acceptDoctorHandoff, detectDoctorIncident, executeDoctorIntent, grantDoctorAction, inspectDoctorIncident } from "./doctor.mjs";
 import { requireDoctor } from "./doctor-state.mjs";
-import { parseDoctorEnvelope } from "./doctor-invocation.mjs";
+import { parseDoctorEnvelope, parseDoctorRequest } from "./doctor-invocation.mjs";
 import { parseWorkflowJson } from "./workflow.mjs";
+import { applyRecovery, inspectRecovery, proposeRecovery } from "./recovery.mjs";
+import { failureFromError, supervisorFailure } from "./supervisor-diagnostics.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
 export function handleDoctorRequest(cwd, request) {
   try {
-    if (!request || typeof request !== "object" || Array.isArray(request) ||
-      Object.keys(request).some((key) => !["operation", "session_id", "transcript_path", "incidentId", "diagnosticHash", "grant", "intent", "handoff", "expectedHash"].includes(key))) throw new Error("DOCTOR_REQUEST_INVALID");
+    request = parseDoctorRequest(JSON.stringify(request));
     const input = { session_id: request.session_id, ...(request.transcript_path === undefined ? {} : { transcript_path: request.transcript_path }) };
     const authority = verifyWorkerAuthority(cwd, input, root);
+    if (request.operation === "diagnose") return inspectRecovery(cwd, input, authority);
+    if (request.operation === "propose-recovery") return proposeRecovery(cwd, { ...input, expectedHash: request.expectedHash, action: request.action }, authority);
+    if (request.operation === "recover-authorized") return applyRecovery(cwd, { ...input, authorizationHash: request.authorizationHash }, authority);
     const incidentId = request.incidentId;
     requireDoctor(incidentId, "id");
     if (request.operation === "detect") return detectDoctorIncident(cwd, input, incidentId, request.diagnosticHash, authority);
@@ -32,7 +36,9 @@ export function handleDoctorRequest(cwd, request) {
     }
     throw new Error("DOCTOR_REQUEST_INVALID");
   } catch (error) {
-    return { status: "blocked", reason: /^DOCTOR_[A-Z_]+$/.test(error.message) ? error.message : "DOCTOR_AUTHORITY_OR_STATE_UNCONFIRMED" };
+    return { status: "blocked", reason: /^DOCTOR_[A-Z_]+$/.test(error.message) ? error.message : "DOCTOR_AUTHORITY_OR_STATE_UNCONFIRMED",
+      failure: failureFromError(error, "recovery") ?? supervisorFailure(error.message === "DOCTOR_REQUEST_INVALID" ? "DOCTOR_REQUEST_INVALID" : "RECOVERY_AUTHORIZATION_REQUIRED",
+        error.message === "DOCTOR_REQUEST_INVALID" ? "invocation" : "recovery") };
   }
 }
 
@@ -57,5 +63,5 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     result = { status: "blocked", reason: "DOCTOR_REQUEST_INVALID" };
   }
   process.stdout.write(`${JSON.stringify(result)}\n`);
-  if (["blocked", "retryable", "conflict", "unknown"].includes(result.status)) process.exitCode = 1;
+  if (["blocked", "retryable", "conflict", "unknown", "unconfirmed"].includes(result.status)) process.exitCode = 1;
 }

@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
 
 import { canonicalPlanHash, checkpointSession, inspectLifecycleLock, recoverLifecycleLock, sha256, validateLifecycle } from "../src/core.mjs";
+import { createWorkerAuthorityFixture } from "./worker-authority-fixture.mjs";
 
 const launcherPath = fileURLToPath(new URL("./kernel-hook-fixture.mjs", import.meta.url));
 const cliPath = fileURLToPath(new URL("../src/cli.mjs", import.meta.url));
@@ -395,13 +396,15 @@ const faultingHookScript = `
   syncBuiltinESMExports();
 
   const core = await import(${JSON.stringify(coreUrl)});
+  const authority = options.authority ? (await import(${JSON.stringify(new URL("../src/authority.mjs", import.meta.url).href)}))
+    .verifyWorkerAuthority(input.cwd, options.request, options.authority.installRoot, options.authority.inventoryPath) : undefined;
   const wallBefore = Date.now();
   let output;
   let actionCalls = 0;
   try {
     actionCalls += 1;
-    if (options.operation === "checkpoint") output = core.checkpointSession(input.cwd, options.request);
-    else if (options.operation === "resume") output = core.resumeSession(input.cwd, options.request);
+    if (options.operation === "checkpoint") output = core.checkpointSession(input.cwd, options.request, authority);
+    else if (options.operation === "resume") output = core.resumeSession(input.cwd, options.request, authority);
     else if (options.operation === "release") output = core.releaseAttachment(input.cwd);
     else if (options.operation === "recover") output = core.recoverLifecycleLock(input.cwd, options.request);
     else output = core.handleHook(input, process.argv[3] ?? "PostToolUse");
@@ -496,6 +499,12 @@ function withActiveHookFixture(action) {
       completion: null,
     }));
     assert.deepEqual(invokeHook("PostToolUse", planWrite), {});
+    // This legacy lock-retirement fixture has a proven fresh counter baseline.
+    // Missing runtime must no longer be interpreted as zero by production Stop.
+    const runtimeFile = path.join(cwd, ".supervised-worker", "runtime", `${sha256(sessionId)}.json`);
+    mkdirSync(path.dirname(runtimeFile), { recursive: true });
+    writeFileSync(runtimeFile, JSON.stringify({ schemaVersion: 2, progressHash: canonicalPlanHash(JSON.parse(readFileSync(planPath))),
+      sameProgressBlocks: 0, totalBlocks: 0 }));
 
     const readTool = {
       tool_name: "Write",
@@ -1024,20 +1033,28 @@ for (const scope of ["repository", "session"]) {
     for (const interrupted of [false, true]) {
       test(`${scope} ${retryCode} cleanup accepts ${interrupted ? "partially failed" : "successful"} ${operation} bindings without replay`, async () => {
         await withRecoveryFixture(async (fixture) => {
-          attachFixture(fixture);
+          let runtime = null;
+          if (operation === "resume") {
+            // Resume is now frontier/authority-bound. Keep the retirement race
+            // on an actual completed source transition, not a fabricated legacy owner.
+            runtime = createWorkerAuthorityFixture(fixture.cwd, fixture.anchor, { baseDirectory: path.join(fixture.base, "authority") });
+            assert.equal(runtime.admit().status, "applied");
+          } else attachFixture(fixture);
           const planBefore = fileState(fixture.planPath);
           let request = { ...fixture.anchor, planHash: canonicalPlanHash(JSON.parse(readFileSync(fixture.planPath))), attachmentHash: sha256(readFileSync(fixture.attachmentPath)) };
           if (operation === "resume") {
-            const checkpoint = checkpointSession(fixture.cwd, request);
+            const checkpoint = checkpointSession(fixture.cwd, request, runtime.authority());
             assert.equal(checkpoint.status, "checkpointed");
             const successor = "retirement-successor";
             const transcript = path.join(path.dirname(fixture.anchor.transcript_path), `${successor}.jsonl`);
             writeFileSync(transcript, "PRIVATE_SUCCESSOR_TRANSCRIPT");
             request = { session_id: successor, transcript_path: transcript, planHash: request.planHash, checkpointHash: checkpoint.checkpointHash };
+            runtime = createWorkerAuthorityFixture(fixture.cwd, request, { installRoot: runtime.installRoot, baseDirectory: path.join(fixture.base, "successor-authority") });
           }
           const before = fileState(fixture.attachmentPath);
           const release = runRetirementScenario(fixture, "transient", scope, {
             code: retryCode, operation, request, preserveAttachment: false,
+            ...(runtime === null ? {} : { authority: { installRoot: runtime.installRoot, inventoryPath: runtime.inventoryPath } }),
             input: { session_id: request.session_id, transcript_path: request.transcript_path },
             ...(interrupted ? { failRouteStatus: operation === "checkpoint" ? "released" : "active" } : {}),
           });
@@ -1184,8 +1201,11 @@ for (const partialAcquisition of [false, true]) {
   });
 }
 
-test("repository-only release retries against its post-action absent attachment", () => {
-  withActiveHookFixture((fixture) => {
+test("repository-only release retries against its post-action absent attachment", async () => {
+  await withRecoveryFixture(async (fixture) => {
+    // Repository-only legacy release is restricted to provable unrouted state;
+    // routed release is separately exercised with an owning grant and frontier.
+    attachFixture(fixture, "legacy");
     const release = runRetirementScenario(fixture, "transient", "repository", {
       code: process.platform === "win32" ? "EPERM" : "EBUSY", operation: "release", preserveAttachment: false,
     });

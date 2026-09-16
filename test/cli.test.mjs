@@ -31,7 +31,18 @@ afterEach(() => workerRuntimes.clear());
 
 function authorizeWorker(cwd, input) {
   const runtime = createWorkerAuthorityFixture(cwd, input);
-  runtime.admit();
+  const seed = path.join(cwd, ".supervised-worker", "plan.json");
+  let plan = null;
+  if (existsSync(seed)) {
+    // The old fixture implicitly adopted an ownerless plan. This is a proven
+    // empty test seed, so exercise real first-plan publication, not recovery.
+    assert.equal(existsSync(path.join(cwd, ".supervised-worker", "attachment.json")), false);
+    assert.equal(existsSync(path.join(cwd, ".supervised-worker", "runtime")), false);
+    assert.deepEqual(readdirSync(path.join(cwd, ".supervised-worker", "runs")), []);
+    plan = JSON.parse(readFileSync(seed));
+    rmSync(seed);
+  }
+  runtime.admit(plan);
   workerRuntimes.set(cwd, runtime);
   return runtime;
 }

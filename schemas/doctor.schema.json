@@ -15,9 +15,22 @@
     { "$ref": "#/$defs/repairAttempt" },
     { "$ref": "#/$defs/validation" },
     { "$ref": "#/$defs/review" },
-    { "$ref": "#/$defs/commit" }
+    { "$ref": "#/$defs/commit" },
+    { "$ref": "#/$defs/scopeObservation" }
   ],
   "$defs": {
+    "scopeObservation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "scope", "status", "owner", "snapshotHash", "snapshot", "prerequisite"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-scope-observation" },
+        "scope": { "enum": ["repository", "session", "journal"] },
+        "status": { "enum": ["absent", "inspected", "unconfirmed", "deferred"] }, "owner": { "enum": [null, "dead", "live", "unknown"] },
+        "snapshotHash": { "$ref": "#/$defs/nullableHash" },
+        "snapshot": { "anyOf": [{ "type": "null" }, { "$ref": "lifecycle.schema.json#/$defs/snapshot" }] },
+        "prerequisite": { "enum": [null, "repository", "session"] }
+      }
+    },
     "validation": {
       "type": "object", "additionalProperties": false,
       "required": ["schemaVersion", "kind", "binding", "actionId", "repairHash", "sourceRootHash", "baseCommit", "tree", "contractHash", "buildReportHash", "reviewAttemptId", "issuedAt"],
@@ -147,10 +160,19 @@
       "type": "object", "additionalProperties": false,
       "required": ["schemaVersion", "kind", "binding", "attemptId", "actionId", "action", "capabilityHash", "expectedHash", "inputHashes"],
       "properties": {
-        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-repair-intent" }, "binding": { "$ref": "#/$defs/binding" },
+        "schemaVersion": { "enum": [1, 2] }, "kind": { "const": "doctor-repair-intent" }, "binding": { "$ref": "#/$defs/binding" },
         "attemptId": { "$ref": "#/$defs/id" }, "actionId": { "$ref": "#/$defs/id" }, "action": { "$ref": "#/$defs/action" },
-        "capabilityHash": { "$ref": "#/$defs/hash" }, "expectedHash": { "$ref": "#/$defs/hash" }, "inputHashes": { "$ref": "#/$defs/hashes" }
-      }
+        "capabilityHash": { "$ref": "#/$defs/hash" }, "expectedHash": { "$ref": "#/$defs/hash" }, "inputHashes": { "$ref": "#/$defs/hashes" },
+        "recovery": {
+          "type": "object", "additionalProperties": false, "required": ["scope", "snapshotHash"],
+          "properties": { "scope": { "enum": ["repository", "session", "journal"] }, "snapshotHash": { "$ref": "#/$defs/hash" } }
+        }
+      },
+      "allOf": [{
+        "if": { "properties": { "schemaVersion": { "const": 2 }, "action": { "const": "recover" } }, "required": ["schemaVersion", "action"] },
+        "then": { "properties": { "recovery": {} }, "required": ["recovery"] },
+        "else": { "not": { "properties": { "recovery": {} }, "required": ["recovery"] } }
+      }]
     },
     "repairOutcome": {
       "type": "object", "additionalProperties": false,

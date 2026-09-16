@@ -15,7 +15,10 @@ import { execFileSync, spawnSync } from "node:child_process";
 import test, { afterEach } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { ALL_TOOL_MATCHER, PLAN_WRITER_MATCHER, PLAN_WRITER_TOOLS, sha256 } from "../src/core.mjs";
+import {
+  ALL_TOOL_MATCHER, applyCampaignPlan, canonicalPlanHash, observeCampaignTransition,
+  PLAN_WRITER_MATCHER, PLAN_WRITER_TOOLS, readRecoveryFrontier, sha256,
+} from "../src/core.mjs";
 import { validateHookManifest } from "../src/hook-manifest.mjs";
 import { spawnProcessTreeSync } from "./process-tree.mjs";
 import { createWorkerAuthorityFixture } from "./worker-authority-fixture.mjs";
@@ -86,20 +89,14 @@ function payload(cwd, eventName, active = false) {
   };
 }
 
-function writeActivePlan(cwd) {
-  const filePath = path.join(cwd, ".supervised-worker", "plan.json");
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  writeFileSync(
-    filePath,
-    `${JSON.stringify({
-      schemaVersion: 1,
-      mode: "active",
-      goal: "Exercise the packaged hook.",
-      items: [{ id: "one", title: "One", status: "in_progress" }],
-      completion: null,
-    })}\n`,
-  );
-  return filePath;
+function activePlan() {
+  return {
+    schemaVersion: 1,
+    mode: "active",
+    goal: "Exercise the packaged hook.",
+    items: [{ id: "one", title: "One", status: "in_progress" }],
+    completion: null,
+  };
 }
 
 function vscodeTranscriptPath(storageRoot, sessionId) {
@@ -231,10 +228,14 @@ test("every checkout hook uses the trusted root and blocks Node startup injectio
   }
 });
 
-function attach(_invoke, cwd, _planFile, session = payload(cwd, "SessionStart")) {
+function attach(cwd, session = payload(cwd, "SessionStart"), plan = activePlan()) {
+  const planFile = path.join(cwd, ".supervised-worker", "plan.json");
+  assert.equal(existsSync(planFile), false, "native writer fixtures must not bootstrap an ownerless prewritten plan");
   const runtime = createWorkerAuthorityFixture(cwd, session);
-  runtime.admit();
+  assert.equal(runtime.admit(plan).status, "applied");
   workerRuntimes.set(cwd, runtime);
+  assert.equal(readRecoveryFrontier(cwd).frontier.phase, "active");
+  return planFile;
 }
 
 function claim(invoke, cwd, planFile, session = payload(cwd, "PreToolUse")) {
@@ -252,8 +253,7 @@ function claim(invoke, cwd, planFile, session = payload(cwd, "PreToolUse")) {
 function exerciseStopLifecycle(invoke) {
   const cwd = workspace();
   try {
-    const planFile = writeActivePlan(cwd);
-    attach(invoke, cwd, planFile);
+    attach(cwd);
     const first = invoke("Stop", payload(cwd, "Stop"), cwd);
     const second = invoke("Stop", payload(cwd, "Stop", true), cwd);
     const third = invoke("Stop", payload(cwd, "Stop", true), cwd);
@@ -264,7 +264,12 @@ function exerciseStopLifecycle(invoke) {
     assert.match(second.reason, /final bounded continuation/);
     assert.equal(third.decision, "allow");
     assert.equal(third.hookSpecificOutput.decision, "allow");
-    assert.match(third.systemMessage, /bounded retry limit/);
+    // Current admission retires through a durable frontier, not the legacy
+    // bounded-retry banner. An unconfirmed fail-open must not pass this check.
+    assert.equal(third.release.status, "detached");
+    assert.match(third.systemMessage, /not a checkpoint or externally verified completion/);
+    assert.equal(readRecoveryFrontier(cwd).frontier.stopState.totalBlocks.value, 2);
+    assert.equal(existsSync(path.join(cwd, ".supervised-worker", "attachment.json")), false);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
     assert.equal(existsSync(cwd), false);
@@ -274,13 +279,14 @@ function exerciseStopLifecycle(invoke) {
 function exerciseProgressingStopLifecycle(invoke) {
   const cwd = workspace();
   try {
-    const planFile = writeActivePlan(cwd);
-    attach(invoke, cwd, planFile);
+    const planFile = attach(cwd);
     for (let index = 0; index < 8; index += 1) {
       if (index > 0) {
         const plan = JSON.parse(readFileSync(planFile, "utf8"));
         plan.items = [{ id: `issue-${index}`, title: `Issue ${index}`, status: "pending" }];
-        writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
+        const session = { session_id: payload(cwd, "Stop").session_id };
+        assert.equal(applyCampaignPlan(cwd, { ...session, expected: observeCampaignTransition(cwd, session), plan },
+          workerRuntimes.get(cwd).authority()).status, "applied");
       }
       const output = invoke("Stop", payload(cwd, "Stop", index > 0), cwd);
       assert.equal(output.decision, "block", `progress epoch ${index}`);
@@ -289,6 +295,7 @@ function exerciseProgressingStopLifecycle(invoke) {
         true,
         `progress epoch ${index}`,
       );
+      assert.equal(readRecoveryFrontier(cwd).frontier.stopState.totalBlocks.value, index + 1);
     }
   } finally {
     rmSync(cwd, { recursive: true, force: true });
@@ -299,24 +306,26 @@ function exerciseProgressingStopLifecycle(invoke) {
 function exerciseInvalidStopLifecycle(invoke) {
   const cwd = workspace();
   try {
-    const planFile = writeActivePlan(cwd);
-    attach(invoke, cwd, planFile);
+    const planFile = attach(cwd);
     const plan = JSON.parse(readFileSync(planFile, "utf8"));
-    plan.unexpectedNonce = 1;
-    writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
-
-    const first = invoke("Stop", payload(cwd, "Stop"), cwd);
-    assert.equal(first.decision, "block");
-    plan.unexpectedNonce = 2;
-    writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
-    const second = invoke("Stop", payload(cwd, "Stop", true), cwd);
-    assert.equal(second.decision, "block");
-    assert.match(second.reason, /final bounded continuation/);
-    plan.unexpectedNonce = 3;
-    writeFileSync(planFile, `${JSON.stringify(plan, null, 2)}\n`);
-    const third = invoke("Stop", payload(cwd, "Stop", true), cwd);
-    assert.equal(third.decision, "allow");
-    assert.match(third.systemMessage, /bounded retry limit/);
+    const selected = readRecoveryFrontier(cwd);
+    const attachmentFile = path.join(cwd, ".supervised-worker", "attachment.json");
+    const attachment = readFileSync(attachmentFile);
+    // The legacy fixture consumed continuation budget from invalid plan bytes.
+    // A frontier-bound owner must instead retain its exact authority/counters.
+    for (const nonce of [1, 2, 3]) {
+      plan.unexpectedNonce = nonce;
+      const bytes = Buffer.from(`${JSON.stringify(plan, null, 2)}\n`);
+      writeFileSync(planFile, bytes);
+      const output = invoke("Stop", payload(cwd, "Stop", nonce > 1), cwd);
+      assert.equal(output.decision, "allow");
+      assert.equal(output.supervisorFailure.code, "RECOVERY_LINEAGE_AMBIGUOUS");
+      assert.match(output.systemMessage, /unconfirmed/);
+      assert.equal(output.release, undefined);
+      assert.equal(readRecoveryFrontier(cwd).frontierHash, selected.frontierHash);
+      assert.deepEqual(readFileSync(attachmentFile), attachment);
+      assert.deepEqual(readFileSync(planFile), bytes);
+    }
   } finally {
     rmSync(cwd, { recursive: true, force: true });
     assert.equal(existsSync(cwd), false);
@@ -329,7 +338,7 @@ for (const [shellName, invoke] of [["Bash", invokeBash], ["PowerShell", invokePo
   }, () => {
     const cwd = workspace();
     try {
-      attach(invoke, cwd, writeActivePlan(cwd));
+      attach(cwd);
       const input = { ...payload(cwd, "PreToolUse"), tool_name: "read_file", tool_use_id: "packaged-host-id", tool_input: { filePath: "PRIVATE_ARGUMENT" } };
       const ledger = path.join(cwd, ".supervised-worker", "runs", `${sha256(input.session_id)}.jsonl`);
       assert.equal(JSON.parse(readFileSync(path.join(cwd, ".supervised-worker", "attachment.json"))).status, "active");
@@ -447,18 +456,17 @@ test("packaged PowerShell Stop remains attached while the plan progresses", {
   exerciseProgressingStopLifecycle(invokePowerShell);
 });
 
-test("packaged PowerShell Stop bounds changing invalid plans", {
+test("packaged PowerShell Stop preserves ownership and counters for changing invalid plans", {
   skip: process.platform !== "win32",
 }, () => {
   exerciseInvalidStopLifecycle(invokePowerShell);
 });
 
-test("packaged PowerShell Stop resets an ambiguous legacy hash mismatch", {
+test("packaged PowerShell Stop ignores an ambiguous legacy cache instead of resetting its allowance", {
   skip: process.platform !== "win32",
 }, () => {
   const cwd = workspace();
   try {
-    const planFile = writeActivePlan(cwd);
     const canonicalOrderPlan = {
       completion: null,
       goal: "Exercise the packaged hook.",
@@ -475,8 +483,9 @@ test("packaged PowerShell Stop resets an ambiguous legacy hash mismatch", {
       completion: null,
     };
     assert.notEqual(sha256(JSON.stringify(reorderedPlan)), legacyHash);
-    writeFileSync(planFile, `${JSON.stringify(reorderedPlan, null, 2)}\n`);
-    attach(invokePowerShell, cwd, planFile);
+    attach(cwd, payload(cwd, "SessionStart"), reorderedPlan);
+    assert.equal(invokePowerShell("Stop", payload(cwd, "Stop"), cwd).decision, "block");
+    assert.equal(readRecoveryFrontier(cwd).frontier.stopState.totalBlocks.value, 1);
     const runtime = path.join(
       cwd,
       ".supervised-worker",
@@ -491,14 +500,17 @@ test("packaged PowerShell Stop resets an ambiguous legacy hash mismatch", {
       totalBlocks: 2,
     }));
 
+    // A stale legacy cache is not migration authority for a genuinely admitted
+    // campaign; it cannot mint the old test's additional continuation.
     const output = invokePowerShell("Stop", payload(cwd, "Stop", true), cwd);
     assert.equal(output.decision, "block");
-    assert.doesNotMatch(output.reason, /final bounded continuation/);
+    assert.match(output.reason, /final bounded continuation/);
     const migrated = JSON.parse(readFileSync(runtime, "utf8"));
-    assert.equal(migrated.schemaVersion, 2);
-    assert.equal(migrated.sameProgressBlocks, 1);
-    assert.equal(migrated.totalBlocks, 3);
-    assert.equal(migrated.progressHash, legacyHash);
+    assert.equal(migrated.schemaVersion, 3);
+    assert.equal(migrated.stopState.sameProgressBlocks.value, 2);
+    assert.equal(migrated.stopState.totalBlocks.value, 2);
+    assert.equal(migrated.stopState.progressHash, canonicalPlanHash(reorderedPlan));
+    assert.equal(invokePowerShell("Stop", payload(cwd, "Stop", true), cwd).release.status, "detached");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
     assert.equal(existsSync(cwd), false);
@@ -527,12 +539,11 @@ test("packaged PowerShell denies direct plan writes without changing the issued 
 }, () => {
   const cwd = workspace();
   try {
-    const planFile = writeActivePlan(cwd);
     const owner = {
       ...payload(cwd, "PreToolUse"),
       session_id: "owner-session",
     };
-    attach(invokePowerShell, cwd, planFile, owner);
+    const planFile = attach(cwd, owner);
     const attachmentFile = path.join(cwd, ".supervised-worker", "attachment.json");
     const attachmentBytes = readFileSync(attachmentFile);
     assert.equal(claim(invokePowerShell, cwd, planFile, owner).permissionDecision, "deny");
@@ -556,14 +567,13 @@ test("packaged PowerShell protects aliases and leaves a missing bound route iner
   try {
     const sessionId = "packaged-vscode-routing";
     const transcriptPath = vscodeTranscriptPath(storageRoot, sessionId);
-    const planFile = writeActivePlan(repository);
     const common = {
       hook_event_name: "PreToolUse",
       session_id: sessionId,
       transcript_path: transcriptPath,
       cwd: root,
     };
-    attach(invokePowerShell, repository, planFile, common);
+    const planFile = attach(repository, common);
     const claimed = invokePowerShell(
       "PreToolUse",
       {

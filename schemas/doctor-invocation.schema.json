@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervised-worker.dev/schemas/doctor-invocation.schema.json",
+  "title": "Exact Native Doctor Requests",
+  "anyOf": [{ "$ref": "#/$defs/request" }, { "$ref": "#/$defs/invocation" }],
+  "$defs": {
+    "request": {
+      "type": "object", "additionalProperties": false, "required": ["operation", "session_id"],
+      "properties": {
+        "operation": { "enum": ["detect", "inspect", "grant", "handoff", "execute", "diagnose", "propose-recovery", "recover-authorized"] },
+        "session_id": { "$ref": "recovery.schema.json#/$defs/sessionId" },
+        "transcript_path": { "$ref": "recovery.schema.json#/$defs/transcriptPath" },
+        "incidentId": { "$ref": "doctor.schema.json#/$defs/id" }, "diagnosticHash": { "$ref": "doctor.schema.json#/$defs/hash" },
+        "expectedHash": { "$ref": "doctor.schema.json#/$defs/hash" }, "handoff": { "$ref": "doctor.schema.json#/$defs/handoff" },
+        "intent": {
+          "allOf": [
+            { "$ref": "doctor.schema.json#/$defs/repairIntent" },
+            { "if": { "properties": { "action": { "const": "recover" } }, "required": ["action"] },
+              "then": { "properties": { "schemaVersion": { "const": 2 } }, "required": ["recovery"] } }
+          ]
+        },
+        "grant": {
+          "type": "object", "additionalProperties": false, "required": ["action", "actionId", "expectedHash"],
+          "properties": {
+            "action": { "$ref": "doctor.schema.json#/$defs/action" }, "actionId": { "$ref": "doctor.schema.json#/$defs/id" },
+            "expectedHash": { "$ref": "doctor.schema.json#/$defs/hash" }
+          }
+        },
+        "action": { "$ref": "recovery.schema.json#/$defs/action" },
+        "authorizationHash": { "$ref": "recovery.schema.json#/$defs/hash" }
+      },
+      "oneOf": [
+        { "properties": { "operation": { "const": "detect" } }, "required": ["incidentId", "diagnosticHash"], "not": { "anyOf": [{ "required": ["grant"] }, { "required": ["intent"] }, { "required": ["handoff"] }, { "required": ["expectedHash"] }, { "required": ["action"] }, { "required": ["authorizationHash"] }] } },
+        { "properties": { "operation": { "const": "inspect" } }, "required": ["incidentId"], "not": { "anyOf": [{ "required": ["diagnosticHash"] }, { "required": ["grant"] }, { "required": ["intent"] }, { "required": ["handoff"] }, { "required": ["expectedHash"] }, { "required": ["action"] }, { "required": ["authorizationHash"] }] } },
+        { "properties": { "operation": { "const": "grant" } }, "required": ["incidentId", "grant"], "not": { "anyOf": [{ "required": ["diagnosticHash"] }, { "required": ["intent"] }, { "required": ["handoff"] }, { "required": ["expectedHash"] }, { "required": ["action"] }, { "required": ["authorizationHash"] }] } },
+        { "properties": { "operation": { "const": "handoff" } }, "required": ["incidentId", "handoff", "expectedHash"], "not": { "anyOf": [{ "required": ["diagnosticHash"] }, { "required": ["grant"] }, { "required": ["intent"] }, { "required": ["action"] }, { "required": ["authorizationHash"] }] } },
+        { "properties": { "operation": { "const": "execute" } }, "required": ["incidentId", "intent"], "not": { "anyOf": [{ "required": ["diagnosticHash"] }, { "required": ["grant"] }, { "required": ["handoff"] }, { "required": ["expectedHash"] }, { "required": ["action"] }, { "required": ["authorizationHash"] }] } },
+        { "properties": { "operation": { "const": "diagnose" } }, "not": { "anyOf": [{ "required": ["incidentId"] }, { "required": ["diagnosticHash"] }, { "required": ["grant"] }, { "required": ["intent"] }, { "required": ["handoff"] }, { "required": ["expectedHash"] }, { "required": ["action"] }, { "required": ["authorizationHash"] }] } },
+        { "properties": { "operation": { "const": "propose-recovery" } }, "required": ["expectedHash", "action"], "not": { "anyOf": [{ "required": ["incidentId"] }, { "required": ["diagnosticHash"] }, { "required": ["grant"] }, { "required": ["intent"] }, { "required": ["handoff"] }, { "required": ["authorizationHash"] }] } },
+        { "properties": { "operation": { "const": "recover-authorized" } }, "required": ["authorizationHash"], "not": { "anyOf": [{ "required": ["incidentId"] }, { "required": ["diagnosticHash"] }, { "required": ["grant"] }, { "required": ["intent"] }, { "required": ["handoff"] }, { "required": ["expectedHash"] }, { "required": ["action"] }] } }
+      ]
+    },
+    "invocation": {
+      "type": "object", "additionalProperties": false, "required": ["schemaVersion", "kind", "status", "command", "requestHash", "failure"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "doctor-invocation" }, "status": { "enum": ["formatted", "blocked"] },
+        "command": { "anyOf": [{ "type": "null" }, { "type": "string", "minLength": 1, "maxLength": 8000 }] },
+        "requestHash": { "$ref": "recovery.schema.json#/$defs/hash" },
+        "failure": { "anyOf": [{ "type": "null" }, { "$ref": "supervisor-failure.schema.json#/$defs/failure" }] }
+      },
+      "allOf": [{
+        "if": { "properties": { "status": { "const": "formatted" } } },
+        "then": { "properties": { "command": { "type": "string" }, "failure": { "type": "null" } } },
+        "else": { "properties": { "command": { "type": "null" }, "failure": { "$ref": "supervisor-failure.schema.json#/$defs/failure" } } }
+      }]
+    }
+  }
+}

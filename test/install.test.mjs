@@ -341,11 +341,9 @@ test("isolated installed dispatch durably observes an owned non-writer", () => {
     assert.equal(manifest.hooks.PreToolUse[0].matcher, ALL_TOOL_MATCHER);
     assert.deepEqual(readFileSync(path.join(installed.installRoot, "hooks.json")), readFileSync(path.join(installed.installRoot, "com.github.copilot", "hooks", "hooks.json")));
     const state = path.join(cwd, ".supervised-worker");
-    mkdirSync(state);
-    const planFile = path.join(state, "plan.json");
-    writeFileSync(planFile, JSON.stringify({ schemaVersion: 1, mode: "active", goal: "Fixture", items: [{ id: "one", title: "One", status: "pending" }], completion: null }));
     const runtime = createWorkerAuthorityFixture(cwd, { session_id: "installed-observer" }, { installRoot: installed.installRoot });
-    runtime.admit();
+    assert.equal(runtime.admit({ schemaVersion: 1, mode: "active", goal: "Fixture",
+      items: [{ id: "one", title: "One", status: "pending" }], completion: null }).status, "applied");
     const invoke = (event, input) => {
       const command = manifest.hooks[event][0][process.platform === "win32" ? "powershell" : "bash"];
       const execution = spawnProcessTreeSync(process.platform === "win32" ? process.env.ComSpec : "bash",

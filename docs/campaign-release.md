@@ -80,10 +80,51 @@ Each supplied artifact has a role, locator, and SHA-256. The plan uses its fixed
 location; handoffs, checkpoints, and model receipts use their existing canonical
 locations. Metadata observations live at
 `.supervised-worker/release-inputs/<sha256>.json`. The compiler only reads these
-files. A complete Doctor/recovery inventory hash is obtained separately from
-`campaign inventory` and included in the input. The inventory scans recovery
-evidence even when there is no Doctor directory. Missing or changed captured
-files invalidate compilation; the compiler rechecks its input set before return.
+files. A complete retained Doctor and immutable recovery-action inventory hash is
+obtained separately from `campaign inventory` and included in the input. The
+inventory scans action intents/outcomes, receipt-only confirmations, their
+referenced authorizations, quarantine metadata and opaque payload hashes even when there is
+no Doctor directory. A confirmation retains both the original expired grant as
+historical evidence and its fresh authorization, with exact intent/metadata and
+post-state bindings; neither is silently relabeled as executable authority.
+An unused authorization and its otherwise unreferenced frontier are not consumed
+action evidence and do not change this inventory.
+Directly referenced historical frontiers are included; the moving live head and
+unrelated tool-observation frontiers are not action inventory. This avoids making
+publication invalidate itself when its own hook updates ordinary lifecycle state.
+Missing or changed captured files and invalid action cross-links invalidate
+compilation; the compiler rechecks its input set before return. A newly applied
+recovery action makes the old inventory/manifest stale.
+
+## Safe Canonical Publication
+
+Use `campaign publish` to compile and durably store a JSON receipt. Its bounded
+JSON stdin is the same owning-session and manifest input as `campaign compile`;
+there is no destination, filename, append or overwrite option.
+
+The helper selects:
+
+```text
+.supervised-worker/releases/<receipt-byte-sha256>.json
+```
+
+Publication revalidates the current owner, accepted inputs and candidate around
+atomic storage, then reopens and hashes the exact bytes. Repeating an unchanged
+publication returns `already-published`. A conflict or unconfirmed readback is
+not a successful publication, and the caller must inspect evidence rather than
+blindly replay a possibly completed operation.
+
+Keep ordinary JSON reports out of `.supervised-worker/runs/`, which is reserved
+for the metadata journal. Do not add Git ignore rules or source-cleanliness
+exceptions to accommodate generated receipts. The helper-owned release directory
+is inside the existing campaign-state namespace and outside the run journal.
+The separate quarantine flow preserves an explicitly authorized foreign entry
+under `.supervised-worker/recovery/quarantine/`; it is not automatic cleanup.
+
+`campaign compile [--format json|markdown]` remains a read-only stdout interface.
+Publication does not bank an item, grant permissions, satisfy Stop, or upgrade
+provider provenance. Existing reports at operator-chosen locations are not
+automatically discovered, moved, or relabeled.
 
 ## Provenance
 
@@ -103,8 +144,9 @@ any supplied complete queue identities. With no complete queue, the provider
 actor/repository hashes remain uncorroborated recorded claims. The compiler does
 not equate a provider repository ID with a local filesystem identity and does
 not independently bind either to a Git remote; that requires external provider
-reconciliation. CI records require all nine supported OS/Node jobs and both required
-npm steps; closure hashes must name plan items. These observations still remain
+reconciliation. CI records use the accepted repository policy below, or the
+legacy nine-job matrix when that policy is absent. Closure hashes must name plan
+items. These observations still remain
 `unattested-provider-observation`, not verified provider truth.
 
 Model receipts remain Worker-recorded host observations, even when their local
@@ -116,6 +158,45 @@ rejected by the JSON and Markdown serializers.
 Item completion, session checkpoint, campaign completion, Doctor resolution,
 and provider verification are distinct dispositions. Recorded completion is not
 permission to close an issue or claim the operational canary passed.
+
+## Target Repository CI
+
+An optional `validation.ci` section in the complete repository workflow specifies
+the required job names and, when needed, required successful steps:
+
+```json
+{
+  "ci": {
+    "requiredJobs": [
+      { "name": "python-tests", "requiredSteps": ["Run tests"] },
+      { "name": "ui-tests", "requiredSteps": [] }
+    ]
+  }
+}
+```
+
+Place this object inside the existing `validation` object, not at workflow root.
+The user must explicitly accept the new exact workflow hash. A policy must name
+at least one job; duplicate job names, blank names, Unicode control/format or
+line/paragraph-separator characters, and unbounded lists are rejected.
+An empty `requiredSteps` explicitly requires job
+success without imposing a step-name convention. Job-name uniqueness is a
+cross-field runtime check in addition to the schema's structural constraints.
+
+For this policy, the provider observation's `ci` is a tagged `repository-ci`
+object containing `kind`, `workflowHash`, `runId`, `commit`, `complete`,
+`conclusion`, and `jobs`. Its workflow hash must equal the currently accepted
+workflow and every job's commit must equal the candidate. Every required job and
+step must be present and successful; duplicate observed job/step names fail.
+Additional observed successful jobs and steps are allowed within the bounds.
+The compiler checks supplied observations; it does not fetch provider data.
+
+Without an explicit CI policy, legacy nine-job observations remain supported and
+repository-tagged observations cannot opt themselves in. With a policy, a legacy
+matrix cannot substitute for the required project jobs. `ci: null` still records
+CI as unavailable and never satisfies CI evidence. Old receipts remain readable.
+Strict Doctor promotion and supervisor release retain their independent nine-job
+OS/Node matrix; this repository-specific policy does not relax those gates.
 
 ## Doctor Evidence
 

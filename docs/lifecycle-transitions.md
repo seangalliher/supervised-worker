@@ -52,7 +52,8 @@ state changes. It never refreshes a stale external expectation to make it pass.
 
 Observations contain canonical plan and exact plan-byte hashes, attachment hash,
 claim and route generations, route and marker hashes, Stop-state hash, session
-hash, repository identity hash, and source state. The closed wire shapes live in
+hash, repository identity hash, current `frontierHash`, and source state.
+Version 2 observations bind the selected recovery frontier. The closed wire shapes live in
 [the transition schema](../schemas/transition.schema.json). Internal filesystem
 identity checks remain inside the kernel; normal callers use these observations
 and hashes, not inode values or lock-directory choreography.
@@ -71,8 +72,10 @@ It is read-only and acquires no lifecycle lock. `plan` takes the same session
 fields plus the exact returned `expected` object and schema-valid `plan`.
 There is no caller-selected destination path or arbitrary command. A stale
 observation returns `CAMPAIGN_COMPARE_AND_SET_CONFLICT`; an uncertain failure
-does not authorize replay. Checkpoint and resume retain their existing bounded
-request formats, now with verified immutable host authority at the CLI boundary.
+does not authorize replay. Checkpoint v3 carries an exact source frontier.
+Ownerless resume requires an explicit `frontierHash`; a current checkpoint may
+omit it only when its matching frontier is uniquely verified under guards.
+Verified immutable authority remains mandatory at the CLI boundary.
 `release` takes the owning session fields and exact `expected` observation as
 bounded JSON stdin. It has no unbound force mode. `lifecycle recover` accepts
 the same capability-bound request as the standalone rescue executor, not a raw
@@ -87,10 +90,13 @@ command remains available, but does not confer mutation authority.
 | Checkpoint | Active or resumed | Persist receipt and journal watermark, then checkpointed attachment and released source route. The active incomplete plan is unchanged. |
 | Checkpoint retry | Matching checkpointed source | Validate the original receipt/ledger binding and finish the same source-route release; never manufacture completion. |
 | Resume | Matching checkpoint, fresh session | Restore bounded Stop/unknown-operation context, publish a new claim and route generation, then report resumed. A changed plan or competing successor is rejected. |
-| Ownerless resume | Released, active incomplete plan | Explicitly adopt with observed or unavailable prior context. Unknown external mutations are not replayed. |
+| Ownerless resume | Proven detached/checkpointed/reconciled frontier, active incomplete plan | Explicit frontier-bound restoration; preserve unknown counters and effects. Never select historical runtime values. |
 | Stop | Validated provisional, active, or resumed owner | Keep the bounded block, or release for verified completion, inactivity, absent provisional plan, or the existing bounded limit. Unverified release is not completion. |
-| Explicit release | Exact observed attachment and verified owner grant | Remove only that attachment and optional counters, preserving the plan. Changed ownership wins. No implicit release is performed for an unrelated chat. |
+| Explicit release | Exact observed attachment and verified owner grant | Persist/read back a prepared frontier before exact route/attachment release; confirm a detached frontier and retain runtime history. Changed ownership wins. |
 | Recovery | Exact inspected dead lock owner | Retain a permanent recovery fence and append-only intent/outcome evidence. Campaign work state is unchanged. Live, unknown, malformed, changed, or unverifiable owners are not reclaimed. |
+| Recovery diagnosis/proposal | Verified source/workflow/session, ownership not required | Bounded zero-write observation; no locks, markers, incidents or implicit grants. |
+| Authorized recovery | Direct operator confirmation of exact snapshot/action/source/workflow/session/expiry | One reconciliation, prepared release completion, selected lock recovery, or exact foreign-file quarantine. No implicit resume. |
+| Campaign publication | Current owning Worker and exact candidate/inputs | Canonical `.supervised-worker/releases/<sha256>.json`; byte readback and idempotence, not banking or completion. |
 
 `resumed` is the active checkpoint successor view. `recovery-fenced` in a
 campaign observation is a refusal state for unverifiable attachment content,
@@ -128,13 +134,24 @@ There is no production flag that enables the test adapter or implicit plan edits
 ## Journal Boundary Preserved From #8
 
 `appendJournalRecord` and routine start/completion, denied-retry, helper-result,
-and PreCompact observations stay outside `withCampaignTransition`. They retain
+and PreCompact observations retain
 the journal mutex, session/route/claim/invocation/operation/observation identity,
 atomic complete-file publication, limits, flush/read-back, and fail-closed start
-behavior. They do not acquire the repository campaign lock. Checkpoint alone
-coordinates the journal watermark with its stronger transition exclusion.
+behavior. Routine observations retain session/journal exclusion. Migrated
+campaigns also publish authoritative tool/counter frontiers through the
+generation-bound transition owner, observing the current head after acquiring
+those guards rather than rejecting a legitimate same-owner peer's progress.
+Explicit lifecycle CAS expectations are not refreshed. Checkpoint/release also
+coordinate repository exclusion and the journal watermark.
 Missing completion remains outcome-unknown. The one hash-stable deterministic
 read-only helper retry is unchanged; unknown mutations are never replayed.
+
+Every journal producer is classified as admission, a reserved terminal, or
+bounded control. New work cannot consume the 1 MiB/four-slot control reserve or
+two maximum terminal records per outstanding operation. Capacity denials append
+no denial records; a fresh session cannot reset aggregate usage. See
+[Bounded Local Reliability And Recovery](reliability-recovery.md) for capacity,
+lineage, recovery commands, exact publication paths and downgrade boundaries.
 
 ## Rescue Entry Point
 

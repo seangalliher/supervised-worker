@@ -6,8 +6,10 @@ authorize itself, run a daemon, or replace the existing build and review roles.
 
 ## Authority And Routing
 
-Production requires the immutable installation's accepted Worker authority and
-the current repository/session owner. The explicit VS Code `local-scoped` profile
+Incident mutation requires the immutable installation's accepted Worker authority
+and the current repository/session owner. Read-only recovery diagnosis/proposal
+instead verifies immutable source, accepted workflow and the real session with
+zero campaign writes, even without an owning attachment. The explicit VS Code `local-scoped` profile
 uses plugin-session binding; the default `host-attested` profile still requires
 genuine host-provided evidence. Neither mode manufactures a host inventory.
 An explicitly accepted workflow chooses `authority.mode` and `authority.assurance`.
@@ -15,14 +17,16 @@ Doctor cannot change either selection,
 the accepted configuration, policy, review rules, or completion criteria.
 
 The hook-to-Doctor route accepts an in-process typed kernel failure, not text
-that looks like an error. It preserves the original hook decision and records
-an incident before asking the Worker to invoke the isolated Doctor companion.
+that looks like an error. It preserves the original hook decision and returns an
+already-generated canonical recovery invocation. Existing owning-session incident
+routing can also record an incident before invoking the isolated Doctor companion.
 Missing authority leaves production fail-closed; fixture authority is never a
 substitute for a live host inventory.
 
 The separate `src/doctor-rescue.mjs` entry point accepts at most 65,536 bytes of
 duplicate-key-free JSON on stdin. Its operations are `detect`, `inspect`,
-`handoff`, `grant`, and `execute`. Requests carry the owning session, incident
+`handoff`, `grant`, `execute`, `diagnose`, `propose-recovery`, and
+`recover-authorized`. Incident requests carry the owning session, incident
 identity, and typed record or hash. No arbitrary shell text or free-form target
 path crosses that boundary. The Doctor agent has no direct durable-state or
 shell tool; probes and mutations run through the Worker and dedicated executors.
@@ -37,7 +41,10 @@ immutable source, workflow and owning session. The executor's existing independe
 incident transaction owns action reservations, capabilities, audit outcomes and
 exact dead-owner recovery; this path does not authorize ordinary tools or replay.
 
-Use the installation record's exact absolute Node path and the immutable
+Use the hook's `recoveryInvocation.command` unchanged, or the healthy/direct
+`doctor request` formatter; do not construct base64, guess fields, or require an
+ordinary formatter tool before a blocked recovery can run. The shared formatter
+and recognizer use the installation record's exact absolute Node path and the immutable
 `src/doctor-rescue.mjs` path, each single-quoted, followed by `--request-base64`
 and one single-quoted canonical base64 argument. Decode that argument as UTF-8
 JSON with exactly `cwd` (the absolute campaign root) and `request` (the usual
@@ -47,8 +54,9 @@ PowerShell requires the leading
 `& `; POSIX shells do not. Escape an apostrophe inside a PowerShell argument as
 `''`, or inside a POSIX argument as `'\''`. No prefix command, pipeline, wrapper,
 redirection, environment override, extra argument or trailing command qualifies.
-The decoded envelope is bounded to 65,536 UTF-8 bytes; a host terminal may impose
-a smaller command-length limit. Requests use the same fields and operations as
+The decoded envelope is bounded to 65,536 UTF-8 bytes. Generated commands have an
+8,000-byte UTF-8 maximum; larger requests return `DOCTOR_NATIVE_REQUEST_TOO_LARGE`
+with `command: null`, not an unrunnable shell command. Requests use the same fields and operations as
 stdin and must carry the native hook's exact session and transcript. Base64 avoids
 JSON quote loss in Windows PowerShell 5.1 and is also accepted by PowerShell 7.
 Do not include raw prompts, credentials or opaque rescue capabilities in it.
@@ -71,6 +79,20 @@ or mark that observation unavailable. A native hook allow is not an action outco
 reopen the Doctor result, retain recovery fences, and prove the next ordinary
 governed action succeeds. Lost or unknown mutating results are not replayed.
 Strict host-attested workflows and the stdin compatibility entry are unchanged.
+
+`diagnose` and `propose-recovery` are zero-write and need no incident transaction.
+`recover-authorized` requires a separately stored, exact operator authorization;
+Doctor's `grant` does not issue one. Recover at most one exact selected scope:
+repository, applicable session, then journal. Later scopes are deferred until
+their prerequisite is recovered. The selected snapshot is revalidated before
+capability minting, and each subsequent action requires fresh inspection and
+authorization. Permanent fences are retained. See
+[Bounded Local Reliability And Recovery](reliability-recovery.md) for commands,
+uncertainty-preserving lineage, single-entry quarantine and authority limits.
+After a quarantine's grant expires, a missing outcome stays visible. Only a
+freshly operator-authorized `confirm-completed-action` may record an already
+proved completed move. That receipt-only operation never repeats the payload
+effect or extends the expired grant.
 
 ## Incident State
 

@@ -10,6 +10,9 @@ import { validateDoctor } from "../src/core.mjs";
 const schema = JSON.parse(readFileSync(new URL("../schemas/doctor.schema.json", import.meta.url)));
 const ajv = new Ajv2020({ allErrors: true, strict: true });
 addFormats(ajv);
+// Selected scope observations now reference the packaged lifecycle snapshot.
+// Keep strict validation; register only that explicit local dependency.
+ajv.addSchema(JSON.parse(readFileSync(new URL("../schemas/lifecycle.schema.json", import.meta.url))));
 const validate = ajv.compile(schema);
 const hash = "a".repeat(64);
 const id = "11111111-1111-4111-8111-111111111111";
@@ -50,7 +53,9 @@ for (const fixture of fixtures) {
       (value) => { value.command = "arbitrary shell"; },
       (value) => { value.binding.repositoryHash = "unbound"; },
       (value) => { value.binding.policyOverride = true; },
-      (value) => { value.schemaVersion = 2; },
+      // v2 repair intents add exact selected recovery; use a still-unsupported
+      // version rather than pinning v2 as invalid after the approved migration.
+      (value) => { value.schemaVersion = value.kind === "doctor-repair-intent" ? 3 : 2; },
       (value) => { delete value.binding; },
     ]) {
       const changed = structuredClone(fixture);
@@ -70,4 +75,23 @@ test("Doctor schema rejects empty, unknown, and malformed boundaries", () => {
     assert.equal(validate(value), false, JSON.stringify(value));
     assert.equal(validateDoctor(value).length, 1);
   }
+});
+
+test("Doctor v2 recovery intents require one closed selected snapshot while v1 remains readable", () => {
+  const selected = { ...fixtures[3], schemaVersion: 2, action: "recover", inputHashes: [hash],
+    recovery: { scope: "journal", snapshotHash: hash } };
+  assert.equal(validate(selected), true, JSON.stringify(validate.errors));
+  assert.deepEqual(validateDoctor(selected), []);
+  for (const changed of [
+    { ...selected, recovery: undefined },
+    { ...selected, schemaVersion: 1 },
+    { ...selected, recovery: { scope: "doctor", snapshotHash: hash } },
+    { ...selected, recovery: { scope: "journal", snapshotHash: null } },
+    { ...selected, recovery: { ...selected.recovery, command: "unbound" } },
+  ]) {
+    const value = JSON.parse(JSON.stringify(changed));
+    assert.equal(validate(value), false, JSON.stringify(value));
+    assert.equal(validateDoctor(value).length, 1);
+  }
+  assert.equal(validate(fixtures[3]), true);
 });

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { withReliabilityFixture } from "./reliability-fixture.mjs";
 
 const testModuleUrl = import.meta.url;
 const coreUrl = new URL("../src/core.mjs", testModuleUrl).href;
@@ -56,6 +57,17 @@ function filesystemPrelude(sessionId) {
     const originalCloseSync = fs.closeSync;
     const originalFsyncSync = fs.fsyncSync;
     const originalReadSync = fs.readSync;
+    const seedFreshLegacyStop = (root) => {
+      const hash = (bytes) => require("node:crypto").createHash("sha256").update(bytes).digest("hex");
+      const file = path.join(root, ".supervised-worker", "runtime", hash(sessionId) + ".json");
+      if (originalExistsSync(file)) return;
+      const plan = JSON.parse(originalReadFileSync(path.join(root, ".supervised-worker", "plan.json")));
+      originalMkdirSync(path.dirname(file), { recursive: true });
+      // Only a known fresh fixture supplies this baseline. Production cannot
+      // invent zero when an existing campaign's runtime tail is missing.
+      originalWriteFileSync(file, JSON.stringify({ schemaVersion: 1, progressHash: hash(JSON.stringify(plan)),
+        sameProgressBlocks: 0, totalBlocks: 0 }));
+    };
   `;
 }
 
@@ -82,15 +94,46 @@ function filesystemCleanup() {
   `;
 }
 
-function checkpointFaultSetup(includeStop = true, routed = true) {
+function checkpointFaultSetup(includeStop = true, routed = true, governed = includeStop) {
   return `
-    const { canonicalPlanHash, checkpointSession, handleHook, planPath, releaseAttachment, resumeSession, sha256, summarizePlan, summarizeRunLedger } = await import(${JSON.stringify(coreUrl)});
+    const core = await import(${JSON.stringify(coreUrl)});
+    const { canonicalPlanHash, planPath, sha256, summarizePlan, summarizeRunLedger } = core;
     const input = { cwd: repositoryRoot, session_id: sessionId, ${routed ? "transcript_path: transcriptPath," : ""}
       tool_name: "Write", tool_use_id: "setup-plan", tool_input: { file_path: planPath(repositoryRoot) } };
-    assert.deepEqual(handleHook(input, "PreToolUse"), {});
     const plan = { schemaVersion: 1, mode: "active", goal: "PRIVATE_GOAL", items: [{ id: "item", title: "PRIVATE_TITLE", status: "pending" }], completion: null };
-    fs.writeFileSync(planPath(repositoryRoot), JSON.stringify(plan));
-    assert.deepEqual(handleHook(input, "PostToolUse"), {});
+    let workerRuntime = null;
+    let authorityFor = () => undefined;
+    ${governed ? `
+      // Positive lifecycle fault grids use real grants/frontiers rather than
+      // the former unbound resume shortcut. Keep each session inventory stable
+      // so a denied nested contender cannot change the outer grant.
+      const { createWorkerAuthorityFixture } = await import(${JSON.stringify(new URL("./worker-authority-fixture.mjs", testModuleUrl).href)});
+      const runtimes = new Map();
+      authorityFor = (request) => {
+        if (!request || typeof request.session_id !== "string") return undefined;
+        const key = JSON.stringify([request.session_id, request.transcript_path ?? null]);
+        if (!runtimes.has(key)) runtimes.set(key, createWorkerAuthorityFixture(repositoryRoot, request, {
+          baseDirectory: path.join(base, "authority-" + sha256(key)),
+          ...(workerRuntime === null ? {} : { installRoot: workerRuntime.installRoot }),
+        }));
+        return runtimes.get(key).authority();
+      };
+      authorityFor(input);
+      workerRuntime = [...runtimes.values()][0];
+      assert.equal(workerRuntime.admit(plan).status, "applied");
+    ` : ""}
+    const handleHook = (value, event) => core.handleHook(value, event, value.cwd, null, authorityFor(value));
+    const checkpointSession = (cwd, request) => core.checkpointSession(cwd, request, authorityFor(request));
+    const resumeSession = (cwd, request) => core.resumeSession(cwd, request, authorityFor(request));
+    const releaseInput = { session_id: sessionId, ${routed ? "transcript_path: transcriptPath," : ""} };
+    const releaseAttachment = (cwd, expected) => ${governed
+      ? 'core.releaseAttachment(cwd, expected ?? core.observeCampaignTransition(cwd, releaseInput), releaseInput, authorityFor(releaseInput))'
+      : 'core.releaseAttachment(cwd, expected)'};
+    const setup = ${governed ? '{ ...input, tool_input: { file_path: path.join(repositoryRoot, "setup.txt") } }' : "input"};
+    assert.deepEqual(handleHook(setup, "PreToolUse"), {});
+    ${governed ? "" : 'fs.writeFileSync(planPath(repositoryRoot), JSON.stringify(plan));'}
+    assert.deepEqual(handleHook(setup, "PostToolUse"), {});
+    ${includeStop && !governed ? "seedFreshLegacyStop(repositoryRoot);" : ""}
     ${includeStop ? 'assert.equal(handleHook({ ...input, stop_hook_active: false }, "Stop").decision, "block");' : ""}
     const attachmentFile = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
     const attachmentBefore = originalReadFileSync(attachmentFile);
@@ -181,7 +224,7 @@ test("routine observations avoid the repository lifecycle lock", () => {
   `);
 });
 
-test("journal admission accounts for unrelated sessions without opening their contents", () => {
+test("journal admission accounts for unrelated session reservations with bounded content inspection", () => {
   runIsolated(`
     ${filesystemPrelude("journal-admission-io")}
     try {
@@ -209,7 +252,9 @@ test("journal admission accounts for unrelated sessions without opening their co
       assert.deepEqual(handleHook(tool, "PreToolUse"), {});
       assert.deepEqual(handleHook(tool, "PostToolUse"), {});
       assert.ok(activeOpens > 0, "the open instrumentation must observe the actual journal path");
-      assert.equal(unrelatedOpens, 0, "aggregate admission must inspect sizes and identities, not reread unrelated contents");
+      // Size-only accounting missed outstanding operations in other sessions.
+      // Bound the real reads while requiring complete reservation evidence.
+      assert.ok(unrelatedOpens >= otherFiles.size && unrelatedOpens <= otherFiles.size * 8);
       assert.deepEqual(originalReadFileSync(attachmentFile), attachmentBefore);
     ${filesystemCleanup()}
   `);
@@ -617,9 +662,9 @@ for (const checkpointFirst of [true, false]) {
   });
 }
 
-function observedHandoffFaultSetup(kind = "build-report", routed = true) {
+function observedHandoffFaultSetup(kind = "build-report", routed = true, governed = false) {
   return `
-    ${checkpointFaultSetup(false, routed)}
+    ${checkpointFaultSetup(false, routed, governed)}
     const { observeHandoffValidation, requestDeniedToolRetry } = await import(${JSON.stringify(coreUrl)});
     const artifactKind = ${JSON.stringify(kind)};
     const itemId = "PRIVATE_HELPER_ITEM";
@@ -895,13 +940,9 @@ test("observed handoff CLI accepts only the explicit bounded JSON interface", ()
   runIsolated(`
     ${filesystemPrelude("observed-handoff-cli")}
     try {
-      ${observedHandoffFaultSetup()}
+      ${observedHandoffFaultSetup("build-report", true, true)}
       const { spawnSync } = await import("node:child_process");
-      const { createWorkerAuthorityFixture } = await import(${JSON.stringify(new URL("./worker-authority-fixture.mjs", testModuleUrl).href)});
-      assert.equal(handleHook({ ...input, stop_hook_active: true }, "Stop").decision, "allow");
-      const runtime = createWorkerAuthorityFixture(repositoryRoot, { session_id: sessionId, transcript_path: transcriptPath },
-        { baseDirectory: path.join(base, "trusted-authority") });
-      runtime.admit();
+      const runtime = workerRuntime;
       const cliPath = path.join(runtime.installRoot, "src", "cli.mjs");
       startHelper("PRIVATE_CLI_HOST");
       const invoke = (args, stdin = "") => {
@@ -1488,14 +1529,21 @@ for (const fault of [
           assert.equal(current.sessionHash, sha256(nextId));
           assert.equal(current.checkpointHash, checkpoint.checkpointHash);
           const currentBytes = originalReadFileSync(attachmentFile);
-          assert.throws(() => resumeSession(repositoryRoot, { session_id: "different-successor", planHash: request.planHash, checkpointHash: checkpoint.checkpointHash }), /another session/);
+          // The prepared frontier now binds the exact successor before its
+          // attachment exists; an alternate request cannot mint another one.
+          assert.throws(() => resumeSession(repositoryRoot, { session_id: "different-successor", planHash: request.planHash, checkpointHash: checkpoint.checkpointHash }), /prepared successor belongs to a different request/);
           assert.deepEqual(originalReadFileSync(attachmentFile), currentBytes);
         } else assert.deepEqual(originalReadFileSync(attachmentFile), tombstone);
         if (fault === "provisional-route-write") {
-          nextId = "fresh-after-unpublished-route";
-          nextTranscript = path.join(transcriptDirectory, nextId + ".jsonl");
-          fs.writeFileSync(nextTranscript, "");
-          nextRequest = { ...nextRequest, session_id: nextId, transcript_path: nextTranscript };
+          // The old retry changed sessions when route publication failed.
+          // Its successor is now durably prepared before that write: only the
+          // original session/generations may finish, even with no route yet.
+          const alternateId = "fresh-after-unpublished-route";
+          const alternateTranscript = path.join(transcriptDirectory, alternateId + ".jsonl");
+          fs.writeFileSync(alternateTranscript, "");
+          assert.throws(() => resumeSession(repositoryRoot, { ...nextRequest, session_id: alternateId,
+            transcript_path: alternateTranscript }), /prepared successor belongs to a different request/);
+          assert.equal(core.readRecoveryFrontier(repositoryRoot).frontier.successor.sessionHash, sha256(nextId));
         }
         const resumed = resumeSession(repositoryRoot, nextRequest);
         assert.equal(resumed.status, "resumed");
@@ -1518,25 +1566,59 @@ for (const eventName of ["PostToolUse", "PostToolUseFailure"]) {
         ${checkpointFaultSetup()}
         const { randomUUID } = await import("node:crypto");
         fs.rmSync(planPath(repositoryRoot));
-        let fired = false;
-        let replacement;
+        const journalBefore = originalReadFileSync(ledgerFile);
+        const routeBefore = originalReadFileSync(routeFile);
+        const headFile = path.join(repositoryRoot, ".supervised-worker", "recovery", "head.json");
+        const headBefore = originalReadFileSync(headFile);
+        const journalDirectory = path.join(repositoryRoot, ".supervised-worker", "locks", "journal");
+        let appendAttempts = 0;
         fs.appendFileSync = (filePath, ...args) => {
-          const result = originalAppendFileSync(filePath, ...args);
-          if (!fired && inRuns(filePath)) {
+          if (inRuns(filePath)) appendAttempts += 1;
+          return originalAppendFileSync(filePath, ...args);
+        };
+        syncBuiltinESMExports();
+        const terminal = { ...input, tool_use_id: "different-terminal" };
+        const missing = handleHook(terminal, ${JSON.stringify(eventName)});
+        // A genuinely admitted owner now fails its missing-plan/frontier binding
+        // before the old append-time fault boundary. That is not a cleanup permit.
+        assert.equal(missing.supervisorFailure.code, "RECOVERY_LINEAGE_AMBIGUOUS");
+        assert.equal(appendAttempts, 0);
+        assert.deepEqual(originalReadFileSync(attachmentFile), attachmentBefore);
+        assert.deepEqual(originalReadFileSync(routeFile), routeBefore);
+        assert.deepEqual(originalReadFileSync(headFile), headBefore);
+        assert.equal(originalExistsSync(journalDirectory), false);
+        let fired = false;
+        let observedOriginalOwner = false;
+        let replacement;
+        fs.readSync = (descriptor, ...args) => {
+          const count = originalReadSync(descriptor, ...args);
+          const target = descriptorPaths.get(descriptor);
+          if (!fired && count > 0 && originalExistsSync(journalDirectory) && target === attachmentFile) {
+            const bytes = args[0].subarray(args[1], args[1] + count);
+            assert.deepEqual(bytes, attachmentBefore, "observe the original owner under exclusion before replacing it");
+            observedOriginalOwner = true;
+          }
+          if (!fired && count > 0 && observedOriginalOwner && target === headFile) {
             fired = true;
             replacement = Buffer.from(JSON.stringify({ ...JSON.parse(attachmentBefore), claimGeneration: randomUUID() }));
             originalWriteFileSync(attachmentFile, replacement);
           }
-          return result;
+          return count;
         };
         syncBuiltinESMExports();
-        const output = handleHook({ ...input, tool_use_id: "different-terminal" }, ${JSON.stringify(eventName)});
-        assert.equal(fired, true);
-        assert.match(output.additionalContext, /cleanup.*failed/i);
+        const output = handleHook(terminal, ${JSON.stringify(eventName)});
+        assert.equal(observedOriginalOwner, true);
+        assert.equal(fired, true, "the earlier guarded snapshot boundary must actually replace the owner");
+        assert.equal(appendAttempts, 0);
+        assert.notEqual(JSON.parse(replacement).claimGeneration, JSON.parse(attachmentBefore).claimGeneration);
+        assert.match(output.additionalContext, /could not verify its local state/);
         assert.deepEqual(originalReadFileSync(attachmentFile), replacement);
-        assert.equal(JSON.parse(originalReadFileSync(routeFile)).status, "active");
+        assert.deepEqual(originalReadFileSync(routeFile), routeBefore);
+        assert.deepEqual(originalReadFileSync(headFile), headBefore);
         const records = originalReadFileSync(ledgerFile, "utf8").trim().split("\\n").map(JSON.parse);
-        assert.equal(records.at(-1).event, "ownership_cleanup_failed");
+        // The old cleanup-failed append borrowed the replaced owner's state.
+        // The transition fence must now preserve the exact original journal.
+        assert.deepEqual(originalReadFileSync(ledgerFile), journalBefore);
         assert.equal(records.some((record) => record.event === "provisional_claim_released"), false);
       ${filesystemCleanup()}
     `);
@@ -1638,7 +1720,8 @@ test("receipt publication excludes claim, resume, and explicit release until log
           resumeReached = true;
           assert.throws(() => resumeSession(repositoryRoot, { session_id: "competing-resume", planHash: request.planHash, checkpointHash: path.basename(destination, ".json") }), /lifecycle/);
           releaseReached = true;
-          assert.throws(() => releaseAttachment(repositoryRoot), /repository lifecycle lock is busy/);
+          // Routed owning release now checks its session guard before repository exclusion.
+          assert.throws(() => releaseAttachment(repositoryRoot), /session lock|lifecycle/);
           assert.deepEqual(originalReadFileSync(attachmentFile), attachmentBefore);
         }
         return result;
@@ -1692,7 +1775,9 @@ test("a delayed explicit release cannot delete the checkpoint successor", () => 
     ${filesystemPrelude("checkpoint-delayed-release")}
     try {
       ${checkpointFaultSetup()}
-      const lockDirectory = path.join(repositoryRoot, ".supervised-worker", "locks", "lifecycle");
+      // Owning routed release acquires the session guard first. Inject before
+      // that guard, not after it already excludes the nested checkpoint.
+      const lockDirectory = path.join(storageRoot, "supervised-worker", "session-locks", sha256(sessionId));
       let fired = false;
       let successorBytes;
       fs.mkdirSync = (directory, ...args) => {
@@ -1740,57 +1825,51 @@ test("checkpoint publication cannot overwrite a replacement generation introduce
 });
 
 for (const ownerless of [false, true]) {
-  test(`a restarted process reports a real unobserved side effect without replay (ownerless=${ownerless})`, () => {
-    const cwd = realpathSync(mkdtempSync(path.join(os.tmpdir(), "supervised-worker-restart-")));
+  test(`a restarted process reports a real unobserved side effect without replay (ownerless=${ownerless})`, () => withReliabilityFixture((fixture) => {
+    const cwd = fixture.cwd;
     const sideEffect = path.join(cwd, "performed-once.txt");
-    try {
       const first = spawnSync(process.execPath, ["--input-type=module", "--eval", `
         import assert from "node:assert/strict";
         import { readFileSync, writeFileSync } from "node:fs";
-        import path from "node:path";
-        import { canonicalPlanHash, handleHook, planPath, sha256 } from ${JSON.stringify(coreUrl)};
+        import { handlePluginHook, observeCampaignTransition, summarizePlan, releaseAttachment } from ${JSON.stringify(pathToFileURL(path.join(fixture.installRoot, "src", "core.mjs")).href)};
+        import { verifyWorkerAuthority } from ${JSON.stringify(pathToFileURL(path.join(fixture.installRoot, "src", "authority.mjs")).href)};
         const cwd = ${JSON.stringify(cwd)};
-        const input = { cwd, session_id: "crashed-session", tool_name: "Write", tool_use_id: "setup", tool_input: { file_path: planPath(cwd) } };
-        assert.deepEqual(handleHook(input, "PreToolUse"), {});
-        const plan = { schemaVersion: 1, mode: "active", goal: "Fixture", items: [{ id: "one", title: "One", status: "pending" }], completion: null };
-        writeFileSync(planPath(cwd), JSON.stringify(plan));
-        assert.deepEqual(handleHook(input, "PostToolUse"), {});
-        assert.deepEqual(handleHook({ ...input, tool_name: "Bash", tool_use_id: "unobserved-effect", tool_input: { command: "PRIVATE_SIDE_EFFECT_ARGUMENT" } }, "PreToolUse"), {});
-        const records = readFileSync(path.join(cwd, ".supervised-worker", "runs", sha256(input.session_id) + ".jsonl"), "utf8").trim().split("\\n").map(JSON.parse);
-        const start = records.at(-1);
-        assert.equal(start.event, "tool_started");
-        assert.equal(records.some((record) => record.event === "tool_completed" && record.operationId === start.operationId), false);
+        const source = ${JSON.stringify(fixture.input)};
+        const installRoot = ${JSON.stringify(fixture.installRoot)};
+        const input = { cwd, ...source, tool_name: "Write", tool_use_id: "unobserved-effect",
+          tool_input: { file_path: ${JSON.stringify(sideEffect)}, content: "PRIVATE_SIDE_EFFECT_ARGUMENT" } };
+        assert.notEqual(handlePluginHook(input, "PreToolUse", installRoot).permissionDecision, "deny");
         writeFileSync(${JSON.stringify(sideEffect)}, "performed-once\\n", { flag: "wx" });
-        process.stdout.write(JSON.stringify({ operationId: start.operationId, request: { session_id: input.session_id, planHash: canonicalPlanHash(plan), attachmentHash: sha256(readFileSync(path.join(cwd, ".supervised-worker", "attachment.json"))) } }));
-      `], { encoding: "utf8", timeout: 10_000 });
+        // Ordinary starts no longer create frontiers; status combines the journal with the stable frontier.
+        const unknown = summarizePlan(cwd).operations.orphans;
+        assert.equal(unknown.length, 1);
+        let frontierHash = null;
+        if (${ownerless}) {
+          // Old coverage deleted the attachment and implicitly adopted history.
+          // The real source now publishes its release frontier before detach.
+          frontierHash = releaseAttachment(cwd, observeCampaignTransition(cwd, source), source,
+            verifyWorkerAuthority(cwd, source, installRoot, "")).frontierHash;
+        }
+        process.stdout.write(JSON.stringify({ operationId: unknown[0].operationId, frontierHash }));
+      `], { encoding: "utf8", timeout: 30_000 });
       assert.equal(first.error, undefined, first.error?.message);
       assert.equal(first.status, 0, first.stderr);
       const observed = JSON.parse(first.stdout);
       assert.match(observed.operationId, /^[0-9a-f-]{36}$/);
       assert.equal(readFileSync(sideEffect, "utf8"), "performed-once\n");
-      if (ownerless) rmSync(path.join(cwd, ".supervised-worker", "attachment.json"));
-      const second = spawnSync(process.execPath, ["--input-type=module", "--eval", `
-        import assert from "node:assert/strict";
-        import { readFileSync } from "node:fs";
-        import { checkpointSession, resumeSession } from ${JSON.stringify(coreUrl)};
-        const cwd = ${JSON.stringify(cwd)};
-        const observed = ${JSON.stringify(observed)};
-        const checkpointHash = ${ownerless} ? null : checkpointSession(cwd, observed.request).checkpointHash;
-        const resumed = resumeSession(cwd, { session_id: "fresh-process", planHash: observed.request.planHash, checkpointHash });
-        assert.equal(resumed.status, "resumed");
-        assert.equal(resumed.context.operations.status, "observed");
-        assert.equal(resumed.context.operations.orphans.length, 1);
-        assert.equal(resumed.context.operations.orphans[0].operationId, observed.operationId);
-        assert.equal(resumed.context.operations.orphans[0].observationStatus, "outcome-unknown");
-        assert.equal(readFileSync(${JSON.stringify(sideEffect)}, "utf8"), "performed-once\\n");
-      `], { encoding: "utf8", timeout: 10_000 });
-      assert.equal(second.error, undefined, second.error?.message);
-      assert.equal(second.status, 0, second.stderr);
+      const planHash = fixture.observe().planHash;
+      const reference = ownerless ? { planHash, checkpointHash: null, frontierHash: observed.frontierHash }
+        : fixture.native(["checkpoint"], { ...fixture.input, planHash, attachmentHash: fixture.observe().attachmentHash }).resume;
+      fixture.select("fresh-process");
+      const resumed = fixture.native(["resume"], { ...fixture.input, ...reference });
+      assert.equal(resumed.status, "resumed");
+      assert.equal(resumed.context.operations.coverage, "complete");
+      assert.equal(resumed.context.operations.orphans.length, 1);
+      assert.equal(resumed.context.operations.orphans[0].operationId, observed.operationId);
+      assert.equal(resumed.context.operations.orphans[0].observationStatus, "outcome-unknown");
+      fixture.tool("post-restart-benign-tool");
       assert.equal(readFileSync(sideEffect, "utf8"), "performed-once\n");
-    } finally {
-      rmSync(cwd, { recursive: true, force: true });
-    }
-  });
+  }));
 }
 
 test("repository claim publication excludes another session and explicit release", () => {
@@ -3498,6 +3577,7 @@ test("bounded Stop reports route-release failure without claiming cleanup", () =
         completion: null,
       }) + "\\n");
       handleHook({ ...common, ...tool, hook_event_name: "PostToolUse" }, "PostToolUse");
+      seedFreshLegacyStop(repositoryRoot);
       assert.equal(handleHook({ ...common, hook_event_name: "Stop" }, "Stop").decision, "block");
       assert.equal(
         handleHook({ ...common, hook_event_name: "Stop", stop_hook_active: true }, "Stop").decision,
@@ -3624,12 +3704,15 @@ test("Stop reports cleanup failure when its attachment disappears", () => {
       );
       const attachmentPath = path.join(repositoryRoot, ".supervised-worker", "attachment.json");
       let removed = false;
-      fs.rmSync = (filePath, ...args) => {
-        if (!removed && String(filePath).includes(path.join(".supervised-worker", "runtime"))) {
+      // Runtime deletion is no longer a legal boundary. Remove the selected
+      // attachment at the real route-publication seam and assert no release.
+      fs.renameSync = (from, to, ...args) => {
+        if (!removed && to === routePath && JSON.parse(originalReadFileSync(from)).status === "released") {
           removed = true;
           originalRmSync(attachmentPath, { force: true });
+          throw new Error("injected source disappearance");
         }
-        return originalRmSync(filePath, ...args);
+        return originalRenameSync(from, to, ...args);
       };
       syncBuiltinESMExports();
       const output = handleHook({ ...common, hook_event_name: "Stop" }, "Stop");

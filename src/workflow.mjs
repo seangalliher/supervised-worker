@@ -13,6 +13,8 @@ import {
 } from "node:fs";
 import path from "node:path";
 
+import { validateRepositoryCiPolicy } from "./ci-policy.mjs";
+
 export const WORKFLOW_CONFIG_PATH = ".github/supervised-worker.json";
 export const WORKFLOW_ACCEPTANCE_PATH = ".supervised-worker/workflow-acceptance.json";
 export const MAX_WORKFLOW_BYTES = 1_048_576;
@@ -280,7 +282,7 @@ export function validateWorkflowValue(value) {
   if (requiredKeys(value.validation, ["focused", "broad"], "validation", errors)) {
     unknownKeys(
       value.validation,
-      new Set(["focused", "broad", "receiptGlobs"]),
+      new Set(["focused", "broad", "receiptGlobs", "ci"]),
       "validation",
       errors,
     );
@@ -288,6 +290,9 @@ export function validateWorkflowValue(value) {
     if (!nonBlank(value.validation.broad)) errors.push("validation.broad must be non-empty");
     if (value.validation.receiptGlobs !== undefined) {
       stringArray(value.validation.receiptGlobs, "validation.receiptGlobs", errors);
+    }
+    if (Object.hasOwn(value.validation, "ci")) {
+      errors.push(...validateRepositoryCiPolicy(value.validation.ci));
     }
   }
 
@@ -513,6 +518,7 @@ function loadWorkflowRoles(workspace = process.cwd(), reader = { lstatSync, read
       authorityMode: workflow.authority.mode,
       authorityAssurance: workflow.authority.assurance ?? "host-attested",
       doctor: workflow.doctor ?? null,
+      ciPolicy: workflow.validation.ci ?? null,
       reviewPolicy: {
         requiredModel: workflow.review.requiredModel ?? null,
         requiredModelFamily: workflow.review.requiredModelFamily ?? null,

@@ -25,7 +25,27 @@ receipts, or completion evidence. Test fixtures are not live authority.
 
 Do not author canonical campaign/release receipts or invoke their compiler.
 Return typed incident evidence only; the Worker opens and validates receipt
-inputs and runs the read-only compiler. Missing legacy proof remains unavailable.
+inputs and uses the compiler and guarded `campaign publish` operation. Canonical
+reports belong at `.supervised-worker/releases/<receipt-byte-sha256>.json`, not
+inside `runs/`. Publication is not banking or completion. Missing legacy proof
+remains unavailable.
+
+For typed recovery, request the already-generated canonical invocation; never
+guess `operation` fields, base64 or executable spellings. `diagnose` and
+`propose-recovery` are zero-write helper operations even without an owner.
+Reconstruction or quarantine requires direct operator confirmation bound to one
+exact snapshot/action/source/workflow/session/expiry; your incident `grant` is
+not that authorization. Recover repository, then applicable session, then
+journal, one exact selected snapshot per action, with fresh inspection between.
+Preserve runtime history, permanent fences, uncertain counters and unknown
+effects. Do not invent totals, reset a same-progress budget, replay effects,
+prune journals, or claim capacity is reset by a new session.
+
+If a quarantine completed but its outcome is missing after grant expiry, ask for
+diagnosis and a fresh operator-authorized `confirm-completed-action`. This
+receipt-only action proves the existing post-state; it never reruns the move or
+extends the old grant. Preserve the original outcome and both authorization
+chains.
 
 ## Diagnose And Reconcile
 

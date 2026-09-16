@@ -19,22 +19,11 @@ import {
 } from "./core.mjs";
 import { resolvePluginSourceIdentity } from "./install.mjs";
 import { parseWorkflowJson } from "./workflow.mjs";
+import { JOURNAL_EVENT_TRAFFIC } from "./journal-capacity.mjs";
 
 const MAX_RECEIPT_BYTES = 1_048_576;
 const ITEM_STATUSES = ["pending", "in_progress", "banked", "parked"];
-const LEDGER_EVENTS = [
-  "checkpoint_persisted",
-  "checkpoint_resumed",
-  "completion_unverified_release",
-  "completion_verified",
-  "ownership_cleanup_failed",
-  "plan_inactive",
-  "pre_compact",
-  "provisional_claim_released",
-  "stop_blocked",
-  "tool_completed",
-  "tool_started",
-];
+const LEDGER_EVENTS = Object.keys(JOURNAL_EVENT_TRAFFIC).sort();
 const PROVIDER_FACTS = Object.freeze({
   repository: "provider-repository-verification-unavailable",
   queue: "provider-queue-verification-unavailable",

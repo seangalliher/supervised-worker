@@ -25,6 +25,20 @@ import { parseWorkflowJson, resolveWorkflowRoles, WORKFLOW_CONFIG_PATH } from ".
 import { captureHandoffValidation, requireModelReceiptPublication, validateModelReceiptValue } from "./handoff.mjs";
 import { requireFullWorkerAuthority, requireVerifiedWorkerAuthority, verifyWorkerAuthority, withWorkerAuthorityVerification } from "./authority.mjs";
 import { doctorInvocationRequest } from "./doctor-invocation.mjs";
+import {
+  decideStop, exactCounter, freshStopState, observeProgress,
+  RECOVERY_PHASES_PREPARED, recoveryValueHash, requireRecovery, serializeRecovery, serializeQuarantineMetadata,
+  resolveLegacyLineage, uncertainStopState, unknownCounter, verifyFrontierChain, verifyFrontierTip,
+} from "./recovery-state.mjs";
+import {
+  projectJournalCapacity, assessRecoveryCapacity, HANDOFF_HELPER_ID, JournalOperationIndex,
+  JOURNAL_LIMITS, MAX_RECOVERY_OPERATIONS, RECOVERY_LIMITS,
+} from "./journal-capacity.mjs";
+import {
+  associateSupervisorFailure, failureFromError, renderSupervisorFailure, SupervisorError,
+  supervisorFailure, trustedSupervisorFailure,
+} from "./supervisor-diagnostics.mjs";
+import { requireOperatorAuthorizationPublication, verifyRecoveryAuthorization } from "./recovery-authority.mjs";
 
 export const STATE_DIRECTORY = ".supervised-worker";
 export const PLAN_FILE = "plan.json";
@@ -39,7 +53,7 @@ const MAX_LIFECYCLE_EVIDENCE_BYTES = 32_768;
 let lifecycleSchema = null;
 let transitionSchema = null;
 const MAX_CHECKPOINT_ITEMS = 4_096;
-const MAX_CHECKPOINT_ORPHANS = 256;
+const MAX_CHECKPOINT_ORPHANS = MAX_RECOVERY_OPERATIONS;
 const MAX_GIT_POINTER_BYTES = 4_096;
 const MAX_SESSION_LOCATOR_BYTES = 4_096;
 const SESSION_LOCK_WAIT_MS = 250;
@@ -67,6 +81,7 @@ const sessionLockWaitCell = new Int32Array(
   new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
 );
 const journalPublicationVerifiers = new WeakMap();
+const journalCaptures = new WeakMap();
 const WINDOWS_DRIVE_CHECK_TIMEOUT_MS = 500;
 const WINDOWS_PATH_CHECK_BUDGET_MS = 1_500;
 const MAX_WINDOWS_DRIVES_PER_OPERATION = 3;
@@ -104,22 +119,26 @@ const ATTACHMENT_KEYS = new Set([
   "updatedAt",
 ]);
 const ATTACHMENT_V3_KEYS = new Set([...ATTACHMENT_KEYS, "claimGeneration", "checkpointHash", "workerAuthorityHash"]);
+const ATTACHMENT_V4_KEYS = new Set([...ATTACHMENT_V3_KEYS, "campaignId"]);
 const ATTACHMENT_STATUSES = new Set(["provisional", "active"]);
 const owningSessionCapabilities = new WeakSet();
 const transitionOwners = new WeakMap();
 const supervisorFailures = new WeakMap();
 const sessionRequestAuthorities = new WeakMap();
+const recoverySourceSessions = new WeakMap();
+const preparedResumeLocators = new WeakMap();
 export const CAMPAIGN_TRANSITIONS = Object.freeze({
   claim: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed"]),
   promote: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed"]),
   plan: Object.freeze(["released", "provisional", "active", "resumed"]),
   checkpoint: Object.freeze(["active", "resumed", "checkpointed"]),
-  resume: Object.freeze(["released", "checkpointed", "resumed"]),
+  resume: Object.freeze(["released", "active", "checkpointed", "resumed"]),
   stop: Object.freeze(["provisional", "active", "resumed"]),
   release: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed", "recovery-fenced"]),
   recover: Object.freeze(["released", "provisional", "active", "resumed", "checkpointed", "recovery-fenced"]),
   doctor: Object.freeze(["active", "resumed"]),
   "record-model": Object.freeze(["active", "resumed"]),
+  publish: Object.freeze(["active", "resumed"]),
 });
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 export const PLAN_WRITER_MATCHER =
@@ -135,7 +154,6 @@ const RUN_LEDGER_MAX_TOTAL_BYTES = 16_777_216;
 const RUN_LEDGER_MAX_RECORD_BYTES = 16_384;
 const RUN_LEDGER_FILE_PATTERN = /^([0-9a-f]{64})(?:\.([0-9]{6}))?\.jsonl$/;
 const RUN_LEDGER_COMMON_KEYS = new Set(["schemaVersion", "at", "event", "session"]);
-const HANDOFF_HELPER_ID = "handoff.validate.v1";
 const HANDOFF_HELPER_FIELDS = [
   "helperId", "operationId", "parentOperationId", "observationId", "invocationHash",
   "retryRoot", "attempt", "namespaceHash", "parametersHash", "inputHash", "implementationHash",
@@ -151,6 +169,7 @@ const RUN_LEDGER_EVENT_FIELDS = new Map([
     required: ["progressHash", "sameProgressBlocks", "totalBlocks"],
     optional: [],
   }],
+  ["stop_decision", { required: ["frontierHash", "decision", "cause"], optional: [] }],
   ["tool_started", {
     required: ["toolName", "operationId", "invocationHash", "routeGeneration", "claimGeneration"],
     optional: ["requestHash"],
@@ -587,11 +606,11 @@ function attachmentFromSnapshot(snapshot) {
       checkpointHash: null,
     };
   }
-  const version3 = attachment?.schemaVersion === 3;
-  const allowedKeys = version3 ? ATTACHMENT_V3_KEYS : ATTACHMENT_KEYS;
+  const version3 = [3, 4].includes(attachment?.schemaVersion);
+  const allowedKeys = attachment?.schemaVersion === 4 ? ATTACHMENT_V4_KEYS : version3 ? ATTACHMENT_V3_KEYS : ATTACHMENT_KEYS;
   const checkpointed = version3 && attachment.status === "checkpointed";
   if (
-    ![2, 3].includes(attachment?.schemaVersion) ||
+    ![2, 3, 4].includes(attachment?.schemaVersion) ||
     !attachment ||
     typeof attachment !== "object" ||
     Array.isArray(attachment) ||
@@ -601,6 +620,7 @@ function attachmentFromSnapshot(snapshot) {
     !generation(attachment.routeGeneration) ||
     !isDateTime(attachment.attachedAt) ||
     !isDateTime(attachment.updatedAt) ||
+    (attachment.schemaVersion === 4 && !uuid(attachment.campaignId)) ||
     (version3 && (
       (Object.hasOwn(attachment, "workerAuthorityHash") && !digest(attachment.workerAuthorityHash)) ||
       !(uuid(attachment.claimGeneration) ||
@@ -709,7 +729,7 @@ function readCampaignTransition(cwd, input) {
   }
   const context = sessionLocatorContext(input);
   return {
-    schemaVersion: 1, kind: "campaign-transition-observation", state,
+    schemaVersion: 2, kind: "campaign-transition-observation", state,
     repositoryHash: sha256(canonicalJson(recoveryBoundary(root, root))),
     sessionHash: sessionHash(input),
     planHash: plan.exists && plan.errors.length === 0 ? canonicalPlanHash(plan.plan) : null,
@@ -719,7 +739,8 @@ function readCampaignTransition(cwd, input) {
     routeGeneration: attachment?.routeGeneration ?? null,
     routeHash: context === null ? null : transitionFileHash(context.storageRoot, context.filePath),
     markerHash: context === null ? null : transitionFileHash(context.storageRoot, context.markerPath),
-    stopHash: sessionHash(input) === null ? null : transitionFileHash(root, runtimeStatePath(root, input)),
+    stopHash: sessionHash(input) === null ? null : transitionFileHash(root, runtimeStatePath(root, input), 262_144),
+    frontierHash: recoveryHeadReference(root),
   };
 }
 
@@ -763,6 +784,8 @@ function withCampaignTransition(operation, cwd, input, expected, guard, action) 
       requireCurrent();
     } catch (error) {
       error.transitionResult = result;
+      const failure = trustedSupervisorFailure(result);
+      if (failure !== null) associateSupervisorFailure(error, failure);
       throw error;
     }
     return result;
@@ -782,10 +805,227 @@ function transitionWriteJson(guard, cwd, filePath, value) {
 }
 
 function transitionWriteBytes(guard, cwd, filePath, bytes, maximum, immutable = false, beforePublish = null) {
-  return transitionMutation(guard, (requireCurrent) => durableWriteBytes(cwd, filePath, bytes, maximum, immutable, null, () => {
+  return transitionMutation(guard, (requireCurrent) => durableWriteBytes(cwd, filePath, bytes, maximum, immutable, null, (temporaryPath) => {
     requireCurrent();
-    if (beforePublish !== null) beforePublish();
+    if (beforePublish !== null) beforePublish(temporaryPath);
   }));
+}
+
+function recoveryHeadPath(cwd) {
+  return path.join(stateDirectory(cwd), "recovery", "head.json");
+}
+
+function recoveryHeadReference(cwd) {
+  const filePath = recoveryHeadPath(cwd);
+  assertSafeStatePath(cwd, filePath);
+  if (!existsSync(filePath)) return null;
+  try {
+    return requireRecovery(parseWorkflowJson(readBoundedStateBytes(cwd, filePath, 262_144).bytes), "head").frontierHash;
+  } catch {
+    throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "observation");
+  }
+}
+
+export function readRecoveryFrontier(cwd) {
+  return readSelectedRecoveryFrontier(cwd, verifyFrontierChain);
+}
+
+export function readRecoveryTip(cwd) {
+  return readSelectedRecoveryFrontier(cwd, verifyFrontierTip);
+}
+
+function readSelectedRecoveryFrontier(cwd, verify) {
+  if (!isFullyQualifiedRepositoryCwd(cwd) || !pathEquals(path.resolve(cwd), realpathSync(cwd))) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "observation");
+  const headPath = recoveryHeadPath(cwd);
+  assertSafeStatePath(cwd, headPath);
+  if (!existsSync(headPath)) return null;
+  try {
+    const snapshot = readBoundedStateBytes(cwd, headPath, 262_144);
+    const head = requireRecovery(parseWorkflowJson(snapshot.bytes), "head");
+    if (!serializeRecovery(head, "head").equals(snapshot.bytes)) throw new Error("noncanonical recovery head");
+    const result = verify(head, (hash) =>
+      readBoundedStateBytes(cwd, path.join(stateDirectory(cwd), "recovery", "frontiers", `${hash}.json`), 262_144).bytes);
+    const after = readBoundedStateBytes(cwd, headPath, 262_144);
+    if (!snapshot.bytes.equals(after.bytes) || !sameRunLedgerStats(snapshot.stats, after.stats)) throw new Error("head changed");
+    return { ...result, headHash: sha256(snapshot.bytes), headIdentity: recoveryIdentity(snapshot.stats) };
+  } catch {
+    throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "observation");
+  }
+}
+
+function recoveryStoreUsage(cwd) {
+  const root = path.join(stateDirectory(cwd), "recovery");
+  assertSafeStatePath(cwd, root);
+  let bytes = 0;
+  let records = 0;
+  let entries = 0;
+  const files = [];
+  const directories = [];
+  const visit = (directory, depth) => {
+    if (depth > 3 || ++entries > 4096) throw new SupervisorError("JOURNAL_CAPACITY", "frontier-publication");
+    const before = recoveryBoundary(cwd, directory);
+    const names = readdirSync(directory).sort();
+    directories.push({ directory, before, names });
+    if (names.length > 1024) throw new SupervisorError("JOURNAL_CAPACITY", "frontier-publication");
+    for (const name of names) {
+      const target = path.join(directory, name);
+      assertSafeStatePath(cwd, target);
+      const stats = lstatSync(target, { bigint: true });
+      if (stats.isDirectory()) visit(target, depth + 1);
+      else {
+        // Quarantined payloads are bounded artifacts, not 256 KiB control records.
+        // Charge their full bytes and a record slot without changing either store cap.
+        const locator = path.relative(cwd, target).split(path.sep).join("/");
+        const maximum = validateRecovery(locator, "quarantineLocator").length === 0 ? 4_194_304 : RECOVERY_LIMITS.recordBytes;
+        recoveryIdentity(stats);
+        if (stats.size > BigInt(maximum)) throw new SupervisorError("JOURNAL_CAPACITY", "frontier-publication");
+        bytes += Number(stats.size);
+        records += 1;
+        files.push({ target, stats });
+        if (records > RECOVERY_LIMITS.records || bytes > RECOVERY_LIMITS.bytes) throw new SupervisorError("JOURNAL_CAPACITY", "frontier-publication");
+      }
+    }
+  };
+  if (existsSync(root)) visit(root, 0);
+  if (files.some((file) => !sameRunLedgerStats(file.stats, lstatSync(file.target, { bigint: true }))) ||
+    directories.some(({ directory, before, names }) => canonicalJson(recoveryBoundary(cwd, directory)) !== canonicalJson(before) ||
+      canonicalJson(readdirSync(directory).sort()) !== canonicalJson(names))) {
+    throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "observation");
+  }
+  return { bytes, records };
+}
+
+function requireRecoveryBundle(cwd, records, traffic = "ordinary") {
+  const assessment = assessRecoveryCapacity(recoveryStoreUsage(cwd), Array(records).fill(RECOVERY_LIMITS.recordBytes), traffic);
+  if (!assessment.allowed) throw new SupervisorError("JOURNAL_CAPACITY", "frontier-publication");
+  return assessment;
+}
+
+function frontierOwner(cwd, input) {
+  const snapshot = readAttachmentSnapshot(cwd);
+  if (snapshot === null) return null;
+  const attachment = attachmentFromSnapshot(snapshot);
+  const observation = readCampaignTransition(cwd, input);
+  return {
+    sessionHash: attachment.sessionHash, sessionRootHash: recoverySessionRootHash(input),
+    routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration,
+    attachmentHash: snapshot.hash, routeHash: observation.routeHash, markerHash: observation.markerHash,
+    workerAuthorityHash: attachment.workerAuthorityHash ?? null,
+  };
+}
+
+function recoverySessionRootHash(input) {
+  const context = sessionLocatorContext(input);
+  return context === null ? null : recoveryValueHash(recoveryBoundary(context.storageRoot, context.storageRoot));
+}
+
+function requireFrontierOwner(cwd, input, selected = readRecoveryTip(cwd), phases = ["active"]) {
+  if (selected === null) throw new SupervisorError("RECOVERY_FRONTIER_MISSING", "admission");
+  const { frontier } = selected;
+  const observation = readCampaignTransition(cwd, input);
+  const owner = frontierOwner(cwd, input);
+  const snapshot = readAttachmentSnapshot(cwd);
+  const attachment = snapshot === null ? null : attachmentFromSnapshot(snapshot);
+  if (!phases.includes(frontier.phase) || owner === null || owner.sessionHash !== sessionHash(input) ||
+    attachment?.campaignId !== frontier.campaignId || snapshot.hash !== owner.attachmentHash ||
+    recoveryValueHash(owner) !== recoveryValueHash(frontier.owner) ||
+    frontier.repositoryHash !== observation.repositoryHash || frontier.planHash !== observation.planHash ||
+    frontier.planBytesHash !== observation.planBytesHash) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "admission", [selected.frontierHash]);
+  return selected;
+}
+
+function publishFrontier(cwd, input, value, previous, journalGuard) {
+  journalGuard(cwd);
+  requireRecovery(value, "frontier");
+  if (value.previousHash !== (previous?.frontierHash ?? null) ||
+    value.sequence !== (previous === null ? 0 : previous.frontier.sequence + 1) ||
+    (previous !== null && value.campaignId !== previous.frontier.campaignId)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "frontier-publication");
+  const bytes = serializeRecovery(value, "frontier");
+  const hash = sha256(bytes);
+  const filePath = path.join(stateDirectory(cwd), "recovery", "frontiers", `${hash}.json`);
+  const compare = () => {
+    journalGuard(cwd);
+    const current = readRecoveryTip(cwd);
+    if (current?.headHash !== previous?.headHash ||
+      canonicalJson(current?.headIdentity ?? null) !== canonicalJson(previous?.headIdentity ?? null)) {
+      throw Object.assign(new Error("recovery head compare-and-set conflict"), { transitionCode: "CAMPAIGN_COMPARE_AND_SET_CONFLICT" });
+    }
+  };
+  compare();
+  try {
+    transitionWriteBytes(journalGuard, cwd, filePath, bytes, 262_144, true, compare);
+    const head = { schemaVersion: 1, kind: "recovery-head", campaignId: value.campaignId, sequence: value.sequence, frontierHash: hash };
+    transitionWriteBytes(journalGuard, cwd, recoveryHeadPath(cwd), serializeRecovery(head, "head"), 262_144, false, compare);
+    const confirmed = readRecoveryTip(cwd);
+    if (confirmed?.frontierHash !== hash) throw new Error("frontier publication readback differs");
+    return confirmed;
+  } catch (error) {
+    if (error?.transitionCode || trustedSupervisorFailure(error)) throw error;
+    throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "frontier-publication", [hash]);
+  }
+}
+
+function advanceFrontier(cwd, input, previous, changes, journalGuard) {
+  return publishFrontier(cwd, input, { ...previous.frontier, ...changes,
+    sequence: previous.frontier.sequence + 1, previousHash: previous.frontierHash }, previous, journalGuard);
+}
+
+function persistFrontierCache(cwd, input, selected, journalGuard) {
+  const owner = selected.frontier.phase === "resume-prepared" ? selected.frontier.successor : selected.frontier.owner;
+  if (owner === null || owner.sessionHash !== sessionHash(input)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "frontier-publication");
+  const cache = { schemaVersion: 3, kind: "recovery-runtime", campaignId: selected.frontier.campaignId,
+    sessionHash: owner.sessionHash, routeGeneration: owner.routeGeneration, claimGeneration: owner.claimGeneration,
+    frontierHash: selected.frontierHash, stopState: selected.frontier.stopState, operations: selected.frontier.operations };
+  transitionWriteBytes(journalGuard, cwd, runtimeStatePath(cwd, input), serializeRecovery(cache, "runtime"), 262_144);
+}
+
+function observeRecoveryEvidence(cwd, journalGuard, previous) {
+  const inherited = previous?.operations ?? { coverage: "complete", orphans: [], uncorrelatedCompletions: exactCounter(0) };
+  try {
+    const capture = requireJournalCapture(cwd, journalGuard);
+    requireRecordedRecoveryPrefixes(capture, previous?.ledger);
+    const index = capture.index;
+    const observed = index.project([], inherited.orphans);
+    const coverage = inherited.coverage !== "complete" ? inherited.coverage : index.incomplete ? "partial" : "complete";
+    const operations = {
+      coverage, orphans: observed.orphans,
+      uncorrelatedCompletions: inherited.uncorrelatedCompletions.certainty === "unknown"
+        ? inherited.uncorrelatedCompletions : index.incomplete ? unknownCounter() : exactCounter(index.uncorrelatedCompletions),
+    };
+    const ledger = { coverage: "complete", segments: capture.names.map((name) => {
+      const segment = capture.segments.get(name);
+      return { sessionHash: segment.session, path: `runs/${name}`, byteOffset: segment.bytes.length,
+        recordCount: segment.records.length, prefixHash: segment.prefixHash };
+    }) };
+    requireRecovery(operations, "operations");
+    requireRecovery(ledger, "ledger");
+    return { operations, ledger };
+  } catch (error) {
+    if (["JOURNAL_INTEGRITY", "RECOVERY_OPERATION_LIMIT", "RECOVERY_OPERATION_CONFLICT"].includes(trustedSupervisorFailure(error)?.code)) throw error;
+    return {
+      operations: { ...structuredClone(inherited), coverage: inherited.orphans.length ? "partial" : "unavailable" },
+      ledger: { coverage: previous?.ledger?.segments.length ? "partial" : "unavailable", segments: structuredClone(previous?.ledger?.segments ?? []) },
+    };
+  }
+}
+
+function detachWithFrontier(cwd, input, journalGuard, cause, stopState = null) {
+  let selected = requireFrontierOwner(cwd, input);
+  requireRecoveryBundle(cwd, 4, "finalization");
+  const source = readAttachmentSnapshot(cwd);
+  const evidence = observeRecoveryEvidence(cwd, journalGuard, selected.frontier);
+  const preparedAt = new Date().toISOString();
+  const routing = readSessionLocator(input, false);
+  const successor = { ...selected.frontier.owner, attachmentHash: null,
+    routeHash: routing.exists ? sha256(Buffer.from(`${JSON.stringify({ ...routing.locator, status: "released", updatedAt: preparedAt }, null, 2)}\n`)) : null };
+  selected = advanceFrontier(cwd, input, selected, { ...evidence, phase: "detach-prepared", cause, transitionId: randomUUID(), preparedAt, successor,
+    stopState: stopState ?? selected.frontier.stopState }, journalGuard);
+  persistFrontierCache(cwd, input, selected, journalGuard);
+  requireAttachmentSnapshot(cwd, source);
+  if (!detachSession(cwd, input, source, journalGuard, preparedAt)) throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "detach", [selected.frontierHash]);
+  selected = advanceFrontier(cwd, input, selected, { phase: "detached" }, journalGuard);
+  persistFrontierCache(cwd, input, selected, journalGuard);
+  return selected;
 }
 
 function pathNameEquals(left, right) {
@@ -901,7 +1141,11 @@ export function lifecycleFailureDetails(error) {
 }
 
 export function supervisorFailureFor(output) {
-  return supervisorFailures.get(output) ?? null;
+  return trustedSupervisorFailure(output) ?? supervisorFailures.get(output) ?? null;
+}
+
+function failedSupervisorOutput(output, failure) {
+  return associateSupervisorFailure({ ...output, supervisorFailure: failure }, failure);
 }
 
 function finalizeLifecycle(primaryResult, primaryError, releases) {
@@ -1494,12 +1738,19 @@ function withJournalRead(cwd, action) {
 }
 
 function lifecycleShapeMatches(shape, value, schema = lifecycleSchema) {
+  if (!shape || typeof shape !== "object") return false;
   if (shape.$ref === "https://github.com/seangalliher/supervised-worker/schemas/plan.schema.json") return validatePlan(value).length === 0;
   if (shape.$ref?.startsWith("lifecycle.schema.json#/$defs/")) {
     lifecycleSchema ??= parseWorkflowJson(readFileSync(new URL("../schemas/lifecycle.schema.json", import.meta.url)));
     return lifecycleShapeMatches(lifecycleSchema.$defs[shape.$ref.split("/$defs/")[1]], value, lifecycleSchema);
   }
-  if (shape.$ref) return lifecycleShapeMatches(schema.$defs[shape.$ref.slice("#/$defs/".length)], value, schema);
+  if (shape.$ref && !shape.$ref.startsWith("#/")) {
+    const [name, pointer] = shape.$ref.split("#");
+    const referenced = packagedSchema(name);
+    return referenced !== null && lifecycleShapeMatches(schemaPointer(referenced, pointer), value, referenced);
+  }
+  if (shape.$ref) return lifecycleShapeMatches(schemaPointer(schema, shape.$ref.slice(1)), value, schema);
+  if (shape.not && lifecycleShapeMatches(shape.not, value, schema)) return false;
   if (shape.anyOf && !shape.anyOf.some((branch) => lifecycleShapeMatches(branch, value, schema))) return false;
   if (shape.oneOf && shape.oneOf.filter((branch) => lifecycleShapeMatches(branch, value, schema)).length !== 1) return false;
   if (shape.allOf && !shape.allOf.every((branch) => lifecycleShapeMatches(branch, value, schema))) return false;
@@ -1524,7 +1775,11 @@ function lifecycleShapeMatches(shape, value, schema = lifecycleSchema) {
   if (Array.isArray(value)) {
     if (value.length < (shape.minItems ?? 0) || value.length > (shape.maxItems ?? Infinity)) return false;
     if (shape.uniqueItems && new Set(value.map((entry) => canonicalJson(entry))).size !== value.length) return false;
-    if (shape.items && !value.every((entry) => lifecycleShapeMatches(shape.items, entry, schema))) return false;
+    const prefix = shape.prefixItems ?? [];
+    if (prefix.some((entry, index) => index < value.length && !lifecycleShapeMatches(entry, value[index], schema))) return false;
+    const remaining = value.slice(prefix.length);
+    if (shape.items === false && remaining.length > 0) return false;
+    if (shape.items && !remaining.every((entry) => lifecycleShapeMatches(shape.items, entry, schema))) return false;
   }
   if (object) {
     if (shape.required?.some((key) => !Object.hasOwn(value, key))) return false;
@@ -1567,6 +1822,53 @@ export function validateTransition(value, definition = null) {
 let doctorSchema;
 let campaignReleaseSchema;
 
+const additionalSchemaNames = new Set([
+  "recovery.schema.json", "supervisor-failure.schema.json", "doctor-invocation.schema.json",
+  "artifact-publication.schema.json", "doctor.schema.json", "campaign-release.schema.json",
+  "checkpoint.schema.json", "transition.schema.json",
+]);
+const additionalSchemas = new Map();
+
+function schemaPointer(schema, pointer = "") {
+  if (pointer === "") return schema;
+  if (!/^\/(?:\$defs|definitions)\/[A-Za-z][A-Za-z0-9]*$/.test(pointer)) return null;
+  return pointer.slice(1).split("/").reduce((value, key) => value?.[key], schema);
+}
+
+function packagedSchema(name) {
+  if (!additionalSchemaNames.has(name)) return null;
+  if (!additionalSchemas.has(name)) additionalSchemas.set(name, parseWorkflowJson(readFileSync(new URL(`../schemas/${name}`, import.meta.url))));
+  return additionalSchemas.get(name);
+}
+
+function validatePackagedValue(name, value, definition, maximum) {
+  try {
+    const schema = packagedSchema(name);
+    const shape = definition === null ? schema : schema.$defs[definition];
+    if (!shape || Buffer.byteLength(JSON.stringify(value)) > maximum || !lifecycleShapeMatches(shape, value, schema)) throw new Error();
+    return [];
+  } catch {
+    return [`${name} value is invalid or exceeds its published bound`];
+  }
+}
+
+export function validateRecovery(value, definition = null) {
+  return validatePackagedValue("recovery.schema.json", value, definition,
+    ["inspectRequest", "proposeRequest", "applyRequest"].includes(definition) ? 8_192 : 262_144);
+}
+
+export function validateDoctorInvocation(value, definition = null) {
+  return validatePackagedValue("doctor-invocation.schema.json", value, definition, 65_536);
+}
+
+export function validateSupervisorFailure(value) {
+  return validatePackagedValue("supervisor-failure.schema.json", value, null, 8_192);
+}
+
+export function validateArtifactPublication(value, definition = null) {
+  return validatePackagedValue("artifact-publication.schema.json", value, definition, definition === "quarantineIntent" ? 262_144 : 65_536);
+}
+
 export function validateCampaignRelease(value, definition = null) {
   try {
     campaignReleaseSchema ??= parseWorkflowJson(readFileSync(new URL("../schemas/campaign-release.schema.json", import.meta.url)));
@@ -1594,6 +1896,79 @@ export function withWorkerEvidenceRead(cwd, input, authority, action) {
   const result = action({ root, observation, authorize });
   authorize();
   return result;
+}
+
+function publicationConflict() {
+  return Object.assign(new Error("canonical publication target or ancestor changed"), { publicationConflict: true });
+}
+
+function canonicalArtifactAncestors(root, directory) {
+  const relative = path.relative(root, directory);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) throw publicationConflict();
+  const values = [{ directory: root, boundary: recoveryBoundary(root, root) }];
+  let current = root;
+  for (const name of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, name);
+    values.push({ directory: current, boundary: recoveryBoundary(root, current) });
+  }
+  return values;
+}
+
+function requireArtifactAncestors(root, ancestors) {
+  for (const value of ancestors) {
+    if (recoveryValueHash(recoveryBoundary(root, value.directory)) !== recoveryValueHash(value.boundary)) throw publicationConflict();
+  }
+}
+
+export function withCampaignPublication(cwd, request, authority, action) {
+  requireVerifiedWorkerAuthority(authority, cwd, request);
+  if (typeof action !== "function") throw new Error("canonical publication action is invalid");
+  const input = recoverySessionInput(request);
+  sessionRequestAuthorities.set(input, authority);
+  return withSessionLifecycle(cwd, input, "publish", (root, session, _routing, requireGuards, journalGuard) => {
+    const capability = owningSessionCapability(root, session);
+    if (capability === null || attachmentFromSnapshot(capability.snapshot).workerAuthorityHash !== authority.grantHash) throw new Error("PUBLICATION_OWNING_WORKER_REQUIRED");
+    const selected = requireFrontierOwner(root, session);
+    const authorize = () => {
+      requireGuards();
+      requireOwningSessionCapability(capability, session);
+      requireAttachmentSnapshot(root, capability.snapshot);
+      if (requireFrontierOwner(root, session).frontierHash !== selected.frontierHash) throw publicationConflict();
+    };
+    authorize();
+    return action({
+      authorize,
+      publish(bytes, requireCandidate) {
+        if (!Buffer.isBuffer(bytes) || bytes.length > 4_194_304 || typeof requireCandidate !== "function" ||
+          validateCampaignRelease(parseWorkflowJson(bytes), "receipt").length) throw new Error("PUBLICATION_RECEIPT_INVALID");
+        authorize();
+        const hash = sha256(bytes);
+        const locator = `.supervised-worker/releases/${hash}.json`;
+        const target = path.join(root, ...locator.split("/"));
+        transitionMutation(journalGuard, () => ensureSafeDirectory(root, path.dirname(target)));
+        const ancestors = canonicalArtifactAncestors(root, path.dirname(target));
+        const previous = existsSync(target) ? readBoundedStateBytes(root, target, 4_194_304) : null;
+        if (previous !== null && !previous.bytes.equals(bytes)) throw publicationConflict();
+        const requireDestination = () => {
+          authorize();
+          requireArtifactAncestors(root, ancestors);
+          const current = existsSync(target) ? readBoundedStateBytes(root, target, 4_194_304) : null;
+          if (previous === null ? current !== null : current === null ||
+            !current.bytes.equals(previous.bytes) || !sameRunLedgerStats(current.stats, previous.stats)) throw publicationConflict();
+          requireCandidate();
+          requireArtifactAncestors(root, ancestors);
+        };
+        requireDestination();
+        if (previous === null) transitionWriteBytes(journalGuard, root, target, bytes, 4_194_304, true, requireDestination);
+        const confirmed = readBoundedStateBytes(root, target, 4_194_304, true);
+        requireArtifactAncestors(root, ancestors);
+        authorize();
+        if (!confirmed.bytes.equals(bytes) || sha256(confirmed.bytes) !== hash ||
+          (previous !== null && !sameRunLedgerStats(confirmed.stats, previous.stats))) throw publicationConflict();
+        return { status: previous === null ? "published" : "already-published", locator, sha256: hash };
+      },
+    });
+  });
 }
 
 export function validateDoctor(value, definition = null) {
@@ -1798,7 +2173,7 @@ function recoveryAttachment(root) {
   if (snapshot === null) return { state: "absent" };
   const raw = parseWorkflowJson(snapshot.bytes);
   const keys = raw?.schemaVersion === 1 ? ["schemaVersion", "sessionHash", "attachedAt"] :
-    raw?.schemaVersion === 2 ? [...ATTACHMENT_KEYS] : [...ATTACHMENT_V3_KEYS].filter((key) => key !== "workerAuthorityHash" || Object.hasOwn(raw, key));
+    raw?.schemaVersion === 2 ? [...ATTACHMENT_KEYS] : [...(raw?.schemaVersion === 4 ? ATTACHMENT_V4_KEYS : ATTACHMENT_V3_KEYS)].filter((key) => key !== "workerAuthorityHash" || Object.hasOwn(raw, key));
   if (!exactObject(raw, keys)) rejectRecoveryIdentity();
   const attachment = attachmentFromSnapshot(snapshot);
   return {
@@ -1880,6 +2255,14 @@ function recoveryDiagnostics(error, scope, operation, phase, attempts = 0) {
 }
 
 export function inspectLifecycleLock(cwd, request) {
+  return inspectLifecycleLockValue(cwd, request, false);
+}
+
+export function inspectLifecycleLockReadOnly(cwd, request) {
+  return inspectLifecycleLockValue(cwd, request, true);
+}
+
+function inspectLifecycleLockValue(cwd, request, readOnly) {
   const result = { schemaVersion: 1, kind: "lifecycle-inspection", status: "unconfirmed", expected: null, diagnostics: [] };
   let context = null;
   let phase = "request-validation";
@@ -1896,7 +2279,7 @@ export function inspectLifecycleLock(cwd, request) {
       return result;
     }
     return withLifecycleCleanup(() => {
-      if (context.scope === "journal") {
+      if (context.scope === "journal" && !readOnly) {
         phase = "guard-acquisition";
         windowsPathChecksMaySpawn = false;
         guards = acquireRepositoryLocks([context.root], releaseContext);
@@ -1921,6 +2304,885 @@ export function inspectLifecycleLock(cwd, request) {
     result.diagnostics = recoveryDiagnostics(error, context?.scope ?? null, "inspect", phase);
     return result;
   }
+}
+
+function recoverySessionInput(input) {
+  return { session_id: input.session_id, ...(input.transcript_path === undefined ? {} : { transcript_path: input.transcript_path }) };
+}
+
+function recoveryScopeObservations(cwd, input, ignoredLocks = []) {
+  let deferred = false;
+  return ["repository", ...(input.transcript_path === undefined ? [] : ["session"]), "journal"].map((scope) => {
+    const empty = { scope, status: deferred ? "deferred" : "absent", owner: null, snapshotHash: null, snapshot: null };
+    if (deferred) return empty;
+    const held = ignoredLocks.find((lock) => lock !== null && lock.scope === scope);
+    if (held) {
+      if (!lifecycleLockIdentityMatches(held) || !lifecycleLockOwnerIdentityMatches(held)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+      return empty;
+    }
+    const selector = { scope, ...(input.transcript_path === undefined ? {} : recoverySessionInput(input)) };
+    const result = inspectLifecycleLockReadOnly(cwd, selector);
+    if (result.status === "absent") return empty;
+    deferred = true;
+    const owner = result.diagnostics[0]?.code === "LIFECYCLE_OWNER_DEAD" ? "dead"
+      : result.diagnostics[0]?.code === "LIFECYCLE_OWNER_LIVE" ? "live" : "unknown";
+    return { scope, status: result.status === "inspected" ? "inspected" : "unconfirmed", owner,
+      snapshotHash: result.expected === null ? null : recoveryValueHash(result.expected), snapshot: result.expected };
+  });
+}
+
+function captureRecoveryState(cwd, input, authority, ignoredLocks = [], ignoredActionTemporary = null) {
+  requireVerifiedWorkerAuthority(authority, cwd, input);
+  const root = realpathSync(cwd);
+  if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd) || !pathEquals(path.resolve(cwd), root)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "observation");
+  const context = sessionLocatorContext(input);
+  if (input.transcript_path !== undefined && context === null) throw new SupervisorError("RECOVERY_AUTHORIZATION_REQUIRED", "observation");
+  const files = [];
+  const capturedEntries = new Map();
+  const values = new Map();
+  const checks = [];
+  const diagnostics = new Set();
+  let status = "complete";
+  let totalBytes = 0;
+  const roots = { repository: root, session: context?.storageRoot };
+  const add = (area, relative, maximum, directory = false, filter = null) => {
+    const key = `${area}:${relative}`;
+    if (capturedEntries.has(key)) return capturedEntries.get(key);
+    if (files.length >= 1400) throw new SupervisorError("JOURNAL_CAPACITY", "observation");
+    const base = roots[area];
+    const target = path.join(base, ...relative.split("/"));
+    const entry = { area, path: relative, kind: "absent", sha256: null, identity: null };
+    try {
+      assertSafeStatePath(base, target);
+      if (!existsSync(target)) {
+        checks.push(() => !existsSync(target));
+      } else if (directory) {
+        const boundary = recoveryBoundary(base, target);
+        const names = readdirSync(target).sort().filter(filter ?? (() => true));
+        if (names.length > maximum) throw new Error("bounded directory inventory exceeded");
+        entry.kind = "directory";
+        entry.identity = { dev: boundary.identity.dev, ino: boundary.identity.ino };
+        entry.sha256 = recoveryValueHash(names);
+        checks.push(() => recoveryValueHash(readdirSync(target).sort().filter(filter ?? (() => true))) === entry.sha256 &&
+          recoveryValueHash(recoveryBoundary(base, target)) === recoveryValueHash(boundary));
+        values.set(`${area}:${relative}`, names);
+      } else {
+        const snapshot = readBoundedStateBytes(base, target, maximum);
+        totalBytes += snapshot.bytes.length;
+        if (totalBytes > 33_554_432) throw new Error("bounded recovery observation exceeded");
+        entry.kind = "file";
+        entry.identity = Object.fromEntries(["dev", "ino", "size", "mtimeNs", "ctimeNs", "nlink"].map((key) => [key, String(snapshot.stats[key])]));
+        entry.sha256 = sha256(snapshot.bytes);
+        values.set(`${area}:${relative}`, snapshot.bytes);
+        checks.push(() => sameRunLedgerStats(snapshot.stats, lstatSync(target, { bigint: true })));
+      }
+    } catch {
+      entry.kind = "unavailable";
+      status = "incomplete";
+    }
+    files.push(entry);
+    capturedEntries.set(key, entry);
+    return entry;
+  };
+  // Unused authorizations and guard directories do not change a proposal's CAS
+  // observation. Referenced action evidence is captured separately below.
+  add("repository", ".supervised-worker", 64, true, (name) => !["locks", "recovery", "lifecycle-evidence", "rescue-capabilities"].includes(name));
+  add("repository", ".github/supervised-worker.json", 65_536);
+  add("repository", ".supervised-worker/workflow-acceptance.json", 65_536);
+  const planFile = add("repository", ".supervised-worker/plan.json", MAX_PLAN_BYTES);
+  const attachmentFile = add("repository", ".supervised-worker/attachment.json", MAX_SESSION_LOCATOR_BYTES);
+  add("repository", ".supervised-worker/recovery/head.json", 262_144);
+  for (const [relative, maximum, bound] of [
+    [".supervised-worker/runs", 257, 4_194_304],
+    [".supervised-worker/runtime", 1024, 262_144],
+    [".supervised-worker/checkpoints", 1024, 262_144],
+    [".supervised-worker/recovery/frontiers", 1024, 262_144],
+  ]) {
+    add("repository", relative, maximum, true);
+    for (const name of values.get(`repository:${relative}`) ?? []) {
+      if (relative.endsWith("/runtime") && !/^[0-9a-f]{64}\.json$/.test(name)) continue;
+      add("repository", `${relative}/${name}`, bound);
+    }
+  }
+  const pendingConfirmations = [];
+  const quarantineRoot = ".supervised-worker/recovery/quarantine";
+  const quarantineMembers = new Map();
+  add("repository", quarantineRoot, 1024, true);
+  for (const id of values.get(`repository:${quarantineRoot}`) ?? []) {
+    if (!uuid(id)) { status = "incomplete"; diagnostics.add("RECOVERY_PERSISTENCE_UNCONFIRMED"); continue; }
+    const prefix = `${quarantineRoot}/${id}`;
+    add("repository", prefix, 1024, true);
+    const members = values.get(`repository:${prefix}`) ?? [];
+    quarantineMembers.set(id, members);
+    for (const name of members) add("repository", `${prefix}/${name}`, 4_194_304);
+  }
+  const actionRoot = ".supervised-worker/recovery/actions";
+  const actionPath = path.join(root, ...actionRoot.split("/"));
+  if (ignoredActionTemporary !== null) {
+    const relative = path.relative(actionPath, ignoredActionTemporary).split(path.sep).join("/");
+    const match = /^([0-9a-f-]{36})\/(?:intent|confirmation)\.json\.([1-9][0-9]*)\.([0-9a-f-]{36})\.tmp$/.exec(relative);
+    if (!match || !uuid(match[1]) || !uuid(match[3]) || match[2] !== String(process.pid)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "observation");
+  }
+  const actionMembers = (directory) => {
+    assertSafeStatePath(root, directory);
+    if (!existsSync(directory)) {
+      checks.push(() => !existsSync(directory));
+      return [];
+    }
+    const boundary = recoveryBoundary(root, directory);
+    const names = readdirSync(directory).sort().filter(name => path.join(directory, name) !== ignoredActionTemporary);
+    if (names.length > 1024) throw new SupervisorError("JOURNAL_CAPACITY", "observation");
+    checks.push(() => recoveryValueHash(recoveryBoundary(root, directory)) === recoveryValueHash(boundary) &&
+      recoveryValueHash(readdirSync(directory).sort().filter(name => path.join(directory, name) !== ignoredActionTemporary)) === recoveryValueHash(names));
+    return names;
+  };
+  // Only durable action members enter the proposal hash. A writer's exclusively
+  // held, verified temporary file is not a published action or a new authority.
+  let actionIds = [];
+  try { actionIds = actionMembers(actionPath); } catch { status = "incomplete"; diagnostics.add("RECOVERY_PERSISTENCE_UNCONFIRMED"); }
+  for (const actionId of actionIds) {
+    if (!uuid(actionId)) { status = "incomplete"; diagnostics.add("RECOVERY_PERSISTENCE_UNCONFIRMED"); continue; }
+    const prefix = `${actionRoot}/${actionId}`;
+    let members;
+    try { members = actionMembers(path.join(root, ...prefix.split("/"))); } catch { status = "incomplete"; diagnostics.add("RECOVERY_PERSISTENCE_UNCONFIRMED"); continue; }
+    if (members.length === 0) continue;
+    add("repository", prefix, 4, true, name => path.join(root, ...prefix.split("/"), name) !== ignoredActionTemporary);
+    for (const name of ["intent.json", "outcome.json", "quarantine.json", "confirmation.json"]) {
+      add("repository", `${prefix}/${name}`, 262_144);
+    }
+    try {
+      const names = values.get(`repository:${prefix}`) ?? [];
+      if (names.some(name => !["intent.json", "outcome.json", "quarantine.json", "confirmation.json"].includes(name))) {
+        throw new Error("unrecognized recovery action member");
+      }
+      const intentBytes = values.get(`repository:${prefix}/intent.json`);
+      const intent = requireRecovery(parseWorkflowJson(intentBytes), "actionIntent");
+      if (intent.actionId !== actionId || !serializeRecovery(intent, "actionIntent").equals(intentBytes)) throw new Error("invalid action intent");
+      add("repository", `.supervised-worker/recovery/authorizations/${intent.authorizationHash}.json`, 262_144);
+      let outcome = null;
+      const outcomeBytes = values.get(`repository:${prefix}/outcome.json`);
+      if (outcomeBytes) {
+        outcome = requireRecovery(parseWorkflowJson(outcomeBytes), "actionReceipt");
+        if (!serializeRecovery(outcome, "actionReceipt").equals(outcomeBytes) || outcome.actionId !== actionId ||
+          outcome.authorizationHash !== intent.authorizationHash || outcome.proposalHash !== intent.proposalHash) throw new Error("invalid action outcome");
+      }
+      const metadataBytes = values.get(`repository:${prefix}/quarantine.json`);
+      if (metadataBytes) {
+        const metadata = parseWorkflowJson(metadataBytes);
+        if (!serializeQuarantineMetadata(metadata).equals(metadataBytes)) throw new Error("invalid quarantine metadata");
+        if ((quarantineMembers.get(actionId) ?? []).some(name => name !== `${metadata.source.sha256}.quarantined`)) {
+          throw new Error("unrecognized quarantine payload member");
+        }
+        const payload = add("repository", metadata.locator, 4_194_304);
+        if (outcome?.status === "applied") {
+          readQuarantineBundle(root, actionId, sha256(intentBytes));
+          if (payload.kind !== "file" || payload.sha256 !== metadata.source.sha256 ||
+            ["dev", "ino", "size"].some(key => payload.identity[key] !== metadata.source.identity[key]) ||
+            outcome.locator !== metadata.locator || outcome.sha256 !== metadata.source.sha256 ||
+            outcome.beforeHash !== intent.expectedHash || outcome.frontierHash !== null) throw new Error("invalid applied quarantine evidence");
+        }
+      } else if (outcome?.status === "applied" && intent.action.kind === "quarantine-journal-entry") {
+        throw new Error("applied quarantine metadata is absent");
+      } else if ((quarantineMembers.get(actionId) ?? []).length > 0) {
+        throw new Error("quarantine payload has no metadata");
+      }
+      const confirmationBytes = values.get(`repository:${prefix}/confirmation.json`);
+      if (confirmationBytes) {
+        const confirmation = requireRecovery(parseWorkflowJson(confirmationBytes), "actionConfirmation");
+        add("repository", `.supervised-worker/recovery/authorizations/${confirmation.authorizationHash}.json`, 262_144);
+        readQuarantineConfirmation(root, actionId);
+        proveCompletedQuarantine(root, actionId, confirmation.targetIntentHash, () => {});
+      } else if (outcome?.status !== "applied") {
+        diagnostics.add("RECOVERY_PERSISTENCE_UNCONFIRMED");
+        if (intent.action.kind === "quarantine-journal-entry") {
+          try {
+            proveCompletedQuarantine(root, actionId, sha256(intentBytes), () => {});
+            pendingConfirmations.push({ kind: "confirm-completed-action", targetActionId: actionId, targetIntentHash: sha256(intentBytes) });
+          } catch { /* Incomplete effects remain visible, but cannot be confirmed or replayed. */ }
+        }
+      }
+    } catch {
+      status = "incomplete";
+      diagnostics.add("RECOVERY_PERSISTENCE_UNCONFIRMED");
+    }
+  }
+  for (const id of quarantineMembers.keys()) {
+    if (!values.has(`repository:${actionRoot}/${id}/intent.json`)) {
+      status = "incomplete";
+      diagnostics.add("RECOVERY_PERSISTENCE_UNCONFIRMED");
+    }
+  }
+  let routeFile = null;
+  let markerFile = null;
+  if (context !== null) {
+    const relative = (value) => path.relative(context.storageRoot, value).split(path.sep).join("/");
+    add("session", "workspace.json", 16_384);
+    add("session", relative(input.transcript_path), 4_194_304);
+    routeFile = add("session", relative(context.filePath), MAX_SESSION_LOCATOR_BYTES);
+    markerFile = add("session", relative(context.markerPath), MAX_SESSION_LOCATOR_BYTES);
+  }
+  let selected = null;
+  try { selected = readRecoveryFrontier(root); } catch { diagnostics.add("RECOVERY_LINEAGE_AMBIGUOUS"); }
+  if (selected?.frontier.owner?.routeGeneration !== null && selected?.frontier.owner &&
+    selected.frontier.owner.sessionHash !== sessionHash(input) && context !== null) {
+    const source = selected.frontier.owner;
+    if (source.sessionRootHash !== recoverySessionRootHash(input)) {
+      diagnostics.add("RECOVERY_LINEAGE_AMBIGUOUS");
+    } else {
+      add("session", `supervised-worker/session-roots/${source.sessionHash}/route.json`, MAX_SESSION_LOCATOR_BYTES);
+      add("session", `supervised-worker/session-bindings/${source.sessionHash}.json`, MAX_SESSION_LOCATOR_BYTES);
+    }
+  }
+  if (selected === null) diagnostics.add("RECOVERY_FRONTIER_MISSING");
+  let plan = null;
+  try {
+    plan = parseWorkflowJson(values.get("repository:.supervised-worker/plan.json"));
+    if (validatePlan(plan).length) plan = null;
+  } catch { plan = null; }
+  const planHash = plan === null ? null : canonicalPlanHash(plan);
+  const readOnlyGuard = () => {
+    if (checks.some((check) => !check())) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "observation");
+  };
+  let journals = [];
+  let checkpoints = [];
+  let operations = { coverage: "unavailable", orphans: [], uncorrelatedCompletions: unknownCounter() };
+  let ledger = { coverage: "unavailable", segments: [] };
+  let lineage = null;
+  try {
+    const inventory = readJournalInventory(root, readOnlyGuard);
+    journals = [...inventory.sessions.keys()].sort().map((session) => {
+      const snapshot = readSessionLedger(root, session, readOnlyGuard);
+      return { sessionHash: session, records: snapshot.records, sha256: sha256(snapshot.bytes), segments: snapshot.segments };
+    });
+    const observation = inspectOperations(journals.flatMap((journal) => journal.records));
+    operations = { coverage: "complete", orphans: observation.orphans, uncorrelatedCompletions: exactCounter(observation.uncorrelatedCompletions) };
+    ledger = { coverage: "complete", segments: journals.flatMap((journal) => journal.segments.map((segment) => ({
+      sessionHash: journal.sessionHash, path: `runs/${segment.name}`, byteOffset: segment.bytes.length,
+      recordCount: parseRunLedgerBytes(segment.bytes, journal.sessionHash).length, prefixHash: sha256(segment.bytes),
+    }))) };
+    for (const name of values.get("repository:.supervised-worker/checkpoints") ?? []) {
+      if (!/^[0-9a-f]{64}\.json$/.test(name)) throw new Error("unknown checkpoint entry");
+      const receipt = readCheckpointReceipt(root, name.slice(0, 64));
+      requireCheckpointLedger(root, receipt, name.slice(0, 64), readOnlyGuard, false);
+      checkpoints.push({ sha256: name.slice(0, 64), value: receipt });
+    }
+    const newRuntime = [...values.entries()].some(([key, bytes]) => {
+      if (!key.startsWith("repository:.supervised-worker/runtime/") || !Buffer.isBuffer(bytes)) return false;
+      try { return parseWorkflowJson(bytes).schemaVersion === 3; } catch { return false; }
+    });
+    if (selected === null && planHash !== null && !newRuntime && !checkpoints.some(({ value }) => value.schemaVersion === 3)) {
+      lineage = resolveLegacyLineage({ journals, checkpoints, planHash, operations, ledger });
+      diagnostics.add(lineage.status === "unique" ? "RECOVERY_COUNTERS_UNCERTAIN" : "RECOVERY_LINEAGE_AMBIGUOUS");
+    }
+  } catch (error) {
+    diagnostics.add(error?.runLedgerReason === "run-ledger-limit-exceeded" ? "JOURNAL_CAPACITY" : "JOURNAL_INTEGRITY");
+  }
+  if (selected?.frontier.stopState.totalBlocks.certainty === "unknown") diagnostics.add("RECOVERY_COUNTERS_UNCERTAIN");
+  const scopes = recoveryScopeObservations(root, input, ignoredLocks);
+  const capacity = { journal: null, recovery: null };
+  try {
+    capacity.journal = journalCapacity(root, readOnlyGuard);
+    if (!capacity.journal.allowed) diagnostics.add("JOURNAL_CAPACITY");
+  } catch (error) {
+    const failure = trustedSupervisorFailure(error);
+    if (failure !== null) {
+      status = "incomplete";
+      diagnostics.add(failure.code);
+    }
+    // Raw inventory failures are already represented above and may still offer
+    // a separately authorized quarantine, not an advance over invalid prefixes.
+  }
+  try {
+    capacity.recovery = assessRecoveryCapacity(recoveryStoreUsage(root), []);
+    if (!capacity.recovery.allowed) diagnostics.add("JOURNAL_CAPACITY");
+  } catch { diagnostics.add("RECOVERY_PERSISTENCE_UNCONFIRMED"); }
+  try { readOnlyGuard(); } catch { status = "racy"; }
+  requireVerifiedWorkerAuthority(authority, root, input);
+  const observation = requireRecovery({
+    schemaVersion: 1, kind: "recovery-observation", status, repositoryHash: sha256(canonicalJson(recoveryBoundary(root, root))),
+    sourceHash: authority.sourceHash, workflowHash: resolveWorkflowRoles(root, { requireAcceptance: true }).workflowHash,
+    sessionHash: sessionHash(input), files, scopes, frontierHash: selected?.frontierHash ?? null,
+    planHash, planBytesHash: planFile.sha256, attachmentHash: attachmentFile.sha256,
+    routeHash: routeFile?.sha256 ?? null, markerHash: markerFile?.sha256 ?? null, diagnostics: [...diagnostics],
+  }, "observation");
+  const candidates = [];
+  const nextScope = scopes.find((entry) => entry.status !== "absent");
+  if (status === "complete" && !nextScope) candidates.push(...pendingConfirmations);
+  if (status === "complete" && nextScope?.owner === "dead") candidates.push({ kind: "recover-lock", scope: nextScope.scope, snapshotHash: nextScope.snapshotHash });
+  if (status === "complete" && attachmentFile.kind === "absent" && lineage?.status === "unique" && !nextScope) {
+    candidates.push({ kind: "legacy-reconcile", resolution: { kind: "preserve-uncertainty" } });
+    if (lineage.provenState) candidates.push({ kind: "legacy-reconcile", resolution: { kind: "use-proven-state", evidenceHash: lineage.evidenceHash } });
+  }
+  if (status === "complete" && !diagnostics.has("JOURNAL_INTEGRITY") && selected?.frontier.phase === "detach-prepared" && !nextScope &&
+    (selected.frontier.owner.routeGeneration === null || selected.frontier.owner.sessionRootHash === recoverySessionRootHash(input))) {
+    candidates.push({ kind: "finish-release", frontierHash: selected.frontierHash });
+  }
+  for (const entry of files.filter((entry) => entry.area === "repository" && entry.path.startsWith(".supervised-worker/runs/"))) {
+    const basename = path.posix.basename(entry.path);
+    if (status === "complete" && !nextScope && entry.kind === "file" && !RUN_LEDGER_FILE_PATTERN.test(basename) &&
+      !/\.tmp$|\.jsonl\./i.test(basename) && Number(entry.identity.size) <= 4_194_304) {
+      candidates.push({ kind: "quarantine-journal-entry", entryHash: recoveryValueHash(entry) });
+    }
+  }
+  return { status: "observed", healthy: status === "complete" && diagnostics.size === 0 && !nextScope,
+    observation, observationHash: recoveryValueHash(observation), candidates, frontier: selected?.frontier ?? null, lineage, capacity };
+}
+
+export function inspectRecoveryState(cwd, request, authority) {
+  requireRecovery(request, "inspectRequest");
+  return captureRecoveryState(cwd, request, authority);
+}
+
+export function readOperatorRecoveryProposal(filePath) {
+  if (typeof filePath !== "string" || !isFullyQualifiedRepositoryCwd(filePath) ||
+    !pathEquals(path.dirname(path.resolve(filePath)), realpathSync(path.dirname(filePath)))) throw new SupervisorError("RECOVERY_AUTHORIZATION_REQUIRED", "recovery");
+  const snapshot = readBoundedStateBytes(path.dirname(filePath), filePath, 262_144);
+  return { proposal: requireRecovery(parseWorkflowJson(snapshot.bytes), "proposal"),
+    sha256: sha256(snapshot.bytes), identity: recoveryIdentity(snapshot.stats) };
+}
+
+function requireProposalSnapshot(cwd, input, proposal, authority, heldLocks, ignoredActionTemporary = null) {
+  const inspection = captureRecoveryState(cwd, input, authority, heldLocks, ignoredActionTemporary);
+  if (inspection.observation.status !== "complete" || inspection.observationHash !== proposal.expectedHash ||
+    recoveryValueHash(proposal.expected) !== proposal.expectedHash ||
+    !inspection.candidates.some((action) => recoveryValueHash(action) === recoveryValueHash(proposal.action))) {
+    throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+  }
+  return inspection;
+}
+
+export function publishRecoveryAuthorization(cwd, request, value, authority) {
+  requireOperatorAuthorizationPublication(value);
+  verifyRecoveryAuthorization(value, cwd, request, authority);
+  const input = recoverySessionInput(request);
+  if (value.proposal.action.kind === "recover-lock") {
+    return withSelectedRecoveryBoundary(cwd, input, value.proposal, authority, false, (root, guard, heldLocks) => {
+      const requireExact = () => {
+        requireOperatorAuthorizationPublication(value);
+        verifyRecoveryAuthorization(value, root, input, authority);
+        requireProposalSnapshot(root, input, value.proposal, authority, heldLocks());
+      };
+      requireExact();
+      requireRecoveryBundle(root, 1, "finalization");
+      const bytes = serializeRecovery(value, "authorization");
+      const authorizationHash = sha256(bytes);
+      transitionWriteBytes(guard, root, path.join(stateDirectory(root), "recovery", "authorizations", `${authorizationHash}.json`), bytes, 262_144, true, requireExact);
+      return { status: "authorized", authorizationHash, proposalHash: value.proposalHash, actionId: value.proposal.actionId, expiresAt: value.expiresAt };
+    });
+  }
+  sessionRequestAuthorities.set(input, authority);
+  return withSessionLifecycle(cwd, input, "recover", (root, session, _routing, _guards, journalGuard, _preserve, heldLocks) => {
+    const requireExact = () => {
+      requireOperatorAuthorizationPublication(value);
+      verifyRecoveryAuthorization(value, root, input, authority);
+      requireProposalSnapshot(root, input, value.proposal, authority, heldLocks());
+    };
+    requireExact();
+    requireRecoveryBundle(root, 1, value.proposal.action.kind === "legacy-reconcile" ? "ordinary" : "finalization");
+    const bytes = serializeRecovery(value, "authorization");
+    const authorizationHash = sha256(bytes);
+    const target = path.join(stateDirectory(root), "recovery", "authorizations", `${authorizationHash}.json`);
+    transitionWriteBytes(journalGuard, root, target, bytes, 262_144, true, requireExact);
+    return { status: "authorized", authorizationHash, proposalHash: value.proposalHash, actionId: value.proposal.actionId, expiresAt: value.expiresAt };
+  });
+}
+
+function readRecoveryAuthorization(cwd, hash) {
+  requireRecovery(hash, "hash");
+  const snapshot = readBoundedStateBytes(cwd, path.join(stateDirectory(cwd), "recovery", "authorizations", `${hash}.json`), 262_144);
+  const value = requireRecovery(parseWorkflowJson(snapshot.bytes), "authorization");
+  if (sha256(snapshot.bytes) !== hash || !serializeRecovery(value, "authorization").equals(snapshot.bytes)) throw new SupervisorError("RECOVERY_AUTHORIZATION_REQUIRED", "recovery");
+  return { value, identity: recoveryIdentity(snapshot.stats) };
+}
+
+function requireStoredRecoveryAuthorization(cwd, input, hash, expected, authority) {
+  const current = readRecoveryAuthorization(cwd, hash);
+  if (recoveryValueHash(current) !== recoveryValueHash(expected)) throw new SupervisorError("RECOVERY_AUTHORIZATION_REQUIRED", "recovery");
+  verifyRecoveryAuthorization(current.value, cwd, input, authority);
+  const observation = readCampaignTransition(cwd, input);
+  if (current.value.proposal.expected.repositoryHash !== observation.repositoryHash ||
+    current.value.proposal.expected.workflowHash !== resolveWorkflowRoles(cwd, { requireAcceptance: true }).workflowHash) {
+    throw new SupervisorError("RECOVERY_AUTHORIZATION_REQUIRED", "recovery");
+  }
+}
+
+function recoveryActionFile(cwd, actionId, name) {
+  requireRecovery(actionId, "id");
+  if (!["intent.json", "outcome.json", "quarantine.json", "confirmation.json"].includes(name)) throw new Error("invalid recovery action artifact");
+  return path.join(stateDirectory(cwd), "recovery", "actions", actionId, name);
+}
+
+function readRecoveryActionReceipt(cwd, proposal, authorizationHash) {
+  const target = recoveryActionFile(cwd, proposal.actionId, "outcome.json");
+  assertSafeStatePath(cwd, target);
+  if (!existsSync(target)) return null;
+  const bytes = readBoundedStateBytes(cwd, target, 262_144).bytes;
+  const receipt = requireRecovery(parseWorkflowJson(bytes), "actionReceipt");
+  if (!serializeRecovery(receipt, "actionReceipt").equals(bytes) || receipt.authorizationHash !== authorizationHash ||
+    receipt.proposalHash !== recoveryValueHash(proposal) || receipt.actionId !== proposal.actionId) throw new SupervisorError("RECOVERY_AUTHORIZATION_REQUIRED", "recovery");
+  return receipt;
+}
+
+function publishRecoveryActionReceipt(cwd, input, authority, proposal, authorizationHash, journalGuard, heldLocks, details) {
+  const after = captureRecoveryState(cwd, input, authority, heldLocks);
+  const receipt = requireRecovery({
+    schemaVersion: 1, kind: "recovery-action", actionId: proposal.actionId, authorizationHash,
+    proposalHash: recoveryValueHash(proposal), status: "applied", beforeHash: proposal.expectedHash,
+    afterHash: after.observationHash, frontierHash: null, locator: null, sha256: null, ...details,
+  }, "actionReceipt");
+  transitionWriteBytes(journalGuard, cwd, recoveryActionFile(cwd, proposal.actionId, "outcome.json"), serializeRecovery(receipt, "actionReceipt"), 262_144, true);
+  return receipt;
+}
+
+function finishPreparedRelease(cwd, input, proposal, authorizationHash, journalGuard) {
+  let selected = readRecoveryFrontier(cwd);
+  if (selected?.frontierHash !== proposal.action.frontierHash || selected.frontier.phase !== "detach-prepared" ||
+    !selected.frontier.preparedAt || selected.frontier.owner === null || selected.frontier.successor === null) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "detach");
+  requireRecordedRecoveryPrefixes(requireJournalCapture(cwd, journalGuard), selected.frontier.ledger);
+  const source = selected.frontier.owner;
+  const intended = selected.frontier.successor;
+  const attachment = readAttachmentSnapshot(cwd);
+  if (attachment !== null && attachment.hash !== source.attachmentHash) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "detach");
+  if (source.routeGeneration !== null) {
+    if (recoverySessionRootHash(input) !== source.sessionRootHash) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "detach");
+    const context = sessionLocatorContext(input);
+    const routePath = path.join(context.storageRoot, "supervised-worker", "session-roots", source.sessionHash, "route.json");
+    const markerPath = path.join(context.storageRoot, "supervised-worker", "session-bindings", `${source.sessionHash}.json`);
+    const route = readBoundedStateBytes(context.storageRoot, routePath, MAX_SESSION_LOCATOR_BYTES);
+    if (sha256(readBoundedStateBytes(context.storageRoot, markerPath, MAX_SESSION_LOCATOR_BYTES).bytes) !== source.markerHash) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "detach");
+    const routeHash = sha256(route.bytes);
+    if (![source.routeHash, intended.routeHash].includes(routeHash) || (attachment === null && routeHash !== intended.routeHash)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "detach");
+    if (routeHash !== intended.routeHash) {
+      const value = parseWorkflowJson(route.bytes);
+      const bytes = Buffer.from(`${JSON.stringify({ ...value, status: "released", updatedAt: selected.frontier.preparedAt }, null, 2)}\n`);
+      if (sha256(bytes) !== intended.routeHash) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "detach");
+      transitionWriteBytes(journalGuard, context.storageRoot, routePath, bytes, MAX_SESSION_LOCATOR_BYTES, false, () => {
+        const current = readBoundedStateBytes(context.storageRoot, routePath, MAX_SESSION_LOCATOR_BYTES);
+        if (!current.bytes.equals(route.bytes) || !sameRunLedgerStats(current.stats, route.stats)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "detach");
+      });
+    }
+  }
+  if (attachment !== null) removeAttachmentSnapshot(cwd, attachment, journalGuard);
+  selected = advanceFrontier(cwd, input, selected, { phase: "detached", authorizationHash }, journalGuard);
+  if (source.sessionHash === sessionHash(input)) persistFrontierCache(cwd, input, selected, journalGuard);
+  if (readAttachmentSnapshot(cwd) !== null) throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "detach");
+  return selected;
+}
+
+function quarantineEntry(proposal) {
+  const source = proposal.expected.files.find((entry) => recoveryValueHash(entry) === proposal.action.entryHash);
+  if (proposal.action.kind !== "quarantine-journal-entry" || source?.area !== "repository" || source.kind !== "file" ||
+    !source.path.startsWith(".supervised-worker/runs/") || path.posix.dirname(source.path) !== ".supervised-worker/runs" ||
+    RUN_LEDGER_FILE_PATTERN.test(path.posix.basename(source.path)) || /\.tmp$|\.jsonl\./i.test(source.path) ||
+    source.identity?.nlink !== "1" || Number(source.identity.size) > 4_194_304) throw new SupervisorError("JOURNAL_INTEGRITY", "recovery");
+  return source;
+}
+
+function requireQuarantineInventory(cwd, metadata, moved) {
+  const sourceDirectory = path.join(stateDirectory(cwd), "runs");
+  if (recoveryValueHash(recoveryBoundary(cwd, sourceDirectory)) !== recoveryValueHash(metadata.sourceParent)) throw new SupervisorError("JOURNAL_INTEGRITY", "recovery");
+  const entries = metadata.entries.filter((entry) => !moved || entry.path !== metadata.source.path);
+  if (recoveryValueHash(readdirSync(sourceDirectory).sort()) !== recoveryValueHash(entries.map((entry) => path.posix.basename(entry.path)).sort())) throw new SupervisorError("JOURNAL_INTEGRITY", "recovery");
+  for (const entry of entries) {
+    const snapshot = readBoundedStateBytes(cwd, path.join(cwd, ...entry.path.split("/")), 4_194_304);
+    const identity = Object.fromEntries(["dev", "ino", "size", "mtimeNs", "ctimeNs", "nlink"].map((key) => [key, String(snapshot.stats[key])]));
+    if (sha256(snapshot.bytes) !== entry.sha256 || recoveryValueHash(identity) !== recoveryValueHash(entry.identity)) throw new SupervisorError("JOURNAL_INTEGRITY", "recovery");
+  }
+  requireArtifactAncestors(cwd, metadata.ancestors.map((entry) => ({ directory: path.join(cwd, ...entry.path.split("/")), boundary: entry.boundary })));
+}
+
+function applyQuarantineEntry(cwd, proposal, authorizationHash, journalGuard, requireGrant, retry = false) {
+  const source = quarantineEntry(proposal);
+  const locator = `.supervised-worker/recovery/quarantine/${proposal.actionId}/${source.sha256}.quarantined`;
+  const destination = path.join(cwd, ...locator.split("/"));
+  const sourcePath = path.join(cwd, ...source.path.split("/"));
+  const metadataPath = recoveryActionFile(cwd, proposal.actionId, "quarantine.json");
+  let metadata;
+  if (retry) {
+    if (!existsSync(metadataPath)) throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+    metadata = parseWorkflowJson(readBoundedStateBytes(cwd, metadataPath, 262_144).bytes);
+    if (validateArtifactPublication(metadata, "quarantineIntent").length || metadata.actionId !== proposal.actionId ||
+      metadata.authorizationHash !== authorizationHash || metadata.entryHash !== proposal.action.entryHash ||
+      metadata.locator !== locator || recoveryValueHash(metadata.source) !== recoveryValueHash(source)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+  } else {
+    assertSafeStatePath(cwd, destination);
+    if (existsSync(path.dirname(destination))) throw publicationConflict();
+    transitionMutation(journalGuard, () => ensureSafeDirectory(cwd, path.dirname(destination)));
+    const ancestors = canonicalArtifactAncestors(cwd, path.dirname(destination));
+    const parent = recoveryBoundary(cwd, path.join(stateDirectory(cwd), "runs"));
+    if (parent.identity.dev !== ancestors.at(-1).boundary.identity.dev) throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+    metadata = { schemaVersion: 1, kind: "journal-entry-quarantine", actionId: proposal.actionId, authorizationHash,
+      entryHash: proposal.action.entryHash, source, sourceParent: parent,
+      entries: proposal.expected.files.filter((entry) => entry.area === "repository" && path.posix.dirname(entry.path) === ".supervised-worker/runs"),
+      locator, ancestors: ancestors.map((entry) => ({ path: path.relative(cwd, entry.directory).split(path.sep).join("/") || ".", boundary: entry.boundary })) };
+    if (validateArtifactPublication(metadata, "quarantineIntent").length) throw new SupervisorError("JOURNAL_INTEGRITY", "recovery");
+    requireQuarantineInventory(cwd, metadata, false);
+    const bytes = serializeQuarantineMetadata(metadata);
+    transitionWriteBytes(journalGuard, cwd, metadataPath, bytes, 262_144, true, requireGrant);
+    transitionMutation(journalGuard, (requireCurrent) => {
+      requireGrant();
+      requireCurrent();
+      requireQuarantineInventory(cwd, metadata, false);
+      assertSafeStatePath(cwd, destination);
+      if (existsSync(destination)) throw publicationConflict();
+      renameSync(sourcePath, destination);
+    });
+  }
+  requireGrant();
+  assertSafeStatePath(cwd, sourcePath);
+  if (existsSync(sourcePath) || !existsSync(destination)) throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+  const completed = readBoundedStateBytes(cwd, destination, 4_194_304, true);
+  if (sha256(completed.bytes) !== source.sha256 || String(completed.stats.dev) !== source.identity.dev ||
+    String(completed.stats.ino) !== source.identity.ino || String(completed.stats.size) !== source.identity.size) throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+  requireQuarantineInventory(cwd, metadata, true);
+  return { locator, sha256: source.sha256 };
+}
+
+function readQuarantineBundle(cwd, targetActionId, targetIntentHash = null) {
+  const intentBytes = readBoundedStateBytes(cwd, recoveryActionFile(cwd, targetActionId, "intent.json"), 262_144).bytes;
+  const intent = requireRecovery(parseWorkflowJson(intentBytes), "actionIntent");
+  if (!serializeRecovery(intent, "actionIntent").equals(intentBytes) || intent.actionId !== targetActionId ||
+    intent.action.kind !== "quarantine-journal-entry" || (targetIntentHash !== null && sha256(intentBytes) !== targetIntentHash)) {
+    throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+  }
+  const authorization = readRecoveryAuthorization(cwd, intent.authorizationHash).value;
+  const proposal = authorization.proposal;
+  if (authorization.proposalHash !== recoveryValueHash(proposal) || intent.proposalHash !== authorization.proposalHash ||
+    intent.expectedHash !== proposal.expectedHash || proposal.expectedHash !== recoveryValueHash(proposal.expected) ||
+    proposal.actionId !== targetActionId || recoveryValueHash(proposal.action) !== recoveryValueHash(intent.action) ||
+    proposal.expected.repositoryHash !== sha256(canonicalJson(recoveryBoundary(cwd, cwd)))) {
+    throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+  }
+  const metadataBytes = readBoundedStateBytes(cwd, recoveryActionFile(cwd, targetActionId, "quarantine.json"), 262_144).bytes;
+  const metadata = parseWorkflowJson(metadataBytes);
+  const source = quarantineEntry(proposal);
+  if (!serializeQuarantineMetadata(metadata).equals(metadataBytes) || metadata.actionId !== targetActionId ||
+    metadata.authorizationHash !== intent.authorizationHash || metadata.entryHash !== proposal.action.entryHash ||
+    recoveryValueHash(metadata.source) !== recoveryValueHash(source) ||
+    metadata.locator !== `.supervised-worker/recovery/quarantine/${targetActionId}/${source.sha256}.quarantined` ||
+    recoveryValueHash(metadata.entries) !== recoveryValueHash(proposal.expected.files.filter(entry =>
+      entry.area === "repository" && path.posix.dirname(entry.path) === ".supervised-worker/runs"))) {
+    throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+  }
+  return { intent, intentHash: sha256(intentBytes), metadata, metadataHash: sha256(metadataBytes), source };
+}
+
+function proveQuarantinePayload(cwd, bundle) {
+  const { metadata, source } = bundle;
+  const sourcePath = path.join(cwd, ...source.path.split("/"));
+  assertSafeStatePath(cwd, sourcePath);
+  if (existsSync(sourcePath)) throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+  const target = path.join(cwd, ...metadata.locator.split("/"));
+  const snapshot = readBoundedStateBytes(cwd, target, 4_194_304);
+  if (sha256(snapshot.bytes) !== source.sha256 ||
+    ["dev", "ino", "size"].some(key => String(snapshot.stats[key]) !== source.identity[key])) {
+    throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+  }
+  requireArtifactAncestors(cwd, metadata.ancestors.map(entry => ({ directory: path.join(cwd, ...entry.path.split("/")), boundary: entry.boundary })));
+  if (recoveryValueHash(recoveryBoundary(cwd, path.join(stateDirectory(cwd), "runs"))) !== recoveryValueHash(metadata.sourceParent)) {
+    throw new SupervisorError("JOURNAL_INTEGRITY", "recovery");
+  }
+}
+
+function requirePreservedForeignEntry(cwd, original, targetActionId, journalGuard) {
+  const sourcePath = path.join(cwd, ...original.path.split("/"));
+  assertSafeStatePath(cwd, sourcePath);
+  if (existsSync(sourcePath)) {
+    const snapshot = readBoundedStateBytes(cwd, sourcePath, 4_194_304);
+    if (sha256(snapshot.bytes) !== original.sha256 ||
+      ["dev", "ino", "size", "mtimeNs", "ctimeNs", "nlink"].some(key => String(snapshot.stats[key]) !== original.identity[key])) {
+      throw new SupervisorError("JOURNAL_INTEGRITY", "recovery");
+    }
+    return;
+  }
+  const actionRoot = path.join(stateDirectory(cwd), "recovery", "actions");
+  assertSafeStatePath(cwd, actionRoot);
+  const ids = readdirSync(actionRoot).sort();
+  if (ids.length > 1024 || ids.some(id => !uuid(id))) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+  for (const id of ids) {
+    if (id === targetActionId) continue;
+    const metadataPath = recoveryActionFile(cwd, id, "quarantine.json");
+    assertSafeStatePath(cwd, metadataPath);
+    if (!existsSync(metadataPath)) continue;
+    const bytes = readBoundedStateBytes(cwd, metadataPath, 262_144).bytes;
+    const metadata = parseWorkflowJson(bytes);
+    if (!serializeQuarantineMetadata(metadata).equals(bytes)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+    if (recoveryValueHash(metadata.source) !== recoveryValueHash(original)) continue;
+    const retained = readQuarantineBundle(cwd, id);
+    proveQuarantinePayload(cwd, retained);
+    journalGuard(cwd);
+    return;
+  }
+  throw new SupervisorError("JOURNAL_INTEGRITY", "recovery");
+}
+
+function proveCompletedQuarantine(cwd, targetActionId, targetIntentHash, journalGuard) {
+  const bundle = readQuarantineBundle(cwd, targetActionId, targetIntentHash);
+  proveQuarantinePayload(cwd, bundle);
+  const { metadata, source } = bundle;
+  const runs = path.join(stateDirectory(cwd), "runs");
+  const names = readdirSync(runs).sort();
+  const layout = journalLayout(names.filter(name => RUN_LEDGER_FILE_PATTERN.test(name)));
+  const journals = new Map();
+  const canonicalRecords = new Set();
+  let journalBytes = 0;
+  journalGuard(cwd);
+  for (const [session, segments] of layout) {
+    for (const segment of segments) {
+      const snapshot = readBoundedStateBytes(cwd, path.join(runs, segment.name), RUN_LEDGER_MAX_FILE_BYTES);
+      journalBytes += snapshot.bytes.length;
+      if (journalBytes > RUN_LEDGER_MAX_TOTAL_BYTES) throw new SupervisorError("JOURNAL_CAPACITY", "recovery");
+      parseRunLedgerBytes(snapshot.bytes, session, RUN_LEDGER_MAX_FILE_BYTES, canonicalRecords);
+      journals.set(`.supervised-worker/runs/${segment.name}`, snapshot.bytes);
+    }
+  }
+  for (const original of metadata.entries.filter(entry => entry.path !== source.path)) {
+    if (RUN_LEDGER_FILE_PATTERN.test(path.posix.basename(original.path))) {
+      const current = journals.get(original.path);
+      const length = Number(original.identity.size);
+      if (!current || current.length < length || sha256(current.subarray(0, length)) !== original.sha256) {
+        throw new SupervisorError("JOURNAL_INTEGRITY", "recovery");
+      }
+    } else {
+      requirePreservedForeignEntry(cwd, original, targetActionId, journalGuard);
+    }
+  }
+  if (canonicalJson(readdirSync(runs).sort()) !== canonicalJson(names)) throw new SupervisorError("JOURNAL_INTEGRITY", "recovery");
+  journalGuard(cwd);
+  return bundle;
+}
+
+function readQuarantineConfirmation(cwd, targetActionId) {
+  const file = recoveryActionFile(cwd, targetActionId, "confirmation.json");
+  assertSafeStatePath(cwd, file);
+  if (!existsSync(file)) return null;
+  const bytes = readBoundedStateBytes(cwd, file, 262_144).bytes;
+  const value = requireRecovery(parseWorkflowJson(bytes), "actionConfirmation");
+  const bundle = readQuarantineBundle(cwd, targetActionId, value.targetIntentHash);
+  const grant = readRecoveryAuthorization(cwd, value.authorizationHash).value;
+  if (!serializeRecovery(value, "actionConfirmation").equals(bytes) || value.targetActionId !== targetActionId ||
+    value.quarantineMetadataHash !== bundle.metadataHash || value.originalAuthorizationHash !== bundle.intent.authorizationHash ||
+    value.actionId !== grant.proposal.actionId || value.proposalHash !== grant.proposalHash ||
+    grant.proposalHash !== recoveryValueHash(grant.proposal) || value.postStateHash !== grant.proposal.expectedHash ||
+    grant.proposal.expectedHash !== recoveryValueHash(grant.proposal.expected) ||
+    recoveryValueHash(grant.proposal.action) !== recoveryValueHash({ kind: "confirm-completed-action",
+      targetActionId, targetIntentHash: bundle.intentHash }) ||
+    value.locator !== bundle.metadata.locator || value.sha256 !== bundle.source.sha256 ||
+    Date.parse(value.confirmedAt) < Date.parse(grant.issuedAt) || Date.parse(value.confirmedAt) >= Date.parse(grant.expiresAt)) {
+    throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+  }
+  return value;
+}
+
+function requireConfirmationPostSnapshot(cwd, input, proposal, authority, heldLocks, confirmation) {
+  const observed = captureRecoveryState(cwd, input, authority, heldLocks).observation;
+  const prefix = `.supervised-worker/recovery/actions/${confirmation.targetActionId}`;
+  const confirmationPath = `${prefix}/confirmation.json`;
+  const authorizationPath = `.supervised-worker/recovery/authorizations/${confirmation.authorizationHash}.json`;
+  const before = new Map(proposal.expected.files.map(file => [`${file.area}:${file.path}`, file]));
+  const expectedMembers = proposal.expected.files.filter(file =>
+    file.area === "repository" && path.posix.dirname(file.path) === prefix && file.kind !== "absent")
+    .map(file => path.posix.basename(file.path));
+  const normalized = [];
+  for (const file of observed.files) {
+    const prior = before.get(`${file.area}:${file.path}`);
+    if (file.area === "repository" && file.path === authorizationPath && prior === undefined) {
+      if (file.kind !== "file" || file.sha256 !== confirmation.authorizationHash) throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+      continue;
+    }
+    if (file.area === "repository" && file.path === confirmationPath) {
+      if (prior?.kind !== "absent" || file.kind !== "file" ||
+        file.sha256 !== sha256(serializeRecovery(confirmation, "actionConfirmation"))) throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+      normalized.push(prior);
+    } else if (file.area === "repository" && file.path === prefix) {
+      if (prior?.kind !== "directory" || file.kind !== "directory" ||
+        recoveryValueHash(file.identity) !== recoveryValueHash(prior.identity) ||
+        file.sha256 !== recoveryValueHash([...expectedMembers, "confirmation.json"].sort())) throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+      normalized.push(prior);
+    } else normalized.push(file);
+  }
+  if (observed.status !== "complete" || observed.diagnostics.some(code => !proposal.expected.diagnostics.includes(code)) ||
+    recoveryValueHash({ ...observed, files: normalized, diagnostics: proposal.expected.diagnostics }) !== proposal.expectedHash) {
+    throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+  }
+}
+
+function confirmCompletedQuarantine(cwd, input, proposal, authorizationHash, authority, journalGuard, heldLocks, requireGrant) {
+  const { targetActionId, targetIntentHash } = proposal.action;
+  const previous = readQuarantineConfirmation(cwd, targetActionId);
+  if (previous !== null) {
+    if (previous.actionId !== proposal.actionId || previous.authorizationHash !== authorizationHash ||
+      previous.proposalHash !== recoveryValueHash(proposal)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+    proveCompletedQuarantine(cwd, targetActionId, targetIntentHash, journalGuard);
+    return previous;
+  }
+  let bundle;
+  const requireExact = (temporaryPath = null) => {
+    requireGrant();
+    requireProposalSnapshot(cwd, input, proposal, authority, heldLocks, temporaryPath);
+    bundle = proveCompletedQuarantine(cwd, targetActionId, targetIntentHash, journalGuard);
+  };
+  requireExact();
+  requireRecoveryBundle(cwd, 1, "finalization");
+  const value = requireRecovery({ schemaVersion: 1, kind: "recovery-action-confirmation",
+    actionId: proposal.actionId, targetActionId, targetIntentHash,
+    quarantineMetadataHash: bundle.metadataHash, originalAuthorizationHash: bundle.intent.authorizationHash,
+    authorizationHash, proposalHash: recoveryValueHash(proposal), postStateHash: proposal.expectedHash,
+    locator: bundle.metadata.locator, sha256: bundle.source.sha256, confirmedAt: new Date(Date.now()).toISOString(),
+    status: "confirmed-complete", effect: "receipt-only" }, "actionConfirmation");
+  const bytes = serializeRecovery(value, "actionConfirmation");
+  transitionWriteBytes(journalGuard, cwd, recoveryActionFile(cwd, targetActionId, "confirmation.json"),
+    bytes, 262_144, true, requireExact);
+  requireGrant();
+  proveCompletedQuarantine(cwd, targetActionId, targetIntentHash, journalGuard);
+  if (recoveryValueHash(readQuarantineConfirmation(cwd, targetActionId)) !== recoveryValueHash(value)) {
+    throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+  }
+  requireConfirmationPostSnapshot(cwd, input, proposal, authority, heldLocks, value);
+  return value;
+}
+
+function withSelectedRecoveryBoundary(cwd, input, proposal, authority, completed, action) {
+  const selected = proposal.expected.scopes.find((entry) => entry.scope === proposal.action.scope);
+  if (proposal.action.kind !== "recover-lock" || selected?.owner !== "dead" || selected.snapshot === null ||
+    selected.snapshotHash !== proposal.action.snapshotHash || recoveryValueHash(selected.snapshot) !== selected.snapshotHash) {
+    throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+  }
+  const context = recoveryContext(cwd, { ...input, expected: selected.snapshot }, "recover");
+  const directory = completed ? `${context.canonicalDirectory}.${selected.snapshot.token}.recovered` : context.sourceDirectory;
+  let guards = [];
+  const releaseContext = createLifecycleReleaseContext(() => ({ roots: [cwd], input, session: context.session }), () => guards);
+  const guard = () => {
+    requireVerifiedWorkerAuthority(authority, cwd, input);
+    if (canonicalJson(recoverySnapshot(context, directory)) !== canonicalJson(selected.snapshot) ||
+      recoveryLiveness(context, selected.snapshot).code !== "LIFECYCLE_OWNER_DEAD") throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+    for (const held of guards) {
+      if (!lifecycleLockIdentityMatches(held) || !lifecycleLockOwnerIdentityMatches(held)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+    }
+  };
+  const expected = readCampaignTransition(cwd, input);
+  return withLifecycleCleanup(() => {
+    if (selected.scope !== "repository") guards = acquireRepositoryLocks([cwd], releaseContext);
+    return withCampaignTransition("recover", cwd, input, expected, guard, () => action(cwd, guard, () => guards));
+  }, () => [...guards].reverse(), releaseContext);
+}
+
+function applyAuthorizedLockRecovery(cwd, input, captured, authorizationHash, authority) {
+  const proposal = captured.value.proposal;
+  const requireGrant = () => requireStoredRecoveryAuthorization(cwd, input, authorizationHash, captured, authority);
+  requireGrant();
+  const prior = readRecoveryActionReceipt(cwd, proposal, authorizationHash);
+  if (prior !== null) return prior;
+  const selected = proposal.expected.scopes.find((entry) => entry.scope === proposal.action.scope);
+  if (selected?.snapshotHash !== proposal.action.snapshotHash || selected.snapshot === null) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+  const target = recoveryActionFile(cwd, proposal.actionId, "intent.json");
+  const intent = { schemaVersion: 1, kind: "recovery-action-intent", actionId: proposal.actionId, authorizationHash,
+    proposalHash: recoveryValueHash(proposal), expectedHash: proposal.expectedHash, action: proposal.action };
+  const bytes = serializeRecovery(intent, "actionIntent");
+  assertSafeStatePath(cwd, target);
+  if (existsSync(target)) {
+    if (!readBoundedStateBytes(cwd, target, 262_144).bytes.equals(bytes)) throw new SupervisorError("RECOVERY_AUTHORIZATION_REQUIRED", "recovery");
+  } else withSelectedRecoveryBoundary(cwd, input, proposal, authority, false, (root, guard, heldLocks) => {
+    requireRecoveryBundle(root, 2, "finalization");
+    const requireExact = (temporaryPath = null) => {
+      requireGrant();
+      requireProposalSnapshot(root, input, proposal, authority, heldLocks(), temporaryPath);
+    };
+    requireExact();
+    transitionWriteBytes(guard, root, target, bytes, 262_144, true, requireExact);
+  });
+  const result = recoverLifecycleLock(cwd, { ...input, expected: selected.snapshot }, requireGrant);
+  if (!["recovered", "already-recovered"].includes(result.status)) return {
+    schemaVersion: 1, kind: "recovery-action", status: "unconfirmed", actionId: proposal.actionId, authorizationHash,
+    proposalHash: recoveryValueHash(proposal), beforeHash: proposal.expectedHash, afterHash: null, frontierHash: null, locator: null, sha256: null,
+  };
+  return withSelectedRecoveryBoundary(cwd, input, proposal, authority, true, (root, guard, heldLocks) => {
+    requireGrant();
+    return readRecoveryActionReceipt(root, proposal, authorizationHash) ??
+      publishRecoveryActionReceipt(root, input, authority, proposal, authorizationHash, guard, heldLocks(), {});
+  });
+}
+
+export function applyRecoveryAction(cwd, request, authority) {
+  requireRecovery(request, "applyRequest");
+  const input = recoverySessionInput(request);
+  requireVerifiedWorkerAuthority(authority, cwd, input);
+  const captured = readRecoveryAuthorization(cwd, request.authorizationHash);
+  requireStoredRecoveryAuthorization(cwd, input, request.authorizationHash, captured, authority);
+  const { proposal } = captured.value;
+  if (proposal.action.kind === "recover-lock") return applyAuthorizedLockRecovery(cwd, input, captured, request.authorizationHash, authority);
+  if (proposal.action.kind === "finish-release") {
+    const selected = readRecoveryFrontier(cwd);
+    if (selected?.frontier.owner?.routeGeneration !== null && selected?.frontier.owner) {
+      if (selected.frontier.owner.sessionRootHash !== recoverySessionRootHash(input)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "detach");
+      if (selected.frontier.owner.sessionHash !== sessionHash(input)) recoverySourceSessions.set(input, selected.frontier.owner.sessionHash);
+    }
+  }
+  sessionRequestAuthorities.set(input, authority);
+  return withSessionLifecycle(cwd, input, "recover", (root, session, _routing, _guards, journalGuard, _preserve, heldLocks) => {
+    const requireGrant = () => requireStoredRecoveryAuthorization(root, input, request.authorizationHash, captured, authority);
+    requireGrant();
+    if (proposal.action.kind === "confirm-completed-action") {
+      return confirmCompletedQuarantine(root, input, proposal, request.authorizationHash, authority, journalGuard, heldLocks(), requireGrant);
+    }
+    if (proposal.action.kind === "finish-release") {
+      requireRecordedRecoveryPrefixes(requireJournalCapture(root, journalGuard), readRecoveryFrontier(root)?.frontier.ledger);
+    }
+    const prior = readRecoveryActionReceipt(root, proposal, request.authorizationHash);
+    if (prior !== null) return prior;
+    const intentPath = recoveryActionFile(root, proposal.actionId, "intent.json");
+    assertSafeStatePath(root, intentPath);
+    if (existsSync(intentPath)) {
+      const selected = readRecoveryFrontier(root);
+      if (proposal.action.kind === "legacy-reconcile" && selected?.frontier.phase === "reconciled" &&
+        selected.frontier.transitionId === proposal.actionId && selected.frontier.authorizationHash === request.authorizationHash) {
+        return publishRecoveryActionReceipt(root, input, authority, proposal, request.authorizationHash, journalGuard, heldLocks(), { frontierHash: selected.frontierHash });
+      }
+      if (proposal.action.kind === "finish-release" && selected?.frontier.phase === "detached" &&
+        selected.frontier.previousHash === proposal.action.frontierHash && selected.frontier.authorizationHash === request.authorizationHash) {
+        return publishRecoveryActionReceipt(root, input, authority, proposal, request.authorizationHash, journalGuard, heldLocks(), { frontierHash: selected.frontierHash });
+      }
+      if (proposal.action.kind === "quarantine-journal-entry") {
+        const details = applyQuarantineEntry(root, proposal, request.authorizationHash, journalGuard, requireGrant, true);
+        return publishRecoveryActionReceipt(root, input, authority, proposal, request.authorizationHash, journalGuard, heldLocks(), details);
+      }
+      throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+    }
+    const inspection = requireProposalSnapshot(root, input, proposal, authority, heldLocks());
+    const payloadSlots = proposal.action.kind === "quarantine-journal-entry"
+      ? Math.ceil(Number(quarantineEntry(proposal).identity.size) / RECOVERY_LIMITS.recordBytes) : 0;
+    requireRecoveryBundle(root, 4 + payloadSlots, proposal.action.kind === "legacy-reconcile" ? "ordinary" : "finalization");
+    const intent = { schemaVersion: 1, kind: "recovery-action-intent", actionId: proposal.actionId,
+      authorizationHash: request.authorizationHash, proposalHash: recoveryValueHash(proposal), expectedHash: proposal.expectedHash, action: proposal.action };
+    transitionWriteBytes(journalGuard, root, intentPath, serializeRecovery(intent, "actionIntent"), 262_144, true, (temporaryPath) => {
+      requireGrant();
+      requireProposalSnapshot(root, input, proposal, authority, heldLocks(), temporaryPath);
+    });
+    requireGrant();
+    if (proposal.action.kind === "quarantine-journal-entry") {
+      const details = applyQuarantineEntry(root, proposal, request.authorizationHash, journalGuard, requireGrant);
+      return publishRecoveryActionReceipt(root, input, authority, proposal, request.authorizationHash, journalGuard, heldLocks(), details);
+    }
+    if (proposal.action.kind === "finish-release") {
+      const selected = finishPreparedRelease(root, input, proposal, request.authorizationHash, journalGuard);
+      return publishRecoveryActionReceipt(root, input, authority, proposal, request.authorizationHash, journalGuard, heldLocks(), { frontierHash: selected.frontierHash });
+    }
+    if (proposal.action.kind !== "legacy-reconcile") throw new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery");
+    if (readAttachmentSnapshot(root) !== null || readRecoveryFrontier(root) !== null || inspection.lineage?.status !== "unique") throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+    const lineage = inspection.lineage;
+    const useProven = proposal.action.resolution.kind === "use-proven-state";
+    if (useProven && (!lineage.provenState || lineage.evidenceHash !== proposal.action.resolution.evidenceHash)) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "recovery");
+    const selected = publishFrontier(root, input, {
+      schemaVersion: 1, kind: "recovery-frontier", campaignId: randomUUID(), sequence: 0, previousHash: null,
+      transitionId: proposal.actionId, phase: "reconciled", repositoryHash: inspection.observation.repositoryHash,
+      sourceHash: authority.sourceHash, workflowHash: inspection.observation.workflowHash,
+      planHash: inspection.observation.planHash, planBytesHash: inspection.observation.planBytesHash,
+      owner: null, successor: null, stopState: useProven ? lineage.provenState : lineage.stopState, operations: lineage.operations,
+      ledger: lineage.ledger, checkpointHash: null, authorizationHash: request.authorizationHash, cause: "legacy-reconcile",
+    }, null, journalGuard);
+    requireGrant();
+    return publishRecoveryActionReceipt(root, input, authority, proposal, request.authorizationHash, journalGuard, heldLocks(), { frontierHash: selected.frontierHash });
+  });
 }
 
 export function recoverLifecycleLock(cwd, request, authorize = () => {}) {
@@ -2059,7 +3321,7 @@ export function recoverLifecycleLock(cwd, request, authorize = () => {}) {
   }
 }
 
-export function issueRescueCapability(cwd, request, authority) {
+export function issueRescueCapability(cwd, request, authority, selectedSnapshot = undefined) {
   const allowed = ["session_id", "transcript_path", "scope", "location", "token", "incidentId", "expiresAt"];
   if (!request || typeof request !== "object" || Array.isArray(request) ||
     Object.keys(request).some((key) => !allowed.includes(key)) || !uuid(request.incidentId) ||
@@ -2077,6 +3339,8 @@ export function issueRescueCapability(cwd, request, authority) {
     throw new Error("rescue issuance requires exact verified dead ownership");
   }
   const expected = inspection.expected;
+  if (selectedSnapshot !== undefined && (validateLifecycle(selectedSnapshot, "snapshot").length > 0 ||
+    canonicalJson(selectedSnapshot) !== canonicalJson(expected))) throw new Error("DOCTOR_RECOVERY_SNAPSHOT_CHANGED");
   const context = recoveryContext(cwd, { ...selector, expected }, "recover");
   const observation = readCampaignTransition(cwd, request);
   const token = randomBytes(32).toString("hex");
@@ -2201,7 +3465,7 @@ function routineHookObservation(input, eventName, targets, cwd) {
   const root = realpathSync(path.resolve(candidateRoot));
   const inspectedTargets = completeToolTargetInspection(targets, root);
   if (inspectedTargets.unsafe || toolTouchesState(inspectedTargets, root) ||
-    toolTouchesGitMetadata(inspectedTargets, root) || toolTouchesWorkflowConfig(inspectedTargets, root)) return null;
+    toolTouchesGitMetadata(inspectedTargets, root) || toolTouchesWorkflowConfig(inspectedTargets, root) || toolTouchesPublication(inspectedTargets, root)) return null;
   const snapshot = readAttachmentSnapshot(root);
   const attachment = attachedRecord(root, input, undefined, snapshot);
   if (attachment === null) return null;
@@ -2277,6 +3541,11 @@ function readSessionLocator(input, repairMarker = false, inspectMissingMarker = 
   }
   if (!existsSync(context.filePath)) {
     if (marker !== null || existsSync(context.directoryPath)) {
+      const requirePrepared = preparedResumeLocators.get(input);
+      if (requirePrepared !== undefined) {
+        requirePrepared();
+        return { context, exists: false, locator: null };
+      }
       throw new Error("session repository locator is missing");
     }
     return { context, exists: false, locator: null };
@@ -2317,7 +3586,7 @@ function preflightSessionLocatorLocality(input) {
   }
 }
 
-function bindSessionLocator(input, cwd, journalGuard) {
+function bindSessionLocator(input, cwd, journalGuard, expectedGeneration = undefined) {
   journalGuard(cwd);
   const context = sessionLocatorContext(input);
   if (context === null) {
@@ -2335,7 +3604,7 @@ function bindSessionLocator(input, cwd, journalGuard) {
     sessionHash: sessionHash(input),
     repositoryRoot,
     repositoryRootHash: sha256(pathIdentity(repositoryRoot)),
-    generation: randomUUID(),
+    generation: expectedGeneration ?? randomUUID(),
     status: "provisional",
     boundAt: now,
     updatedAt: now,
@@ -2363,7 +3632,7 @@ function bindSessionLocator(input, cwd, journalGuard) {
       return { bound: true, created: true, conflict: false, generation: record.generation };
     }
     if (pathEquals(existing.repositoryRoot, repositoryRoot)) {
-      if (readAttachment(existing.repositoryRoot) === null) {
+      if (readAttachment(existing.repositoryRoot) === null && existing.generation !== expectedGeneration) {
         transitionWriteJson(journalGuard, context.storageRoot, context.filePath, record);
         return { bound: true, created: true, conflict: false, generation: record.generation };
       }
@@ -2378,7 +3647,7 @@ function bindSessionLocator(input, cwd, journalGuard) {
   }
 }
 
-function updateSessionLocatorStatus(input, expectedCwd, generation, status, journalGuard, durable = false) {
+function updateSessionLocatorStatus(input, expectedCwd, generation, status, journalGuard, durable = false, updatedAt = undefined) {
   journalGuard(expectedCwd);
   const result = readSessionLocator(input);
   if (result.context === null) return;
@@ -2399,7 +3668,7 @@ function updateSessionLocatorStatus(input, expectedCwd, generation, status, jour
   const updated = {
     ...result.locator,
     status,
-    updatedAt: new Date().toISOString(),
+    updatedAt: updatedAt ?? new Date().toISOString(),
   };
   journalGuard(expectedCwd);
   if (durable) {
@@ -2899,6 +4168,14 @@ function toolTouchesState(inspectedTargets, cwd) {
   );
 }
 
+function toolTouchesPublication(inspectedTargets, cwd) {
+  return [["releases"], ["recovery", "quarantine"]].some((parts) => {
+    const root = path.join(stateDirectory(cwd), ...parts);
+    const canonicalRoot = canonicalizeDeepestExisting(root);
+    return inspectedTargets.targets.some((target) => targetWithin(target, root, canonicalRoot));
+  });
+}
+
 function toolTouchesGitMetadata(inspectedTargets, cwd) {
   const roots = gitMetadataRoots(cwd).map((rootPath) => ({
     rootPath,
@@ -2950,7 +4227,7 @@ function claimSession(cwd, input, promote = false, journalGuard) {
   if (readAttachment(cwd)?.status === "checkpointed") {
     return { claimed: false, conflict: true, checkpointed: true };
   }
-  const locatorClaim = bindSessionLocator(input, cwd, journalGuard);
+  const locatorClaim = bindSessionLocator(input, cwd, journalGuard, input.recoverySuccessor?.routeGeneration ?? undefined);
   if (locatorClaim.conflict) {
     return { claimed: false, conflict: true, routingConflict: true };
   }
@@ -2964,11 +4241,12 @@ function claimSession(cwd, input, promote = false, journalGuard) {
     throw error;
   }
   const record = {
-    schemaVersion: 3,
+    schemaVersion: input.recoveryCampaignId ? 4 : 3,
+    ...(input.recoveryCampaignId ? { campaignId: input.recoveryCampaignId } : {}),
     sessionHash: hash,
     status: "provisional",
     routeGeneration: locatorClaim.generation ?? null,
-    claimGeneration: randomUUID(),
+    claimGeneration: input.recoverySuccessor?.claimGeneration ?? randomUUID(),
     checkpointHash: null,
     ...(digest(input.workerAuthorityHash) ? { workerAuthorityHash: input.workerAuthorityHash } : {}),
     attachedAt: new Date().toISOString(),
@@ -3060,7 +4338,7 @@ function removeStateFile(cwd, filePath) {
   rmSync(filePath, { force: true });
 }
 
-function detachSession(cwd, input, snapshot = readAttachmentSnapshot(cwd), journalGuard) {
+function detachSession(cwd, input, snapshot = readAttachmentSnapshot(cwd), journalGuard, preparedAt = undefined) {
   journalGuard(cwd);
   const attachment = attachedRecord(cwd, input, undefined, snapshot);
   if (attachment === null) return false;
@@ -3072,6 +4350,8 @@ function detachSession(cwd, input, snapshot = readAttachmentSnapshot(cwd), journ
       attachment.routeGeneration,
       "released",
       journalGuard,
+      true,
+      preparedAt,
     );
   }
   journalGuard(cwd);
@@ -3123,10 +4403,11 @@ function durableWriteBytes(cwd, filePath, bytes, maximumBytes, immutable = false
   assertSafeStatePath(cwd, filePath);
   ensureSafeDirectory(cwd, path.dirname(filePath));
   if (immutable && existsSync(filePath)) {
-    if (!readBoundedStateBytes(cwd, filePath, maximumBytes, true).bytes.equals(bytes)) {
+    const existing = readBoundedStateBytes(cwd, filePath, maximumBytes, true);
+    if (!existing.bytes.equals(bytes)) {
       throw new Error("immutable state already exists with different bytes");
     }
-    return;
+    return existing;
   }
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   let descriptor;
@@ -3147,16 +4428,18 @@ function durableWriteBytes(cwd, filePath, bytes, maximumBytes, immutable = false
     if (immutable && existsSync(filePath)) throw new Error("immutable state publication conflicted");
     if (beforePublish !== null) beforePublish(temporaryPath);
     renameSync(temporaryPath, filePath);
-    if (!readBoundedStateBytes(cwd, filePath, maximumBytes).bytes.equals(bytes)) {
+    const published = readBoundedStateBytes(cwd, filePath, maximumBytes);
+    if (!published.bytes.equals(bytes)) {
       throw new Error("durable state publication read-back failed");
     }
+    return published;
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
     if (existsSync(temporaryPath)) removeStateFile(cwd, temporaryPath);
   }
 }
 
-function parseRunLedgerBytes(bytes, expectedSession, maximumBytes = RUN_LEDGER_MAX_FILE_BYTES, canonicalRecords = new Set()) {
+function parseRunLedgerBytes(bytes, expectedSession, maximumBytes = RUN_LEDGER_MAX_FILE_BYTES, canonicalRecords = new Set(), recordEnds = null) {
   if (bytes.length > maximumBytes) throw runLedgerFailure("run-ledger-limit-exceeded");
   if (bytes.length === 0 || bytes.at(-1) !== 0x0a) throw runLedgerFailure("run-ledger-invalid");
   const records = [];
@@ -3178,6 +4461,7 @@ function parseRunLedgerBytes(bytes, expectedSession, maximumBytes = RUN_LEDGER_M
     if (canonicalRecords.has(canonicalRecord)) throw runLedgerFailure("run-ledger-invalid");
     canonicalRecords.add(canonicalRecord);
     records.push(record);
+    recordEnds?.push(start);
   }
   return records;
 }
@@ -3213,99 +4497,221 @@ function readJournalInventory(cwd, journalGuard, ignoredTemporary = null) {
   return { directory, names, sessions: journalLayout(names) };
 }
 
-function readSessionLedgerBytes(cwd, hash, journalGuard, flush = false, ignoredTemporary = null) {
-  const inventory = readJournalInventory(cwd, journalGuard, ignoredTemporary);
-  const layout = inventory.sessions.get(hash) ?? [];
-  const segments = [];
-  let length = 0;
-  for (const segment of layout) {
-    const filePath = path.join(inventory.directory, segment.name);
-    const snapshot = readBoundedStateBytes(cwd, filePath, RUN_LEDGER_MAX_FILE_BYTES,
-      flush && segment.index === layout.length - 1);
-    length += snapshot.bytes.length;
-    if (length > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
-    segments.push({ ...segment, ...snapshot });
-  }
-  if (JSON.stringify(readJournalInventory(cwd, journalGuard, ignoredTemporary).names) !== JSON.stringify(inventory.names)) {
-    throw runLedgerFailure("run-ledger-changed-during-read");
-  }
-  for (const segment of segments) {
-    if (!sameRunLedgerStats(segment.stats, lstatSync(path.join(inventory.directory, segment.name), { bigint: true }))) {
-      throw runLedgerFailure("run-ledger-changed-during-read");
-    }
-  }
-  const bytes = Buffer.concat(segments.map((segment) => segment.bytes));
+function verifyJournalCapture(cwd, journalGuard, capture, ignoredTemporary = null, replacement = null, creatingDirectory = false) {
   journalGuard(cwd);
-  return { bytes, exists: segments.length > 0, segments, inventory: inventory.names };
+  if (capture.error !== null) throw capture.error;
+  try {
+    const inventory = readJournalInventory(cwd, journalGuard, ignoredTemporary);
+    const names = replacement && !capture.segments.has(replacement.name)
+      ? [...capture.names, replacement.name].sort() : capture.names;
+    if (canonicalJson(inventory.names) !== canonicalJson(names)) throw runLedgerFailure("run-ledger-changed-during-read");
+    const boundary = existsSync(capture.directory) ? canonicalJson(recoveryBoundary(cwd, capture.directory)) : null;
+    if (boundary !== capture.boundary && !(creatingDirectory && capture.boundary === null)) throw runLedgerFailure("run-ledger-changed-during-read");
+    for (const name of names) {
+      const segment = replacement?.name === name ? replacement : capture.segments.get(name);
+      const current = lstatSync(path.join(capture.directory, name), { bigint: true });
+      if (!sameRunLedgerStats(segment.stats, current)) throw runLedgerFailure("run-ledger-changed-during-read");
+    }
+    journalGuard(cwd);
+    if (creatingDirectory && capture.boundary === null) capture.boundary = boundary;
+  } catch (error) {
+    capture.error = error;
+    throw error;
+  }
+}
+
+function requireJournalCapture(cwd, journalGuard, ignoredTemporary = null) {
+  let captures = journalCaptures.get(journalGuard);
+  if (captures === undefined) {
+    captures = new Map();
+    journalCaptures.set(journalGuard, captures);
+  }
+  let capture = captures.get(cwd);
+  if (capture !== undefined) {
+    verifyJournalCapture(cwd, journalGuard, capture, ignoredTemporary);
+    return capture;
+  }
+  capture = { error: null };
+  captures.set(cwd, capture);
+  try {
+    const inventory = readJournalInventory(cwd, journalGuard, ignoredTemporary);
+    Object.assign(capture, { directory: inventory.directory, names: inventory.names,
+      boundary: existsSync(inventory.directory) ? canonicalJson(recoveryBoundary(cwd, inventory.directory)) : null,
+      sessions: new Map(), segments: new Map(), totalBytes: 0 });
+    const records = [];
+    for (const [session, layout] of inventory.sessions) {
+      const stream = { segments: [], records: [], canonicalRecords: new Set(), bytes: null };
+      capture.sessions.set(session, stream);
+      for (const segment of layout) {
+        const snapshot = readBoundedStateBytes(cwd, path.join(inventory.directory, segment.name), RUN_LEDGER_MAX_FILE_BYTES);
+        recoveryIdentity(snapshot.stats);
+        capture.totalBytes += snapshot.bytes.length;
+        if (capture.totalBytes > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
+        const recordEnds = [];
+        const parsed = parseRunLedgerBytes(snapshot.bytes, session, RUN_LEDGER_MAX_FILE_BYTES, stream.canonicalRecords, recordEnds);
+        const prefixHash = sha256(snapshot.bytes);
+        const verified = { ...segment, ...snapshot, session, records: parsed, recordEnds, prefixHash,
+          prefixHashes: new Map([[snapshot.bytes.length, prefixHash]]), flushed: false };
+        stream.segments.push(verified);
+        stream.records.push(...parsed);
+        records.push(...parsed);
+        capture.segments.set(segment.name, verified);
+      }
+    }
+    capture.index = new JournalOperationIndex(records);
+    verifyJournalCapture(cwd, journalGuard, capture, ignoredTemporary);
+    return capture;
+  } catch (error) {
+    capture.error = error;
+    throw error;
+  }
+}
+
+function readSessionLedgerBytes(cwd, hash, journalGuard, flush = false, ignoredTemporary = null) {
+  const capture = requireJournalCapture(cwd, journalGuard, ignoredTemporary);
+  const stream = capture.sessions.get(hash);
+  const segments = stream?.segments ?? [];
+  const tail = segments.at(-1);
+  if (flush && tail && !tail.flushed) {
+    const target = path.join(capture.directory, tail.name);
+    const descriptor = openSync(target, "r+");
+    try {
+      if (!sameRunLedgerStats(tail.stats, fstatSync(descriptor, { bigint: true }))) throw runLedgerFailure("run-ledger-changed-during-read");
+      fsyncSync(descriptor);
+      if (!sameRunLedgerStats(tail.stats, fstatSync(descriptor, { bigint: true }))) throw runLedgerFailure("run-ledger-changed-during-read");
+    } finally {
+      closeSync(descriptor);
+    }
+    verifyJournalCapture(cwd, journalGuard, capture, ignoredTemporary);
+    tail.flushed = true;
+  }
+  if (stream && stream.bytes === null) stream.bytes = Buffer.concat(segments.map((segment) => segment.bytes));
+  return { bytes: stream?.bytes ?? Buffer.alloc(0), exists: segments.length > 0, segments: [...segments], inventory: [...capture.names],
+    records: stream?.records ?? [], canonicalRecords: stream?.canonicalRecords ?? new Set() };
 }
 
 function readSessionLedger(cwd, hash, journalGuard, flush = false, ignoredTemporary = null) {
-  const snapshot = readSessionLedgerBytes(cwd, hash, journalGuard, flush, ignoredTemporary);
-  const canonicalRecords = new Set();
-  const records = snapshot.segments.flatMap((segment) =>
-    parseRunLedgerBytes(segment.bytes, hash, RUN_LEDGER_MAX_FILE_BYTES, canonicalRecords));
-  return { ...snapshot, records, canonicalRecords };
+  return readSessionLedgerBytes(cwd, hash, journalGuard, flush, ignoredTemporary);
+}
+
+function requireRecordedRecoveryPrefixes(capture, ledger) {
+  for (const position of ledger?.segments ?? []) {
+    const segment = capture.segments.get(position.path.slice("runs/".length));
+    if (!segment || segment.session !== position.sessionHash || segment.bytes.length < position.byteOffset ||
+      (position.recordCount === 0 ? position.byteOffset !== 0 : segment.recordEnds[position.recordCount - 1] !== position.byteOffset)) {
+      throw new SupervisorError("JOURNAL_INTEGRITY", "observation");
+    }
+    let prefixHash = segment.prefixHashes.get(position.byteOffset);
+    if (prefixHash === undefined) {
+      prefixHash = sha256(segment.bytes.subarray(0, position.byteOffset));
+      segment.prefixHashes.set(position.byteOffset, prefixHash);
+    }
+    if (prefixHash !== position.prefixHash) throw new SupervisorError("JOURNAL_INTEGRITY", "observation");
+  }
 }
 
 function requireJournalAdmission(cwd, fileName, bytes, journalGuard, ignoredTemporary = null) {
-  const { directory, names } = readJournalInventory(cwd, journalGuard, ignoredTemporary);
+  const capture = requireJournalCapture(cwd, journalGuard, ignoredTemporary);
+  const names = capture.names;
   if (bytes.length > RUN_LEDGER_MAX_FILE_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
   journalLayout(names.includes(fileName) ? names : [...names, fileName]);
-  let aggregateBytes = bytes.length;
-  for (const name of names) {
-    if (name === fileName) continue;
-    const filePath = path.join(directory, name);
-    assertSafeStatePath(cwd, filePath);
-    const stats = lstatSync(filePath, { bigint: true });
-    if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1n) throw runLedgerFailure("run-ledger-invalid");
-    if (stats.size > BigInt(RUN_LEDGER_MAX_FILE_BYTES)) throw runLedgerFailure("run-ledger-limit-exceeded");
-    aggregateBytes += Number(stats.size);
-    if (aggregateBytes > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
-  }
-  journalGuard(cwd);
+  const aggregateBytes = capture.totalBytes - (capture.segments.get(fileName)?.bytes.length ?? 0) + bytes.length;
   if (aggregateBytes > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
 }
 
+function journalCapacity(cwd, journalGuard, writes = [], ignoredTemporary = null, controlWrites = []) {
+  const capture = requireJournalCapture(cwd, journalGuard, ignoredTemporary);
+  const files = capture.names.map((name) => ({ name, bytes: capture.segments.get(name).bytes.length }));
+  const previous = readRecoveryTip(cwd)?.frontier;
+  requireRecordedRecoveryPrefixes(capture, previous?.ledger);
+  const inherited = previous?.operations.orphans ?? [];
+  return projectJournalCapacity({ files, index: capture.index, writes, inherited, controlWrites });
+}
+
+function requireJournalCapacity(cwd, journalGuard, writes, ignoredTemporary = null) {
+  const assessment = journalCapacity(cwd, journalGuard, writes, ignoredTemporary);
+  if (!assessment.allowed) throw Object.assign(runLedgerFailure("run-ledger-limit-exceeded"), { journalCapacity: assessment });
+  return assessment;
+}
+
+function requireJournalControlBundle(cwd, input, journalGuard, count) {
+  const assessment = journalCapacity(cwd, journalGuard, [], null,
+    Array.from({ length: count }, () => ({ sessionHash: sessionHash(input), bytes: JOURNAL_LIMITS.recordBytes })));
+  if (!assessment.allowed) throw Object.assign(runLedgerFailure("run-ledger-limit-exceeded"), { journalCapacity: assessment });
+}
+
 function prepareJournalAppend(cwd, hash, event, detail, journalGuard, recordedAt = new Date().toISOString()) {
-  const snapshot = readSessionLedger(cwd, hash, journalGuard);
+  const capture = requireJournalCapture(cwd, journalGuard);
+  const stream = capture.sessions.get(hash);
   const record = { schemaVersion: 1, at: recordedAt, event, session: hash, ...detail };
   requireRunLedgerRecord(record, hash);
   const suffix = Buffer.from(`${JSON.stringify(record)}\n`);
-  if (snapshot.bytes.length + suffix.length > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
-  parseRunLedgerBytes(suffix, hash, RUN_LEDGER_MAX_FILE_BYTES, snapshot.canonicalRecords);
-  const tail = snapshot.segments.at(-1);
+  if (capture.totalBytes + suffix.length > RUN_LEDGER_MAX_TOTAL_BYTES) throw runLedgerFailure("run-ledger-limit-exceeded");
+  if (stream?.canonicalRecords.has(canonicalJson(record))) throw runLedgerFailure("run-ledger-invalid");
+  parseRunLedgerBytes(suffix, hash);
+  const tail = stream?.segments.at(-1);
   const rollover = tail !== undefined && tail.bytes.length + suffix.length > RUN_LEDGER_MAX_FILE_BYTES;
   const index = tail === undefined ? 0 : tail.index + (rollover ? 1 : 0);
   const fileName = index === 0 ? `${hash}.jsonl` : `${hash}.${String(index).padStart(6, "0")}.jsonl`;
   const bytes = Buffer.concat([rollover || tail === undefined ? Buffer.alloc(0) : tail.bytes, suffix]);
   requireJournalAdmission(cwd, fileName, bytes, journalGuard);
-  return { snapshot, record, fileName, bytes, suffix };
+  requireJournalCapacity(cwd, journalGuard, [record]);
+  return { capture, record, fileName, index, bytes, suffix };
 }
 
 function appendJournalRecord(cwd, hash, event, detail, journalGuard, beforePublish = null, recordedAt = undefined) {
-  const { snapshot, record, fileName, bytes, suffix } = prepareJournalAppend(cwd, hash, event, detail, journalGuard, recordedAt);
-  durableWriteBytes(
-    cwd, path.join(stateDirectory(cwd), "runs", fileName),
-    bytes, RUN_LEDGER_MAX_FILE_BYTES, false, suffix, (temporaryPath) => {
-      if (!readBoundedStateBytes(cwd, temporaryPath, RUN_LEDGER_MAX_FILE_BYTES).bytes.equals(bytes)) {
-        throw runLedgerFailure("run-ledger-changed-during-read");
-      }
-      const current = readSessionLedgerBytes(cwd, hash, journalGuard, false, temporaryPath);
-      if (current.exists !== snapshot.exists || !current.bytes.equals(snapshot.bytes) ||
-        JSON.stringify(current.inventory) !== JSON.stringify(snapshot.inventory) ||
-        current.segments.length !== snapshot.segments.length || current.segments.some((segment, position) =>
-          segment.name !== snapshot.segments[position].name || !sameRunLedgerStats(segment.stats, snapshot.segments[position].stats))) {
-        throw runLedgerFailure("run-ledger-changed-during-read");
-      }
+  const { capture, record, fileName, index, bytes, suffix } = prepareJournalAppend(cwd, hash, event, detail, journalGuard, recordedAt);
+  const target = path.join(capture.directory, fileName);
+  let publicationAttempted = false;
+  const accept = (snapshot) => {
+    const previous = capture.segments.get(fileName);
+    const prefixHash = sha256(snapshot.bytes);
+    const segment = { ...snapshot, name: fileName, index, session: hash,
+      records: [...(previous?.records ?? []), record],
+      recordEnds: [...(previous?.recordEnds ?? []), snapshot.bytes.length], prefixHash,
+      prefixHashes: new Map(previous?.prefixHashes), flushed: true };
+    segment.prefixHashes.set(snapshot.bytes.length, prefixHash);
+    verifyJournalCapture(cwd, journalGuard, capture, null, segment);
+    capture.index.append(record);
+    capture.totalBytes += suffix.length;
+    if (!previous) capture.names = [...capture.names, fileName].sort();
+    capture.segments.set(fileName, segment);
+    const stream = capture.sessions.get(hash) ?? { segments: [], records: [], canonicalRecords: new Set() };
+    stream.segments[index] = segment;
+    stream.records.push(record);
+    stream.canonicalRecords.add(canonicalJson(record));
+    stream.bytes = null;
+    capture.sessions.set(hash, stream);
+  };
+  let published;
+  try {
+    published = durableWriteBytes(cwd, target, bytes, RUN_LEDGER_MAX_FILE_BYTES, false, suffix, (temporaryPath) => {
+      verifyJournalCapture(cwd, journalGuard, capture, temporaryPath, null, true);
       requireJournalAdmission(cwd, fileName, bytes, journalGuard, temporaryPath);
+      requireJournalCapacity(cwd, journalGuard, [record], temporaryPath);
       if (beforePublish !== null) beforePublish();
-      journalGuard(cwd);
       journalPublicationVerifiers.get(journalGuard)?.();
-    },
-  );
+      verifyJournalCapture(cwd, journalGuard, capture, temporaryPath);
+      publicationAttempted = true;
+    });
+  } catch (error) {
+    if (publicationAttempted && capture.error === null) {
+      try {
+        // One affected-tail reread distinguishes a lost append response from an absent append.
+        const observed = existsSync(target) ? readBoundedStateBytes(cwd, target, RUN_LEDGER_MAX_FILE_BYTES) : null;
+        if (observed?.bytes.equals(bytes)) accept(observed);
+        else verifyJournalCapture(cwd, journalGuard, capture);
+      } catch (uncertain) {
+        capture.error = uncertain;
+      }
+    }
+    throw error;
+  }
+  accept(published);
   journalGuard(cwd);
   if (beforePublish !== null) beforePublish();
   journalPublicationVerifiers.get(journalGuard)?.();
+  verifyJournalCapture(cwd, journalGuard, capture);
   return record;
 }
 
@@ -3431,9 +4837,9 @@ function requireDeniedSource(records, sourceOperationId) {
 function recordToolDenial(cwd, input, attempt, journalGuard) {
   if (attempt === null) throw new Error("denial ownership was not confirmed");
   attempt.requireOwner();
-  const records = readSessionLedger(cwd, attempt.attachment.sessionHash, journalGuard).records;
-  const roots = attempt.requestHash === null ? [] : records.filter((record) =>
-    record.event === "tool_denied" && record.requestHash === attempt.requestHash && record.retryOf === null);
+  const index = requireJournalCapture(cwd, journalGuard).index;
+  const roots = attempt.requestHash === null ? [] :
+    index.denialsForRequest(attempt.attachment.sessionHash, attempt.requestHash).filter((record) => record.retryOf === null);
   return appendDurableLedger(cwd, input, "tool_denied", {
     toolName: attempt.toolName, operationId: attempt.operationId, observationId: randomUUID(),
     invocationHash: attempt.invocationHash, requestHash: attempt.requestHash,
@@ -3446,13 +4852,21 @@ function recordToolDenial(cwd, input, attempt, journalGuard) {
   });
 }
 
-function deniedToolOutput(cwd, input, attempt, reason, journalGuard) {
+function deniedToolOutput(cwd, input, attempt, reason, journalGuard, failure = null) {
+  if (["JOURNAL_CAPACITY", "RECOVERY_OPERATION_LIMIT"].includes(failure?.code) && !attempt?.admissionPending) {
+    return preToolDecision(input, "deny", `${reason} No capacity-denial record was appended; terminal and control headroom remains reserved. No retry permit is available.`);
+  }
   let detail;
   try {
     const denial = recordToolDenial(cwd, input, attempt, journalGuard);
     detail = `The tool did not execute; its denial was durably recorded as operation ${denial.operationId}. No automatic retry is authorized.`;
-  } catch {
-    detail = "The tool did not execute. Denial journaling is unconfirmed; no retry permit is available.";
+  } catch (error) {
+    detail = `The tool did not execute. Denial journaling is unconfirmed; no retry permit is available.${
+      attempt?.admissionPending ? ` Preserve outcome-unknown operation ${attempt.operationId}; its admission may already be durable.` : ""}`;
+    const primary = failure ?? failureFromError(error, "admission") ??
+      supervisorFailure("JOURNAL_OBSERVATION_UNCONFIRMED", "admission");
+    return failedSupervisorOutput(preToolDecision(input, "deny", `${reason} ${detail}`),
+      { ...primary, diagnostics: [...new Set([...primary.diagnostics, "JOURNAL_OBSERVATION_UNCONFIRMED"])] });
   }
   return preToolDecision(input, "deny", `${reason} ${detail}`);
 }
@@ -3460,17 +4874,21 @@ function deniedToolOutput(cwd, input, attempt, reason, journalGuard) {
 function recordToolStart(cwd, input, journalGuard, attempt) {
   if (attempt === null) return;
   attempt.requireOwner();
-  const records = readSessionLedger(cwd, attempt.attachment.sessionHash, journalGuard).records;
-  if (attempt.requestHash === null && records.some((record) => record.event === "tool_denied" &&
+  if (attempt.attachment.schemaVersion === 4) requireFrontierOwner(cwd, input);
+  const capture = requireJournalCapture(cwd, journalGuard);
+  const index = capture.index;
+  const records = capture.sessions.get(attempt.attachment.sessionHash)?.records ?? [];
+  if (attempt.requestHash === null && index.forEvent("tool_denied", attempt.attachment.sessionHash).some((record) =>
     record.toolName.toLowerCase() === attempt.toolName.toLowerCase())) {
     throw new Error("denied retry requires unambiguous complete tool arguments");
   }
-  const denials = attempt.requestHash === null ? [] : records.filter((record) =>
-    record.event === "tool_denied" && record.requestHash === attempt.requestHash);
+  const denials = attempt.requestHash === null ? [] : index.denialsForRequest(attempt.attachment.sessionHash, attempt.requestHash);
   const requireAdmission = () => {
     attempt.requireOwner();
+    if (attempt.attachment.schemaVersion === 4) requireFrontierOwner(cwd, input);
     if (denials.length > 0) requireActivePlan(cwd, attempt.planHash);
   };
+  let retryDetail = null;
   if (denials.length > 0) {
     const roots = denials.filter((record) => record.retryOf === null);
     if (roots.length !== 1) throw new Error("denied retry root is ambiguous");
@@ -3490,19 +4908,26 @@ function recordToolStart(cwd, input, journalGuard, attempt) {
       throw new Error("denied retry has no unspent matching reservation");
     }
     requireAdmission();
-    appendDurableLedger(cwd, input, "denied_retry_consumed", {
+    retryDetail = {
       sourceOperationId: source.operationId, reservationId: reservation.reservationId,
       requestHash: source.requestHash, planHash: source.planHash,
       attachmentHash: source.attachmentHash, ownershipHash: source.ownershipHash,
       routeGeneration: source.routeGeneration, claimGeneration: source.claimGeneration, attempt: 1,
       operationId: attempt.operationId, invocationHash: attempt.invocationHash,
-    }, journalGuard, requireAdmission);
+    };
   }
-  appendDurableLedger(cwd, input, "tool_started", {
+  const startDetail = {
     toolName: attempt.toolName, operationId: attempt.operationId,
     invocationHash: attempt.invocationHash, requestHash: attempt.requestHash,
     routeGeneration: attempt.attachment.routeGeneration, claimGeneration: attempt.attachment.claimGeneration,
-  }, journalGuard, requireAdmission);
+  };
+  const recordedAt = new Date().toISOString();
+  const pendingWrites = [...(retryDetail === null ? [] : [{ event: "denied_retry_consumed", ...retryDetail }]), { event: "tool_started", ...startDetail }]
+    .map((record) => ({ schemaVersion: 1, at: recordedAt, session: sessionHash(input), ...record }));
+  requireJournalCapacity(cwd, journalGuard, pendingWrites);
+  attempt.admissionPending = true;
+  if (retryDetail !== null) appendDurableLedger(cwd, input, "denied_retry_consumed", retryDetail, journalGuard, requireAdmission, recordedAt);
+  appendDurableLedger(cwd, input, "tool_started", startDetail, journalGuard, requireAdmission, recordedAt);
 }
 
 function recordToolCompletion(cwd, input, success, journalGuard) {
@@ -3510,26 +4935,33 @@ function recordToolCompletion(cwd, input, success, journalGuard) {
   const attachment = attachedRecord(cwd, input, undefined, attachmentSnapshot);
   if (attachment === null) return true;
   try {
-    const snapshot = readSessionLedger(cwd, attachment.sessionHash, journalGuard);
+    const requireOwner = () => {
+      requireAttachmentSnapshot(cwd, attachmentSnapshot);
+      if (attachment.schemaVersion === 4) requireFrontierOwner(cwd, input);
+    };
+    requireOwner();
+    const index = requireJournalCapture(cwd, journalGuard).index;
     const hintHash = invocationHash(input);
-    const starts = hintHash === null ? [] : snapshot.records.filter((record) =>
-      record.event === "tool_started" && record.invocationHash === hintHash);
+    const starts = hintHash === null ? [] : index.startsForInvocation(attachment.sessionHash, hintHash);
+    const observations = starts.length === 1 ? index.forOperation(starts[0].operationId) : [];
     const operationId = starts.length === 1 && sameClaim(starts[0], attachment) &&
-      !snapshot.records.some((record) => record.event === "tool_denied" && record.operationId === starts[0].operationId)
+      !observations.some((record) => record.event === "tool_denied" && sameClaim(record, attachment) &&
+        record.invocationHash === hintHash && record.requestHash === starts[0].requestHash)
       ? starts[0].operationId : null;
-    if (operationId !== null && snapshot.records.some((record) =>
+    if (operationId !== null && observations.some((record) =>
       record.event === "tool_completed" && record.operationId === operationId &&
       record.invocationHash === hintHash && sameClaim(record, attachment))) {
       journalGuard(cwd);
-      requireAttachmentSnapshot(cwd, attachmentSnapshot);
+      requireOwner();
       return true;
     }
     appendDurableLedger(cwd, input, "tool_completed", {
       toolName: boundedToolName(input), success, observationId: randomUUID(), operationId,
       invocationHash: hintHash, routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration,
-    }, journalGuard, () => requireAttachmentSnapshot(cwd, attachmentSnapshot));
+    }, journalGuard, requireOwner);
     return true;
-  } catch {
+  } catch (error) {
+    if (attachment.schemaVersion === 4) throw error;
     return false;
   }
 }
@@ -3589,6 +5021,16 @@ function validOperationContext(value) {
 }
 
 export function validateCheckpoint(value) {
+  if (value?.schemaVersion === 3) {
+    const errors = validatePackagedValue("checkpoint.schema.json", value, null, MAX_CHECKPOINT_BYTES);
+    if (errors.length) return errors;
+    if (value.ledgerPosition.path !== `runs/${value.sessionHash}.jsonl` ||
+      Object.values(value.context.counts).reduce((sum, count) => sum + count, 0) !== value.context.itemHashes.length ||
+      new Set(value.context.operations.orphans.map((operation) => operation.operationId)).size !== value.context.operations.orphans.length) {
+      return ["checkpoint context or frontier bindings are invalid"];
+    }
+    return [];
+  }
   try {
     if (Buffer.byteLength(JSON.stringify(value)) > MAX_CHECKPOINT_BYTES) return ["checkpoint exceeds the size limit"];
   } catch {
@@ -3642,6 +5084,10 @@ function checkpointFailure(reason) {
 }
 
 function requireSessionRequest(request, operation) {
+  if (["recover", "publish"].includes(operation)) {
+    requireRecovery(request, "inspectRequest");
+    return;
+  }
   if (operation === "record-model") {
     const required = ["session_id", "expected", "receipt"];
     const allowed = [...required, "transcript_path"];
@@ -3694,7 +5140,7 @@ function requireSessionRequest(request, operation) {
   const deniedRetry = operation === "retry-denied";
   const binding = operation === "checkpoint" || deniedRetry ? "attachmentHash" : "checkpointHash";
   const required = ["session_id", "planHash", binding, ...(deniedRetry ? ["sourceOperationId"] : [])];
-  const allowed = [...required, "transcript_path"];
+  const allowed = [...required, "transcript_path", ...(operation === "resume" ? ["frontierHash"] : [])];
   try {
     if (Buffer.byteLength(JSON.stringify(request)) >
       (deniedRetry ? MAX_OBSERVATION_REQUEST_BYTES : MAX_CHECKPOINT_REQUEST_BYTES)) throw new Error();
@@ -3704,6 +5150,7 @@ function requireSessionRequest(request, operation) {
       !nonEmptyString(request.session_id) || Buffer.byteLength(request.session_id) > 256 ||
       /[\x00-\x1f\x7f]/.test(request.session_id) || sessionHash(request) === null ||
       !digest(request.planHash) || !(digest(request[binding]) || (operation === "resume" && request[binding] === null)) ||
+      (operation === "resume" && Object.hasOwn(request, "frontierHash") && !digest(request.frontierHash)) ||
       (deniedRetry && !uuid(request.sourceOperationId)) ||
       (Object.hasOwn(request, "transcript_path") &&
         (typeof request.transcript_path !== "string" || Buffer.byteLength(request.transcript_path) > 4_096))) throw new Error();
@@ -3715,13 +5162,14 @@ function requireSessionRequest(request, operation) {
 function withSessionLifecycle(cwd, request, operation, action) {
   requireSessionRequest(request, operation);
   let sessionLock = null;
+  const sessionLocks = [];
   let repositoryLocks = [];
   let journalLocks = [];
   let root = null;
   let input = null;
   let context = null;
   let preserveJournal = false;
-  const heldLocks = () => (preserveJournal ? [] : [...journalLocks].reverse()).concat([...repositoryLocks].reverse(), sessionLock);
+  const heldLocks = () => (preserveJournal ? [] : [...journalLocks].reverse()).concat([...repositoryLocks].reverse(), [...sessionLocks].reverse());
   const releaseContext = createLifecycleReleaseContext(() => ({ roots: [root], input, session: context }), heldLocks);
   const guardedAction = () => {
     if (process.platform === "win32") resetWindowsPathChecks();
@@ -3752,7 +5200,34 @@ function withSessionLifecycle(cwd, request, operation, action) {
       assertSafeStatePath(context.storageRoot, path.join(context.storageRoot, "workspace.json"));
       if (lstatSync(input.transcript_path).nlink !== 1) checkpointFailure("transcript anchor must be a single-link file");
     }
+    const sourceSession = recoverySourceSessions.get(request);
+    const acquireSource = () => sessionLocks.push(acquireLifecycleLock(context.storageRoot,
+      path.join(context.storageRoot, "supervised-worker", "session-locks", sourceSession), "session"));
+    if (sourceSession && sourceSession < sessionHash(input)) acquireSource();
     sessionLock = acquireSessionLock(input, context);
+    if (sessionLock !== null) sessionLocks.push(sessionLock);
+    if (sourceSession && sourceSession > sessionHash(input)) acquireSource();
+    if (operation === "resume" && authority !== undefined) {
+      const selected = readRecoveryFrontier(root);
+      const prepared = selected?.frontier;
+      if (prepared?.phase === "resume-prepared" && prepared.successor?.sessionHash === sessionHash(input) &&
+        prepared.successor.workerAuthorityHash === authority.grantHash && prepared.checkpointHash === request.checkpointHash &&
+        prepared.planHash === request.planHash &&
+        (request.frontierHash === undefined ? request.checkpointHash !== null : request.frontierHash === prepared.previousHash)) {
+        preparedResumeLocators.set(input, () => {
+          requireVerifiedWorkerAuthority(authority, root, input);
+          const current = readRecoveryFrontier(root);
+          const observation = readCampaignTransition(root, input);
+          if (current?.frontierHash !== selected.frontierHash || canonicalJson(current.headIdentity) !== canonicalJson(selected.headIdentity) ||
+            prepared.sourceHash !== authority.sourceHash || prepared.repositoryHash !== observation.repositoryHash ||
+            prepared.workflowHash !== resolveWorkflowRoles(root, { requireAcceptance: true }).workflowHash ||
+            prepared.planHash !== observation.planHash || prepared.planBytesHash !== observation.planBytesHash ||
+            prepared.successor.sessionRootHash !== recoverySessionRootHash(input)) {
+            throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "resume");
+          }
+        });
+      }
+    }
     const routing = readSessionLocator(input, false);
     if (routing.exists && !pathEquals(routing.locator.repositoryRoot, root)) {
       checkpointFailure(`${operation} session routing conflicts with the process cwd`);
@@ -3760,7 +5235,7 @@ function withSessionLifecycle(cwd, request, operation, action) {
     windowsPathChecksMaySpawn = false;
     repositoryLocks = ["observe-handoff", "retry-denied"].includes(operation) ? [] : acquireRepositoryLocks([root], releaseContext);
     journalLocks = acquireJournalLocks([root], releaseContext);
-    const requireJournal = createJournalGuard(journalLocks, [sessionLock, ...repositoryLocks]);
+    const requireJournal = createJournalGuard(journalLocks, [...sessionLocks, ...repositoryLocks]);
     const journalGuard = (guardedRoot) => {
       requireJournal(guardedRoot);
       if (authority !== undefined) requireVerifiedWorkerAuthority(authority, root, input);
@@ -3779,15 +5254,18 @@ function withSessionLifecycle(cwd, request, operation, action) {
     const execute = () => action(root, input, currentRouting, requireGuards, journalGuard, () => {
       preserveJournal = true;
       for (const lock of journalLocks) closeSync(lock.ownerFd);
-    });
+    }, () => [...journalLocks, ...repositoryLocks, ...sessionLocks]);
     return transitionExpected === null ? execute()
       : withCampaignTransition(operation, root, input, transitionExpected, journalGuard, execute);
   };
   try {
     return withLifecycleCleanup(guardedAction, heldLocks, releaseContext);
   } catch (error) {
-    if (error instanceof LifecycleError || error?.checkpointReason || error?.transitionCode) throw error;
+    if (error instanceof LifecycleError || error?.checkpointReason || error?.transitionCode || error?.publicationConflict || trustedSupervisorFailure(error)) throw error;
+    if (operation === "recover") throw Object.assign(new SupervisorError("RECOVERY_PERSISTENCE_UNCONFIRMED", "recovery"), { cause: error });
     throw new Error(`${operation} could not confirm its local lifecycle state; inspect status, ledger integrity, and ownership before retrying`, { cause: error });
+  } finally {
+    if (input !== null) preparedResumeLocators.delete(input);
   }
 }
 
@@ -3972,9 +5450,15 @@ function readStopSnapshot(cwd, hash) {
   if (!existsSync(filePath)) return null;
   let value;
   try {
-    value = parseWorkflowJson(readBoundedStateBytes(cwd, filePath, MAX_SESSION_LOCATOR_BYTES).bytes);
+    value = parseWorkflowJson(readBoundedStateBytes(cwd, filePath, 262_144).bytes);
   } catch {
     checkpointFailure("checkpoint Stop state is not valid bounded JSON; repair it explicitly");
+  }
+  if (value?.schemaVersion === 3 && validateRecovery(value, "runtime").length === 0) {
+    const selected = readRecoveryFrontier(cwd);
+    if (selected === null || selected.frontier.campaignId !== value.campaignId || value.sessionHash !== hash ||
+      !selected.hashes.includes(value.frontierHash)) checkpointFailure("runtime cache is not bound to the selected recovery lineage");
+    return value.stopState;
   }
   if (!checkpointStopState(value) || value === null) checkpointFailure("checkpoint Stop state is invalid; repair it explicitly");
   return value;
@@ -3985,48 +5469,14 @@ function unavailableOperations(reason) {
 }
 
 function inspectOperations(records, inherited = null) {
-  if (inherited?.status === "unavailable" || records.some((record) =>
-    record.event === "checkpoint_resumed" && record.observationStatus === "unavailable")) {
+  const index = new JournalOperationIndex(records);
+  const observed = index.project([], inherited?.orphans ?? []);
+  if (inherited?.status === "unavailable" || index.incomplete) {
     return unavailableOperations("inherited-observation-unavailable");
   }
-  const starts = records.filter((record) => record.event === "tool_started");
-  const terminals = records.filter((record) => record.event === "tool_completed");
-  const orphans = new Map((inherited?.orphans ?? []).map((operation) => [operation.operationId, operation]));
-  const seenOperations = new Set();
-  for (const start of starts) {
-    if (seenOperations.has(start.operationId)) checkpointFailure("ledger contains duplicate operation identities");
-    seenOperations.add(start.operationId);
-    const matchingStarts = start.invocationHash === null ? [] : starts.filter((candidate) =>
-      candidate.invocationHash === start.invocationHash && candidate.session === start.session);
-    const matchingTerminals = terminals.filter((terminal) => terminal.operationId === start.operationId &&
-      terminal.invocationHash === start.invocationHash && terminal.session === start.session &&
-      terminal.claimGeneration === start.claimGeneration && terminal.routeGeneration === start.routeGeneration);
-    const matchingDenials = records.filter((record) => record.event === "tool_denied" &&
-      record.operationId === start.operationId && record.invocationHash === start.invocationHash &&
-      record.session === start.session && record.claimGeneration === start.claimGeneration &&
-      record.routeGeneration === start.routeGeneration && digest(start.requestHash) && record.requestHash === start.requestHash);
-    if (matchingStarts.length === 1 &&
-      ((matchingTerminals.length === 1 && matchingDenials.length === 0) ||
-        (matchingTerminals.length === 0 && matchingDenials.length === 1))) continue;
-    orphans.set(start.operationId, {
-      operationId: start.operationId, sessionHash: start.session,
-      routeGeneration: start.routeGeneration, claimGeneration: start.claimGeneration,
-      invocationHash: start.invocationHash, toolName: start.toolName, observationStatus: "outcome-unknown",
-    });
-  }
-  for (const child of records.filter((record) => record.event === "helper_attempt_reserved")) {
-    if (seenOperations.has(child.operationId)) checkpointFailure("ledger contains duplicate operation identities");
-    seenOperations.add(child.operationId);
-    orphans.set(child.operationId, {
-      operationId: child.operationId, sessionHash: child.session,
-      routeGeneration: child.routeGeneration, claimGeneration: child.claimGeneration,
-      invocationHash: child.invocationHash, toolName: HANDOFF_HELPER_ID, observationStatus: "outcome-unknown",
-    });
-  }
-  if (orphans.size > MAX_CHECKPOINT_ORPHANS) checkpointFailure("checkpoint orphan limit exceeded; no operations were truncated");
   return {
-    status: "observed", reason: null, orphans: [...orphans.values()],
-    uncorrelatedCompletions: (inherited?.uncorrelatedCompletions ?? 0) + terminals.filter((record) => !record.operationId).length,
+    status: "observed", reason: null, orphans: observed.orphans,
+    uncorrelatedCompletions: (inherited?.uncorrelatedCompletions ?? 0) + index.uncorrelatedCompletions,
   };
 }
 
@@ -4054,11 +5504,23 @@ function readCheckpointReceipt(cwd, hash) {
   return value;
 }
 
-function requireCheckpointLedger(cwd, receipt, hash, journalGuard, flush = true) {
+function requireCheckpointLedger(cwd, receipt, hash, journalGuard, flush = true, allowUnpublished = false) {
+  if (receipt.schemaVersion === 3) {
+    journalGuard(cwd);
+    const bytes = readBoundedStateBytes(cwd, path.join(stateDirectory(cwd), "recovery", "frontiers", `${receipt.frontierHash}.json`), 262_144).bytes;
+    const prepared = requireRecovery(parseWorkflowJson(bytes), "frontier");
+    if (sha256(bytes) !== receipt.frontierHash || prepared.phase !== "checkpoint-prepared" ||
+      prepared.transitionId !== receipt.checkpointId || prepared.planHash !== receipt.planHash ||
+      prepared.owner?.attachmentHash !== receipt.attachmentHash || prepared.owner?.sessionHash !== receipt.sessionHash ||
+      prepared.owner?.claimGeneration !== receipt.claimGeneration || prepared.owner?.routeGeneration !== receipt.routeGeneration ||
+      recoveryValueHash(prepared.stopState) !== recoveryValueHash(receipt.context.stopState) ||
+      recoveryValueHash(prepared.operations) !== recoveryValueHash(receipt.context.operations)) checkpointFailure("checkpoint prepared frontier does not match its receipt");
+  }
   let snapshot;
   try {
     snapshot = readSessionLedger(cwd, receipt.sessionHash, journalGuard, flush);
-  } catch {
+  } catch (error) {
+    if (trustedSupervisorFailure(error)) throw error;
     checkpointFailure("checkpoint source ledger is corrupt, partial, unsafe, or exceeds its bound");
   }
   const position = receipt.ledgerPosition;
@@ -4068,10 +5530,11 @@ function requireCheckpointLedger(cwd, receipt, hash, journalGuard, flush = true)
   const prefix = sourceBytes.subarray(0, position.byteOffset);
   if (!snapshot.exists || prefix.length !== position.byteOffset || sha256(prefix) !== position.prefixHash ||
     (prefix.length > 0 && parseRunLedgerBytes(prefix, receipt.sessionHash,
-      receipt.schemaVersion === 2 ? RUN_LEDGER_MAX_TOTAL_BYTES : RUN_LEDGER_MAX_FILE_BYTES).length !== position.recordCount)) {
+      receipt.schemaVersion === 1 ? RUN_LEDGER_MAX_FILE_BYTES : RUN_LEDGER_MAX_TOTAL_BYTES).length !== position.recordCount)) {
     checkpointFailure("checkpoint source ledger prefix does not match the receipt");
   }
   const event = sourceRecords[position.recordCount];
+  if (allowUnpublished && event === undefined) return;
   if (event?.event !== "checkpoint_persisted" || event.checkpointHash !== hash ||
     event.planHash !== receipt.planHash || event.attachmentHash !== receipt.attachmentHash ||
     event.claimGeneration !== receipt.claimGeneration || event.routeGeneration !== receipt.routeGeneration) {
@@ -4094,6 +5557,8 @@ function checkpointResult(cwd, hash, receipt) {
   return {
     status: "checkpointed", checkpointHash: hash, planHash: receipt.planHash,
     attachmentHash: readAttachmentSnapshot(cwd).hash, context: receipt.context,
+    ...(receipt.schemaVersion === 3 ? { frontierHash: readRecoveryFrontier(cwd).frontierHash,
+      resume: { planHash: receipt.planHash, checkpointHash: hash, frontierHash: readRecoveryFrontier(cwd).frontierHash } } : {}),
   };
 }
 
@@ -4103,6 +5568,7 @@ export function checkpointSession(cwd, request, authority = undefined) {
     sessionRequestAuthorities.set(request, authority);
   }
   return withSessionLifecycle(cwd, request, "checkpoint", (root, input, routing, requireGuards, journalGuard) => {
+    if (readRecoveryFrontier(root) !== null) return checkpointFrontier(root, request, input, routing, requireGuards, journalGuard, authority);
     const plan = requireActivePlan(root, request.planHash);
     const snapshot = readAttachmentSnapshot(root);
     if (snapshot === null) checkpointFailure("checkpoint requires the current owning attachment");
@@ -4182,6 +5648,87 @@ export function checkpointSession(cwd, request, authority = undefined) {
   });
 }
 
+function checkpointFrontier(root, request, input, routing, requireGuards, journalGuard, authority) {
+  const plan = requireActivePlan(root, request.planHash);
+  let selected = readRecoveryFrontier(root);
+  let source = readAttachmentSnapshot(root);
+  if (source === null) checkpointFailure("checkpoint requires its current source attachment");
+  let attachment = attachmentFromSnapshot(source);
+  if (attachment.sessionHash !== sessionHash(input) ||
+    (authority !== undefined && attachment.status !== "checkpointed" && attachment.workerAuthorityHash !== authority.grantHash)) {
+    checkpointFailure("checkpoint requires the exact source Worker");
+  }
+  if (selected.frontier.phase === "checkpointed") {
+    const receipt = readCheckpointReceipt(root, selected.frontier.checkpointHash);
+    requireCheckpointLedger(root, receipt, selected.frontier.checkpointHash, journalGuard);
+    if (receipt.attachmentHash !== request.attachmentHash || attachment.status !== "checkpointed" ||
+      source.hash !== selected.frontier.owner.attachmentHash || attachment.checkpointHash !== selected.frontier.checkpointHash) checkpointFailure("checkpoint retry source conflict");
+    return checkpointResult(root, selected.frontier.checkpointHash, receipt);
+  }
+  if (attachment.status !== "active" || source.hash !== request.attachmentHash) {
+    if (selected.frontier.phase !== "checkpoint-prepared" || attachment.status !== "checkpointed" ||
+      selected.frontier.owner.attachmentHash !== request.attachmentHash) checkpointFailure("checkpoint requires its exact active source or interrupted tombstone");
+  }
+  requireRecoveryBundle(root, 5, "finalization");
+  if (selected.frontier.phase === "active") {
+    requireJournalControlBundle(root, input, journalGuard, 1);
+    requireFrontierOwner(root, input, selected);
+    requireSourceRoute(attachment, input, routing);
+    const evidence = observeRecoveryEvidence(root, journalGuard, selected.frontier);
+    selected = advanceFrontier(root, input, selected, { ...evidence, phase: "checkpoint-prepared", cause: "checkpoint", transitionId: randomUUID(), preparedAt: new Date().toISOString() }, journalGuard);
+    persistFrontierCache(root, input, selected, journalGuard);
+  } else if (selected.frontier.phase !== "checkpoint-prepared" || selected.frontier.owner.sessionHash !== sessionHash(input) ||
+    selected.frontier.owner.attachmentHash !== request.attachmentHash) checkpointFailure("checkpoint has a different prepared transition");
+  const directory = path.join(stateDirectory(root), "checkpoints");
+  assertSafeStatePath(root, directory);
+  const names = existsSync(directory) ? readdirSync(directory) : [];
+  if (names.length > 1024) checkpointFailure("checkpoint evidence inventory exceeds its bound");
+  const matches = names.filter((name) => /^[0-9a-f]{64}\.json$/.test(name)).map((name) => {
+    const receipt = readCheckpointReceipt(root, name.slice(0, 64));
+    return { receipt, hash: name.slice(0, 64) };
+  }).filter(({ receipt }) => receipt.schemaVersion === 3 && receipt.frontierHash === selected.frontierHash);
+  if (matches.length > 1) checkpointFailure("checkpoint prepared frontier has conflicting receipts");
+  let receipt = matches[0]?.receipt;
+  let hash = matches[0]?.hash;
+  if (!receipt) {
+    const ledger = readSessionLedger(root, attachment.sessionHash, journalGuard, true);
+    receipt = {
+      schemaVersion: 3, kind: "session-checkpoint", checkpointId: selected.frontier.transitionId, createdAt: selected.frontier.preparedAt,
+      planHash: request.planHash, sessionHash: selected.frontier.owner.sessionHash,
+      routeGeneration: selected.frontier.owner.routeGeneration, claimGeneration: selected.frontier.owner.claimGeneration,
+      attachmentHash: selected.frontier.owner.attachmentHash, frontierHash: selected.frontierHash,
+      ledgerPosition: { path: `runs/${attachment.sessionHash}.jsonl`, byteOffset: ledger.bytes.length, recordCount: ledger.records.length, prefixHash: sha256(ledger.bytes) },
+      context: checkpointContext(plan, selected.frontier.stopState, selected.frontier.operations),
+    };
+    if (validateCheckpoint(receipt).length) checkpointFailure("v3 checkpoint context is invalid");
+    const bytes = Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`);
+    hash = sha256(bytes);
+    transitionWriteBytes(journalGuard, root, path.join(directory, `${hash}.json`), bytes, MAX_CHECKPOINT_BYTES, true, requireGuards);
+  }
+  requireCheckpointLedger(root, receipt, hash, journalGuard, true, true);
+  const persistence = { checkpointHash: hash, planHash: request.planHash, attachmentHash: receipt.attachmentHash,
+    routeGeneration: receipt.routeGeneration, claimGeneration: receipt.claimGeneration };
+  const recorded = readSessionLedger(root, receipt.sessionHash, journalGuard).records.filter((record) =>
+    record.event === "checkpoint_persisted" && record.checkpointHash === hash);
+  if (recorded.length > 1) checkpointFailure("checkpoint persistence observations conflict");
+  if (recorded.length === 0) appendDurableLedger(root, input, "checkpoint_persisted", persistence, journalGuard, requireGuards);
+  requireCheckpointLedger(root, receipt, hash, journalGuard);
+  if (attachment.status !== "checkpointed") {
+    requireAttachmentSnapshot(root, source);
+    const tombstone = { schemaVersion: 4, campaignId: selected.frontier.campaignId, sessionHash: attachment.sessionHash, status: "checkpointed",
+      routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration, checkpointHash: hash,
+      attachedAt: attachment.attachedAt, updatedAt: receipt.createdAt };
+    transitionWriteBytes(journalGuard, root, attachmentPath(root), Buffer.from(`${JSON.stringify(tombstone, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES, false,
+      () => requireAttachmentSnapshot(root, source));
+    source = readAttachmentSnapshot(root);
+    attachment = attachmentFromSnapshot(source);
+  } else if (attachment.checkpointHash !== hash) checkpointFailure("interrupted checkpoint tombstone has a different receipt");
+  if (attachment.routeGeneration !== null) updateSessionLocatorStatus(input, root, attachment.routeGeneration, "released", journalGuard, true);
+  selected = advanceFrontier(root, input, selected, { phase: "checkpointed", checkpointHash: hash, owner: frontierOwner(root, input) }, journalGuard);
+  persistFrontierCache(root, input, selected, journalGuard);
+  return checkpointResult(root, hash, receipt);
+}
+
 function restoreStopSnapshot(cwd, input, state, journalGuard) {
   journalGuard(cwd);
   const filePath = runtimeStatePath(cwd, input);
@@ -4209,25 +5756,6 @@ function allSessionOperations(cwd, journalGuard, flush = true) {
   return inspectOperations(records);
 }
 
-function ownerlessContext(cwd, plan, journalGuard) {
-  const operations = allSessionOperations(cwd, journalGuard);
-  const states = new Map();
-  const runtimeDirectory = path.join(stateDirectory(cwd), "runtime");
-  assertSafeStatePath(cwd, runtimeDirectory);
-  if (existsSync(runtimeDirectory)) {
-    const names = readdirSync(runtimeDirectory).filter((name) => name.endsWith(".json"));
-    if (names.length > RUN_LEDGER_MAX_FILES || names.some((name) => !/^[0-9a-f]{64}\.json$/.test(name))) {
-      checkpointFailure("ownerless recovery Stop-state directory is invalid or exceeds its bound");
-    }
-    for (const name of names) {
-      const state = readStopSnapshot(cwd, name.slice(0, 64));
-      if (state !== null) states.set(canonicalJson(state), state);
-    }
-  }
-  if (states.size > 1) checkpointFailure("ownerless recovery has ambiguous Stop state; inspect the prior sessions explicitly");
-  return checkpointContext(plan, states.values().next().value ?? null, operations);
-}
-
 export function resumeSession(cwd, request, authority = undefined) {
   if (authority !== undefined) {
     requireVerifiedWorkerAuthority(authority, cwd, request);
@@ -4235,99 +5763,123 @@ export function resumeSession(cwd, request, authority = undefined) {
   }
   return withSessionLifecycle(cwd, request, "resume", (root, input, routing, requireGuards, journalGuard) => {
     const plan = requireActivePlan(root, request.planHash);
-    const snapshot = readAttachmentSnapshot(root);
-    const existing = snapshot === null ? null : attachmentFromSnapshot(snapshot);
-    let receipt = null;
-    let context;
-    if (request.checkpointHash === null) {
-      if (existing !== null) checkpointFailure("ownerless recovery requires no attachment or checkpoint tombstone; never release an owner automatically");
-      context = ownerlessContext(root, plan, journalGuard);
-    } else {
-      receipt = readCheckpointReceipt(root, request.checkpointHash);
-      if (receipt.planHash !== request.planHash) checkpointFailure("resume plan hash does not match the checkpoint");
-      const expectedContext = checkpointContext(plan, receipt.context.stopState, receipt.context.operations);
-      if (canonicalJson(expectedContext.counts) !== canonicalJson(receipt.context.counts) ||
-        canonicalJson(expectedContext.itemHashes) !== canonicalJson(receipt.context.itemHashes)) {
-        checkpointFailure("resume checkpoint counts and item references do not match the unchanged plan");
-      }
-      if (receipt.sessionHash === sessionHash(input)) checkpointFailure("resume requires a fresh session distinct from the source");
-      requireCheckpointLedger(root, receipt, request.checkpointHash, journalGuard);
-      if (existing === null || existing.checkpointHash !== request.checkpointHash) checkpointFailure("resume requires the matching checkpoint tombstone or its exact successor");
-      if (existing.status === "checkpointed") {
-        if (existing.sessionHash !== receipt.sessionHash || existing.claimGeneration !== receipt.claimGeneration ||
-          existing.routeGeneration !== receipt.routeGeneration) checkpointFailure("checkpoint tombstone source identity does not match its receipt");
-      } else if (existing.status !== "active" || existing.sessionHash !== sessionHash(input)) {
-        checkpointFailure("another session owns this checkpoint successor");
-      }
-      context = receipt.context;
-    }
-    let successor = existing?.status === "active" ? existing : null;
-    if (successor !== null) {
-      if (authority !== undefined && successor.workerAuthorityHash !== authority.grantHash) {
-        checkpointFailure("resume retry does not match the successor immutable Worker grant");
-      }
-      if (successor.routeGeneration !== null && (routing.context === null || !routing.exists ||
-        routing.locator.generation !== successor.routeGeneration || routing.locator.status === "released")) {
-        checkpointFailure("resume retry does not match the successor transcript route");
-      }
-    } else {
-      if (routing.exists && !["released", "provisional"].includes(routing.locator.status)) {
-        checkpointFailure("resume requires a fresh, interrupted provisional, or explicitly released successor session route");
-      }
-      prepareJournalAppend(root, sessionHash(input), "checkpoint_resumed", {
-        checkpointHash: request.checkpointHash, planHash: request.planHash,
-        sourceSessionHash: receipt?.sessionHash ?? sessionHash(input),
-        routeGeneration: routing.context === null ? null : "00000000-0000-4000-8000-000000000000",
-        claimGeneration: "00000000-0000-4000-8000-000000000000",
-        observationStatus: context.operations.status, observationReason: context.operations.reason,
-      }, journalGuard);
-      restoreStopSnapshot(root, input, context.stopState, journalGuard);
-      const route = bindSessionLocator(input, root, journalGuard);
-      if (route.conflict) checkpointFailure("resume successor routing conflicts with current ownership");
-      if (routing.context !== null) readBoundedStateBytes(routing.context.storageRoot, routing.context.filePath, MAX_SESSION_LOCATOR_BYTES, true);
-      if (snapshot === null) {
-        if (readAttachmentSnapshot(root) !== null) checkpointFailure("ownership appeared during ownerless recovery");
-      } else requireAttachmentSnapshot(root, snapshot);
-      requireActivePlan(root, request.planHash);
-      successor = {
-        schemaVersion: 3, sessionHash: sessionHash(input), status: "active",
-        routeGeneration: route.generation ?? null, claimGeneration: randomUUID(), checkpointHash: request.checkpointHash,
-        ...(digest(input.workerAuthorityHash) ? { workerAuthorityHash: input.workerAuthorityHash } : {}),
-        attachedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-      };
-      transitionWriteBytes(journalGuard, root, attachmentPath(root), Buffer.from(`${JSON.stringify(successor, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES, false, () => {
-        requireGuards();
-        if (snapshot === null) {
-          if (readAttachmentSnapshot(root) !== null) checkpointFailure("ownership appeared during ownerless recovery");
-        } else requireAttachmentSnapshot(root, snapshot);
-        requireActivePlan(root, request.planHash);
-      });
+    return resumeFrontier(root, request, input, routing, requireGuards, journalGuard, authority, plan);
+  });
+}
+
+function resumeFrontier(root, request, input, routing, requireGuards, journalGuard, authority, plan) {
+  if (authority === undefined) throw new SupervisorError("RECOVERY_AUTHORIZATION_REQUIRED", "resume");
+  let selected = readRecoveryFrontier(root);
+  if (selected === null) throw new SupervisorError("RECOVERY_FRONTIER_MISSING", "resume");
+  const workflow = resolveWorkflowRoles(root, { requireAcceptance: true });
+  if (selected.frontier.sourceHash !== authority.sourceHash || selected.frontier.workflowHash !== workflow.workflowHash ||
+    selected.frontier.repositoryHash !== readCampaignTransition(root, input).repositoryHash ||
+    selected.frontier.planHash !== request.planHash || selected.frontier.planBytesHash !== transitionFileHash(root, planPath(root), MAX_PLAN_BYTES)) {
+    throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "resume");
+  }
+  if (request.checkpointHash === null && request.frontierHash === undefined) checkpointFailure("ownerless resume requires an explicit frontierHash");
+  let completedResume = null;
+  if (selected.frontier.phase === "active" && selected.frontier.cause === "resume" && selected.frontier.previousHash !== null) {
+    const bytes = readBoundedStateBytes(root, path.join(stateDirectory(root), "recovery", "frontiers", `${selected.frontier.previousHash}.json`), 262_144).bytes;
+    const prepared = requireRecovery(parseWorkflowJson(bytes), "frontier");
+    if (sha256(bytes) === selected.frontier.previousHash && prepared.phase === "resume-prepared" &&
+      prepared.transitionId === selected.frontier.transitionId && prepared.successor?.sessionHash === sessionHash(input) &&
+      prepared.successor.workerAuthorityHash === authority.grantHash && prepared.checkpointHash === request.checkpointHash &&
+      (request.frontierHash === undefined || request.frontierHash === prepared.previousHash)) completedResume = prepared;
+  }
+  const expectedHash = request.frontierHash ?? selected.frontierHash;
+  if (completedResume === null && selected.frontierHash !== expectedHash &&
+    !(selected.frontier.phase === "resume-prepared" && selected.frontier.previousHash === expectedHash)) checkpointFailure("resume frontier reference is stale");
+  let snapshot = readAttachmentSnapshot(root);
+  let attachment = snapshot === null ? null : attachmentFromSnapshot(snapshot);
+  const receipt = request.checkpointHash === null ? null : readCheckpointReceipt(root, request.checkpointHash);
+  if (receipt !== null) {
+    if (receipt.schemaVersion !== 3 || receipt.planHash !== request.planHash || !selected.hashes.includes(receipt.frontierHash) ||
+      selected.frontier.checkpointHash !== request.checkpointHash || receipt.sessionHash === sessionHash(input)) checkpointFailure("checkpoint is historical or is not the current resume lineage");
+    requireCheckpointLedger(root, receipt, request.checkpointHash, journalGuard);
+  }
+  const effective = observeRecoveryEvidence(root, journalGuard, selected.frontier);
+  if (completedResume !== null) {
+    requireFrontierOwner(root, input, selected);
+    if (attachment.claimGeneration !== completedResume.successor.claimGeneration ||
+      attachment.routeGeneration !== completedResume.successor.routeGeneration ||
+      recoveryValueHash(selected.frontier.stopState) !== recoveryValueHash(completedResume.stopState) ||
+      recoveryValueHash(selected.frontier.operations) !== recoveryValueHash(completedResume.operations)) checkpointFailure("completed resume context changed");
+    const recorded = readSessionLedger(root, sessionHash(input), journalGuard, true).records.filter((record) =>
+      record.event === "checkpoint_resumed" && record.checkpointHash === request.checkpointHash &&
+      record.planHash === request.planHash && sameClaim(record, attachment) &&
+      record.sourceSessionHash === (completedResume.owner?.sessionHash ?? sessionHash(input)));
+    if (recorded.length !== 1) checkpointFailure("completed resume observation is unconfirmed");
+    const cachePath = runtimeStatePath(root, input);
+    const cache = existsSync(cachePath) ? parseWorkflowJson(readBoundedStateBytes(root, cachePath, 262_144).bytes) : null;
+    if (validateRecovery(cache, "runtime").length || cache.frontierHash !== selected.frontierHash ||
+      cache.campaignId !== selected.frontier.campaignId || cache.sessionHash !== sessionHash(input) ||
+      cache.claimGeneration !== attachment.claimGeneration || cache.routeGeneration !== attachment.routeGeneration ||
+      recoveryValueHash(cache.stopState) !== recoveryValueHash(selected.frontier.stopState) ||
+      recoveryValueHash(cache.operations) !== recoveryValueHash(selected.frontier.operations)) {
+      persistFrontierCache(root, input, selected, journalGuard);
     }
     requireGuards();
-    const successorSnapshot = readAttachmentSnapshot(root);
-    if (successorSnapshot === null || canonicalJson(attachmentFromSnapshot(successorSnapshot)) !== canonicalJson(successor)) {
-      checkpointFailure("successor ownership changed before route confirmation");
-    }
-    if (successor.routeGeneration !== null) updateSessionLocatorStatus(input, root, successor.routeGeneration, "active", journalGuard, true);
-    const resumed = readSessionLedger(root, successor.sessionHash, journalGuard).records.filter((record) =>
-      record.event === "checkpoint_resumed" && record.checkpointHash === request.checkpointHash &&
-      record.planHash === request.planHash && sameClaim(record, successor));
-    if (resumed.length > 1) checkpointFailure("successor ledger has ambiguous resume observations");
-    if (resumed.length === 0) appendDurableLedger(root, input, "checkpoint_resumed", {
-      checkpointHash: request.checkpointHash, planHash: request.planHash,
-      sourceSessionHash: receipt?.sessionHash ?? successor.sessionHash,
-      routeGeneration: successor.routeGeneration, claimGeneration: successor.claimGeneration,
-      observationStatus: context.operations.status, observationReason: context.operations.reason,
-    }, journalGuard, () => {
-      requireGuards();
-      requireAttachmentSnapshot(root, successorSnapshot);
-    });
-    const confirmed = readAttachment(root);
-    if (canonicalJson(confirmed) !== canonicalJson(successor)) checkpointFailure("successor ownership changed during confirmation");
-    requireActivePlan(root, request.planHash);
+    if (readRecoveryFrontier(root).frontierHash !== selected.frontierHash) checkpointFailure("completed resume frontier changed");
     return { status: "resumed", checkpointHash: request.checkpointHash, planHash: request.planHash,
-      attachmentHash: readAttachmentSnapshot(root).hash, context };
-  });
+      frontierHash: selected.frontierHash, attachmentHash: snapshot.hash,
+      context: checkpointContext(plan, selected.frontier.stopState, effective.operations) };
+  }
+  if (selected.frontier.phase !== "resume-prepared") {
+    if (!["detached", "checkpointed", "reconciled"].includes(selected.frontier.phase)) checkpointFailure("resume requires a detached, checkpointed, or reconciled frontier");
+    if (selected.frontier.phase === "checkpointed") {
+      if (receipt === null || attachment?.status !== "checkpointed" || snapshot.hash !== selected.frontier.owner.attachmentHash ||
+        attachment.checkpointHash !== request.checkpointHash) checkpointFailure("resume requires the exact checkpoint tombstone");
+    } else if (attachment !== null) checkpointFailure("ownership appeared; ownerless resume will not seize it");
+    if (selected.frontier.owner?.sessionHash === sessionHash(input)) checkpointFailure("resume requires a fresh successor session");
+    requireRecoveryBundle(root, 4, "finalization");
+    requireJournalControlBundle(root, input, journalGuard, 1);
+    const successor = { sessionHash: sessionHash(input), sessionRootHash: recoverySessionRootHash(input), routeGeneration: routing.context === null ? null : randomUUID(),
+      claimGeneration: randomUUID(), attachmentHash: null, routeHash: null, markerHash: null, workerAuthorityHash: authority.grantHash };
+    selected = advanceFrontier(root, input, selected, { ...effective, phase: "resume-prepared", cause: "resume",
+      transitionId: randomUUID(), preparedAt: new Date().toISOString(), successor }, journalGuard);
+  } else if (selected.frontier.successor?.sessionHash !== sessionHash(input) || selected.frontier.successor.workerAuthorityHash !== authority.grantHash ||
+    selected.frontier.checkpointHash !== request.checkpointHash) checkpointFailure("resume prepared successor belongs to a different request");
+  const successor = selected.frontier.successor;
+  const context = checkpointContext(plan, selected.frontier.stopState, effective.operations);
+  const detail = { checkpointHash: request.checkpointHash, planHash: request.planHash,
+    sourceSessionHash: selected.frontier.owner?.sessionHash ?? sessionHash(input), routeGeneration: successor.routeGeneration,
+    claimGeneration: successor.claimGeneration, observationStatus: context.operations.coverage === "complete" ? "observed" : "unavailable",
+    observationReason: context.operations.coverage === "complete" ? null : "inherited-observation-unavailable" };
+  prepareJournalAppend(root, sessionHash(input), "checkpoint_resumed", detail, journalGuard);
+  if (attachment?.status === "active" && (attachment.sessionHash !== successor.sessionHash ||
+    attachment.claimGeneration !== successor.claimGeneration || attachment.routeGeneration !== successor.routeGeneration ||
+    attachment.workerAuthorityHash !== authority.grantHash || attachment.campaignId !== selected.frontier.campaignId)) {
+    checkpointFailure("resume found a competing or replaced owner");
+  }
+  const route = bindSessionLocator(input, root, journalGuard, successor.routeGeneration ?? undefined);
+  if (route.conflict || (route.generation ?? null) !== successor.routeGeneration) checkpointFailure("resume successor route conflicts with its persisted generation");
+  persistFrontierCache(root, input, selected, journalGuard);
+  if (attachment?.status !== "active") {
+    const value = { schemaVersion: 4, campaignId: selected.frontier.campaignId, sessionHash: successor.sessionHash, status: "active",
+      routeGeneration: successor.routeGeneration, claimGeneration: successor.claimGeneration, checkpointHash: request.checkpointHash,
+      workerAuthorityHash: authority.grantHash, attachedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    transitionWriteBytes(journalGuard, root, attachmentPath(root), Buffer.from(`${JSON.stringify(value, null, 2)}\n`), MAX_SESSION_LOCATOR_BYTES, false, () => {
+      requireGuards();
+      if (snapshot === null && readAttachmentSnapshot(root) !== null) checkpointFailure("ownership appeared during resume");
+      if (snapshot !== null) requireAttachmentSnapshot(root, snapshot);
+    });
+    snapshot = readAttachmentSnapshot(root);
+    attachment = attachmentFromSnapshot(snapshot);
+  }
+  if (successor.routeGeneration !== null) updateSessionLocatorStatus(input, root, successor.routeGeneration, "active", journalGuard, true);
+  const resumed = readSessionLedger(root, sessionHash(input), journalGuard).records.filter((record) => record.event === "checkpoint_resumed" &&
+    record.checkpointHash === request.checkpointHash && record.planHash === request.planHash && sameClaim(record, attachment));
+  if (resumed.length > 1) checkpointFailure("resume observations conflict");
+  if (resumed.length === 0) appendDurableLedger(root, input, "checkpoint_resumed", detail, journalGuard, requireGuards);
+  const confirmed = readSessionLedger(root, sessionHash(input), journalGuard, true).records.filter((record) =>
+    record.event === "checkpoint_resumed" && record.checkpointHash === request.checkpointHash && sameClaim(record, attachment));
+  if (confirmed.length !== 1) checkpointFailure("resume durable observation is unconfirmed");
+  selected = advanceFrontier(root, input, selected, { ...effective, phase: "active", owner: frontierOwner(root, input), successor: null }, journalGuard);
+  persistFrontierCache(root, input, selected, journalGuard);
+  requireFrontierOwner(root, input, selected);
+  return { status: "resumed", checkpointHash: request.checkpointHash, planHash: request.planHash, frontierHash: selected.frontierHash,
+    attachmentHash: readAttachmentSnapshot(root).hash, context };
 }
 
 export function applyCampaignPlan(cwd, request, authority) {
@@ -4335,27 +5887,65 @@ export function applyCampaignPlan(cwd, request, authority) {
   sessionRequestAuthorities.set(request, authority);
   return withSessionLifecycle(cwd, request, "plan", (root, input, routing, requireGuards, journalGuard) => {
     const existing = readAttachment(root);
-    if (existing === null && loadPlan(root).exists) checkpointFailure("an existing ownerless plan requires explicit resume");
+    let selected = readRecoveryFrontier(root);
+    const freshRetry = selected?.frontier.phase === "resume-prepared" && selected.frontier.cause === "fresh-plan" &&
+      selected.frontier.successor?.sessionHash === sessionHash(input) && selected.frontier.successor.workerAuthorityHash === authority.grantHash &&
+      selected.frontier.stopState.progressHash === canonicalPlanHash(request.plan);
+    if (existing === null && loadPlan(root).exists && !freshRetry) checkpointFailure("an existing ownerless plan requires explicit resume");
     if (existing !== null && (existing.sessionHash !== sessionHash(input) || existing.workerAuthorityHash !== authority.grantHash)) {
       checkpointFailure("plan transition requires the current owning Worker capability");
     }
+    if (selected === null && existing !== null) throw new SupervisorError("RECOVERY_FRONTIER_MISSING", "admission");
+    if (selected !== null && !freshRetry) requireFrontierOwner(root, input, selected);
+    requireRecoveryBundle(root, 5);
     prepareJournalAppend(root, sessionHash(input), "plan_transitioned", {
       planHash: canonicalPlanHash(request.plan), priorPlanHash: request.expected.planHash, authorityHash: authority.grantHash,
       routeGeneration: routing.context === null ? existing?.routeGeneration ?? null
         : existing?.routeGeneration ?? "00000000-0000-4000-8000-000000000000",
       claimGeneration: existing?.claimGeneration ?? "00000000-0000-4000-8000-000000000000",
     }, journalGuard);
+    if (selected === null) {
+      const runtime = path.join(stateDirectory(root), "runtime");
+      const checkpoints = path.join(stateDirectory(root), "checkpoints");
+      for (const directory of [runtime, checkpoints]) {
+        assertSafeStatePath(root, directory);
+        if (existsSync(directory) && readdirSync(directory).length !== 0) throw new SupervisorError("RECOVERY_FRONTIER_MISSING", "admission");
+      }
+      if (readJournalInventory(root, journalGuard).names.length !== 0) throw new SupervisorError("RECOVERY_FRONTIER_MISSING", "admission");
+      const successor = { sessionHash: sessionHash(input), sessionRootHash: recoverySessionRootHash(input), routeGeneration: routing.context === null ? null : randomUUID(),
+        claimGeneration: randomUUID(), attachmentHash: null, routeHash: null, markerHash: null, workerAuthorityHash: authority.grantHash };
+      selected = publishFrontier(root, input, {
+        schemaVersion: 1, kind: "recovery-frontier", campaignId: randomUUID(), sequence: 0, previousHash: null, transitionId: randomUUID(), preparedAt: new Date().toISOString(),
+        phase: "resume-prepared", repositoryHash: readCampaignTransition(root, input).repositoryHash, sourceHash: authority.sourceHash,
+        workflowHash: resolveWorkflowRoles(root, { requireAcceptance: true }).workflowHash, planHash: null, planBytesHash: null,
+        owner: null, successor, stopState: freshStopState(canonicalPlanHash(request.plan)),
+        operations: { coverage: "complete", orphans: [], uncorrelatedCompletions: exactCounter(0) }, ledger: { coverage: "complete", segments: [] },
+        checkpointHash: null, authorizationHash: null, cause: "fresh-plan",
+      }, null, journalGuard);
+    }
+    if (selected.frontier.phase === "resume-prepared") {
+      input.recoveryCampaignId = selected.frontier.campaignId;
+      input.recoverySuccessor = selected.frontier.successor;
+    }
     const claim = claimSession(root, input, false, journalGuard);
     if (!claim.claimed || claim.conflict) checkpointFailure("plan transition could not claim its expected source state");
     const bytes = Buffer.from(`${JSON.stringify(request.plan, null, 2)}\n`);
     transitionWriteBytes(journalGuard, root, planPath(root), bytes, MAX_PLAN_BYTES, false, requireGuards);
     const attachment = readAttachment(root);
     promoteSessionClaim(root, input, attachment.routeGeneration, journalGuard);
-    const observation = readCampaignTransition(root, input);
+    let observation = readCampaignTransition(root, input);
     appendDurableLedger(root, input, "plan_transitioned", {
       planHash: observation.planHash, priorPlanHash: request.expected.planHash,
       authorityHash: authority.grantHash, routeGeneration: attachment.routeGeneration, claimGeneration: attachment.claimGeneration,
     }, journalGuard, requireGuards);
+    selected = advanceFrontier(root, input, selected, {
+      phase: "active", cause: selected.frontier.cause === "fresh-plan" ? "fresh-plan" : "plan-progress",
+      owner: frontierOwner(root, input), successor: null, planHash: observation.planHash, planBytesHash: observation.planBytesHash,
+      stopState: observeProgress(selected.frontier.stopState, observation.planHash),
+      ...observeRecoveryEvidence(root, journalGuard, selected.frontier),
+    }, journalGuard);
+    persistFrontierCache(root, input, selected, journalGuard);
+    observation = readCampaignTransition(root, input);
     return { schemaVersion: 1, kind: "campaign-transition-outcome", status: "applied", operation: "plan",
       previousHash: sha256(canonicalJson(request.expected)), observation };
   });
@@ -4421,8 +6011,14 @@ export function handlePluginHook(input, eventName, pluginRoot) {
   let inspectedTargets;
   let protectedMutation = true;
   let ownedSessionObserved = false;
+  let campaignObserved = false;
   try {
     if (process.platform === "win32") resetWindowsPathChecks();
+    const command = (input?.tool_input ?? input?.toolArgs ?? input?.toolInput)?.command;
+    if (eventName === "PreToolUse" && typeof command === "string" && /(?:^|[\s'"])recovery['"]?\s+['"]?authorize(?:[\s'"]|$)/i.test(command)) {
+      return failedSupervisorOutput(preToolDecision(input, "deny", "Recovery authorization is a direct operator console action, never an ordinary model-admitted tool."),
+        supervisorFailure("RECOVERY_AUTHORIZATION_REQUIRED", "admission"));
+    }
     if (!isFullyQualifiedRepositoryCwd(cwd) || !isLocalRepositoryPath(cwd)) {
       return eventName === "PreToolUse"
         ? preToolDecision(input, "deny", "Supervised Worker denied the invocation because the hook payload did not provide an absolute repository cwd.") : {};
@@ -4432,13 +6028,39 @@ export function handlePluginHook(input, eventName, pluginRoot) {
     cwd = routing.roots[0] ?? cwd;
     inspectedTargets = completeToolTargetInspection(targets, cwd);
     protectedMutation = inspectedTargets.unsafe || routing.hasUnqualifiedTarget || routing.roots.length > 1 ||
-      toolTouchesState(inspectedTargets, cwd) || toolTouchesGitMetadata(inspectedTargets, cwd) || toolTouchesWorkflowConfig(inspectedTargets, cwd);
+      toolTouchesState(inspectedTargets, cwd) || toolTouchesGitMetadata(inspectedTargets, cwd) || toolTouchesWorkflowConfig(inspectedTargets, cwd) ||
+      toolTouchesPublication(inspectedTargets, cwd);
+    if (toolTouchesPublication(inspectedTargets, cwd)) {
+      return eventName === "PreToolUse" ? preToolDecision(input, "deny",
+        "Canonical release and quarantine evidence is helper-owned; use campaign publish or one explicitly authorized recovery action, not a direct file edit.") : {};
+    }
     const lifecycleEdit = toolTouchesState(inspectedTargets, cwd) && inspectedTargets.targets.some((target) =>
       !targetWithin(target, path.join(stateDirectory(cwd), "handoffs"), canonicalizeDeepestExisting(path.join(stateDirectory(cwd), "handoffs"))) &&
       !targetWithin(target, path.join(stateDirectory(cwd), "runtime", "review-attempts"), canonicalizeDeepestExisting(path.join(stateDirectory(cwd), "runtime", "review-attempts"))));
     if (lifecycleEdit && ["PostToolUse", "PostToolUseFailure"].includes(eventName)) return {};
+    campaignObserved = loadPlan(cwd).exists;
     const capability = owningSessionCapability(cwd, input);
     if (capability === null) {
+      const snapshot = readAttachmentSnapshot(cwd);
+      const owner = snapshot === null ? null : attachmentFromSnapshot(snapshot);
+      const frontier = campaignObserved ? readRecoveryFrontier(cwd) : null;
+      if (campaignObserved && (owner === null || owner.status === "checkpointed" ||
+        RECOVERY_PHASES_PREPARED.includes(frontier?.frontier.phase) || (owner.schemaVersion === 4 && frontier === null))) {
+        const authority = verifyWorkerAuthority(cwd, input, pluginRoot);
+        const nodePath = parseWorkflowJson(readFileSync(path.join(pluginRoot, "install-record.json"))).nodePath;
+        const request = doctorInvocationRequest(input, pluginRoot, nodePath);
+        if (request && ["diagnose", "propose-recovery", "recover-authorized"].includes(request.operation)) {
+          if (request.operation === "recover-authorized") {
+            const captured = readRecoveryAuthorization(cwd, request.authorizationHash);
+            requireStoredRecoveryAuthorization(cwd, recoverySessionInput(request), request.authorizationHash, captured, authority);
+          }
+          return eventName === "PreToolUse" ? preToolDecision(input, "allow",
+            "Exact provenance-bound recovery request admitted without Worker ownership; execution still enforces the operator authorization and selected snapshot.") : {};
+        }
+        if (eventName === "PreToolUse") return failedSupervisorOutput(preToolDecision(input, "deny",
+          "An ownerless campaign requires explicit frontier-bound resume. Only exact read-only recovery requests or a separately authorized action are admitted."),
+        supervisorFailure("RECOVERY_FRONTIER_MISSING", "admission"));
+      }
       return eventName === "PreToolUse" && protectedMutation
         ? preToolDecision(input, "deny", "Protected lifecycle and authority files require a validated owning Worker capability and their typed transition entry point.") : {};
     }
@@ -4450,16 +6072,34 @@ export function handlePluginHook(input, eventName, pluginRoot) {
     requireVerifiedWorkerAuthority(authority, capability.root, input);
     const doctorNodePath = authority.assurance === "local-scoped"
       ? parseWorkflowJson(readFileSync(path.join(pluginRoot, "install-record.json"))).nodePath : null;
+    const doctorRequest = authority.assurance === "local-scoped" ? doctorInvocationRequest(input, pluginRoot, doctorNodePath) : null;
     if (authority.assurance === "local-scoped" && pathEquals(input.cwd, capability.root) &&
-      ["PreToolUse", "PostToolUse", "PostToolUseFailure"].includes(eventName) && doctorInvocationRequest(input, pluginRoot, doctorNodePath) !== null) {
+      ["PreToolUse", "PostToolUse", "PostToolUseFailure"].includes(eventName) && doctorRequest !== null) {
       requireVerifiedWorkerAuthority(authority, capability.root, input);
+      if (doctorRequest.operation === "recover-authorized") {
+        const captured = readRecoveryAuthorization(capability.root, doctorRequest.authorizationHash);
+        requireStoredRecoveryAuthorization(capability.root, recoverySessionInput(doctorRequest), doctorRequest.authorizationHash, captured, authority);
+      }
       return eventName === "PreToolUse" ? preToolDecision(input, "allow",
         "Exact immutable Doctor control-plane request admitted for the current Worker; its incident transaction enforces authority, capability, and recovery evidence. Ordinary tools remain subject to lifecycle exclusion.") : {};
     }
+    if (eventName === "PreToolUse") {
+      const selected = requireFrontierOwner(capability.root, input);
+      if (selected.frontier.sourceHash !== authority.sourceHash ||
+        selected.frontier.workflowHash !== resolveWorkflowRoles(capability.root, { requireAcceptance: true }).workflowHash) {
+        throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "admission");
+      }
+    }
     return handleHook(input, eventName, input.cwd, lifecycleEdit
       ? "Protected lifecycle files require their typed transition entry point; direct file edits are denied." : null, authority);
-  } catch {
-    if (eventName === "PreToolUse" && (protectedMutation || ownedSessionObserved)) {
+  } catch (error) {
+    const failure = failureFromError(error, eventName === "PreToolUse" ? "admission" : "observation");
+    if (failure !== null) {
+      const output = eventName === "PreToolUse" ? preToolDecision(input, "deny", renderSupervisorFailure(failure))
+        : eventName === "Stop" ? allowStopOutput(input, renderSupervisorFailure(failure)) : contextOutput(input, eventName, renderSupervisorFailure(failure));
+      return failedSupervisorOutput(output, failure);
+    }
+    if (eventName === "PreToolUse" && (protectedMutation || ownedSessionObserved || campaignObserved)) {
       return preToolDecision(input, "deny", "Campaign execution requires unchanged accepted authority, verified ownership, and immutable plugin provenance.");
     }
     if (ownedSessionObserved) {
@@ -4493,11 +6133,6 @@ function releaseStop(cwd, input, event, detail, output, journalGuard) {
   journalGuard(cwd);
   const intendedAttachment = readAttachmentSnapshot(cwd);
   try {
-    transitionMutation(journalGuard, () => removeStateFile(cwd, runtimeStatePath(cwd, input)));
-  } catch {
-    // Runtime counters are recoverable; ownership cleanup remains authoritative.
-  }
-  try {
     if (!detachSession(cwd, input, intendedAttachment, journalGuard)) {
       throw new Error("expected attachment disappeared during Stop cleanup");
     }
@@ -4518,6 +6153,7 @@ function handleStop(input, cwd, journalGuard) {
   const attachment = attachedRecord(cwd, input);
   if (attachment === null) return {};
   journalGuard(cwd);
+  if (recoveryHeadReference(cwd) !== null) return handleFrontierStop(input, cwd, journalGuard);
   const planResult = loadPlan(cwd);
   if (attachment.status === "provisional") {
     if (!planResult.exists) {
@@ -4582,6 +6218,11 @@ function handleStop(input, cwd, journalGuard) {
     }
   }
   const recursiveStop = input?.stop_hook_active === true;
+  if (stateWasInvalid || !stateExists) {
+    return failedSupervisorOutput(allowStopOutput(input,
+      "Legacy Stop counters lack a current authoritative frontier. Stop is allowed without resetting counters or retiring ownership; preserve the source and use explicit recovery diagnosis."),
+    supervisorFailure("RECOVERY_FRONTIER_MISSING", "observation"));
+  }
   if (recursiveStop && stateWasInvalid) {
     const reason =
       "Supervised Worker released the Stop gate because its bounded runtime state was invalid. The durable plan remains incomplete; do not rely on this run as queue completion.";
@@ -4593,15 +6234,6 @@ function handleStop(input, cwd, journalGuard) {
       allowStopOutput(input, reason),
       journalGuard,
     );
-  }
-  if (stateWasInvalid) {
-    transitionMutation(journalGuard, () => removeStateFile(cwd, filePath));
-    state = {
-      schemaVersion: 2,
-      progressHash,
-      sameProgressBlocks: 0,
-      totalBlocks: 0,
-    };
   }
   if (state.progressHash !== progressHash) {
     state.progressHash = progressHash;
@@ -4636,6 +6268,43 @@ function handleStop(input, cwd, journalGuard) {
       ? `${stopReason(planResult)} This is the final bounded continuation before an unchanged Stop is released. If no measurable progress is possible, the final response must state that queue completion remains unverified.`
       : stopReason(planResult);
   return blockOutput(input, "Stop", reason);
+}
+
+function handleFrontierStop(input, cwd, journalGuard) {
+  try {
+    const selected = requireFrontierOwner(cwd, input);
+    const result = loadPlan(cwd);
+    if (!result.exists || result.errors.length) throw new SupervisorError("RECOVERY_LINEAGE_AMBIGUOUS", "observation");
+    if (result.plan.mode === "inactive" || isComplete(result.plan)) {
+      return releaseFrontierStop(cwd, input, journalGuard, result.plan.mode === "inactive" ? "stop-inactive" : "stop-complete");
+    }
+    const decision = decideStop(selected.frontier.stopState, canonicalPlanHash(result.plan));
+    if (decision.decision === "allow") return releaseFrontierStop(cwd, input, journalGuard, decision.cause, decision.stopState);
+    requireRecoveryBundle(cwd, 2);
+    const committed = advanceFrontier(cwd, input, selected, { phase: "active", cause: decision.cause, transitionId: randomUUID(),
+      stopState: decision.stopState, ...observeRecoveryEvidence(cwd, journalGuard, selected.frontier) }, journalGuard);
+    persistFrontierCache(cwd, input, committed, journalGuard);
+    const reason = decision.stopState.sameProgressBlocks.value >= MAX_SAME_PROGRESS_BLOCKS
+      ? `${stopReason(result)} This is the final bounded continuation before an unchanged Stop is released. If no measurable progress is possible, the final response must state that queue completion remains unverified.`
+      : stopReason(result);
+    const output = blockOutput(input, "Stop", reason);
+    if (!appendLedger(cwd, input, "stop_decision", { frontierHash: committed.frontierHash, decision: "block", cause: decision.cause }, journalGuard)) {
+      return failedSupervisorOutput({ ...output, frontierHash: committed.frontierHash },
+        supervisorFailure("JOURNAL_OBSERVATION_UNCONFIRMED", "observation", [committed.frontierHash]));
+    }
+    return { ...output, frontierHash: committed.frontierHash };
+  } catch (error) {
+    const failure = failureFromError(error, "frontier-publication") ?? supervisorFailure("RECOVERY_PERSISTENCE_UNCONFIRMED", "frontier-publication");
+    return failedSupervisorOutput(allowStopOutput(input, renderSupervisorFailure(failure)), failure);
+  }
+}
+
+function releaseFrontierStop(cwd, input, journalGuard, cause, stopState = null) {
+  const selected = detachWithFrontier(cwd, input, journalGuard, cause, stopState);
+  const recorded = appendLedger(cwd, input, "stop_decision", { frontierHash: selected.frontierHash, decision: "allow", cause }, journalGuard);
+  const output = { ...allowStopOutput(input, "Stop is allowed. The exact source was detached with preserved recovery context; this is not a checkpoint or externally verified completion."),
+    release: { status: "detached", frontierHash: selected.frontierHash, journalRecorded: recorded } };
+  return recorded ? output : failedSupervisorOutput(output, supervisorFailure("JOURNAL_OBSERVATION_UNCONFIRMED", "observation", [selected.frontierHash]));
 }
 
 function handleHookUnsafe(input, eventName, cwd, inspectedTargets, journalGuard) {
@@ -4688,6 +6357,7 @@ function handleHookUnsafe(input, eventName, cwd, inspectedTargets, journalGuard)
           "Supervised Worker denied an agent file edit to human-managed .github/supervised-worker.json role authority.",
         );
       }
+      if (toolTouchesPublication(inspectedTargets, cwd)) return preToolDecision(input, "deny", "Canonical release and quarantine evidence requires its guarded helper entry point.");
       if (!touchesState) return {};
       assertSafeStatePath(cwd, touchesPlan ? planPath(cwd) : stateDirectory(cwd));
       if (sessionHash(input) === null) {
@@ -4860,7 +6530,7 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
     const protectedMutation = ["PreToolUse", "PostToolUse", "PostToolUseFailure"].includes(eventName) &&
       (preliminaryTargets.unsafe || protectedRouting.hasUnqualifiedTarget ||
       protectedRouting.roots.length > 0 || toolTouchesState(preliminaryTargets, cwd) ||
-      toolTouchesGitMetadata(preliminaryTargets, cwd) || toolTouchesWorkflowConfig(preliminaryTargets, cwd));
+      toolTouchesGitMetadata(preliminaryTargets, cwd) || toolTouchesWorkflowConfig(preliminaryTargets, cwd) || toolTouchesPublication(preliminaryTargets, cwd));
     let capability = null;
     try {
       capability = owningSessionCapability(cwd, input);
@@ -4926,6 +6596,9 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
     } else {
       journalGuard(observation.root);
       effectiveCwd = observation.root;
+      // A hook's observation is inferred, not a caller-supplied CAS request.
+      // Capture it under exclusion after a legitimate same-owner peer finishes.
+      transitionExpected = readCampaignTransition(effectiveCwd, input);
     }
     const inspectedTargets = completeToolTargetInspection(preparedTargets, effectiveCwd);
     if (capability !== null) requireOwningSessionCapability(capability, input);
@@ -4949,17 +6622,20 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
           ? preToolDecision(input, "deny", forcedDenial)
           : handleHookUnsafe(input, eventName, effectiveCwd, inspectedTargets, journalGuard);
         const operation = eventName === "Stop" ? "stop" : eventName === "PreToolUse" ? "claim" : "promote";
-        const output = repositoryLocks.length === 0 ? execute()
-          : withCampaignTransition(operation, effectiveCwd, input, transitionExpected, journalGuard, execute);
-        if (eventName === "PreToolUse") {
-          if (guarded) attempt = captureToolAttempt(effectiveCwd, input, journalGuard);
-          if (output.permissionDecision === "deny") {
-            return deniedToolOutput(effectiveCwd, input, attempt, output.permissionDecisionReason, journalGuard);
+        const executeAndObserve = () => {
+          const output = execute();
+          if (eventName === "PreToolUse") {
+            if (guarded) attempt = captureToolAttempt(effectiveCwd, input, journalGuard);
+            if (output.permissionDecision === "deny") {
+              return deniedToolOutput(effectiveCwd, input, attempt, output.permissionDecisionReason, journalGuard);
+            }
+            recordToolStart(effectiveCwd, input, journalGuard, attempt);
           }
-          recordToolStart(effectiveCwd, input, journalGuard, attempt);
-        }
-        if (guarded) journalGuard(effectiveCwd);
-        return output;
+          if (guarded) journalGuard(effectiveCwd);
+          return output;
+        };
+        return repositoryLocks.length === 0 && attachment?.schemaVersion !== 4 ? executeAndObserve()
+          : withCampaignTransition(operation, effectiveCwd, input, transitionExpected, journalGuard, executeAndObserve);
       } catch (error) {
         if (eventName !== "PreToolUse") throw error;
         if (attempt === null && guarded && attachment !== null) {
@@ -4970,10 +6646,12 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
             attempt = null;
           }
         }
-        return deniedToolOutput(effectiveCwd, input, attempt,
+        const failure = failureFromError(error, "admission");
+        const denial = deniedToolOutput(effectiveCwd, input, attempt,
           error?.runLedgerReason === "run-ledger-limit-exceeded"
             ? "Supervised Worker journal storage limit reached; the tool was not admitted. Preserve existing journals and revalidate aggregate byte and physical-file capacity before recovery."
-            : "Supervised Worker could not durably admit the tool start or denied retry. Inspect local ledger state before retrying.", journalGuard);
+            : "Supervised Worker could not durably admit the tool start or denied retry. Inspect local ledger state before retrying.", journalGuard, failure);
+        return failure === null || trustedSupervisorFailure(denial) !== null ? denial : failedSupervisorOutput(denial, failure);
       }
     };
     if (authority?.assurance === "local-scoped" && observation !== null && attachment?.status === "active" &&
@@ -4994,6 +6672,9 @@ export function handleHook(input, eventName, cwd = input?.cwd, forcedDenial = nu
   } catch (error) {
     const lifecycleError = error instanceof LifecycleError ? error : null;
     const report = (output) => {
+      const failure = failureFromError(error, eventName === "PreToolUse" ? "admission" : "observation") ??
+        failureFromError(error?.cause, eventName === "PreToolUse" ? "admission" : "observation");
+      if (failure !== null) return failedSupervisorOutput(output, failure);
       if (lifecycleError !== null && lifecycleError.diagnostics.length > 0 && lifecycleError.diagnostics.length <= 16 &&
         lifecycleError.diagnostics.every((diagnostic) => validateLifecycle(diagnostic, "diagnostic").length === 0)) {
         supervisorFailures.set(output, Object.freeze({ diagnostics: structuredClone(lifecycleError.diagnostics) }));
@@ -5044,9 +6725,11 @@ export function releaseAttachment(cwd, expected = undefined, request = {}, autho
       requireGuards();
       requireOwningSessionCapability(capability, input);
       requireAttachmentSnapshot(root, capability.snapshot);
-      transitionMutation(journalGuard, () => removeStateFile(root, runtimeStatePath(root, input)));
-      if (!detachSession(root, input, capability.snapshot, journalGuard)) checkpointFailure("release lost its expected owning attachment");
-      return { released: true, message: "Released the owning session attachment and route." };
+      const selected = detachWithFrontier(root, input, journalGuard, "explicit-release");
+      const recorded = appendLedger(root, input, "stop_decision", { frontierHash: selected.frontierHash, decision: "allow", cause: "explicit-release" }, journalGuard);
+      return { released: true, status: "detached", frontierHash: selected.frontierHash, journalRecorded: recorded,
+        ...(recorded ? {} : { failure: supervisorFailure("JOURNAL_OBSERVATION_UNCONFIRMED", "observation", [selected.frontierHash]) }),
+        message: "Released the owning session attachment and route with preserved recovery context." };
     });
   }
   if (process.platform === "win32") resetWindowsPathChecks();
@@ -5061,6 +6744,7 @@ export function releaseAttachment(cwd, expected = undefined, request = {}, autho
   assertSafeStatePath(cwd, filePath);
   const intended = readAttachmentSnapshot(cwd);
   if (intended === null) return { released: false, message: "No attachment found." };
+  if (recoveryHeadReference(cwd) !== null) throw new SupervisorError("RECOVERY_AUTHORIZATION_REQUIRED", "detach");
   const transitionExpected = expected ?? readCampaignTransition(cwd, request);
   windowsPathChecksMaySpawn = false;
   const releaseContext = createLifecycleReleaseContext(() => ({ roots: [resolvedCwd], session: null }));
@@ -5081,13 +6765,7 @@ export function releaseAttachment(cwd, expected = undefined, request = {}, autho
       } catch {
         // Explicit release may remove malformed local ownership state, but never a link.
       }
-      try {
-        if (attachment) {
-          transitionMutation(journalGuard, () => removeStateFile(cwd, path.join(stateDirectory(cwd), "runtime", `${attachment.sessionHash}.json`)));
-        }
-      } catch {
-        // Runtime state is optional; attachment release is the authoritative action.
-      }
+      if (attachment === null || attachment.routeGeneration !== null) checkpointFailure("legacy release requires provable unrouted ownership; preserve unknown or routed source evidence");
       removeAttachmentSnapshot(cwd, intended, journalGuard);
       return { released: true, message: "Released the stale session attachment." };
     });
@@ -5140,6 +6818,8 @@ function requireRunLedgerRecord(record, expectedSession) {
     throw runLedgerFailure("run-ledger-invalid");
   }
   const hexadecimal = (value) => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+  if (record.event === "stop_decision" && (!hexadecimal(record.frontierHash) || !["block", "allow"].includes(record.decision) ||
+    validateRecovery(record.cause, "cause").length > 0)) throw runLedgerFailure("run-ledger-invalid");
   if (Object.hasOwn(record, "planHash") && !hexadecimal(record.planHash) &&
     !(record.event === "tool_denied" && record.planHash === null)) {
     throw runLedgerFailure("run-ledger-invalid");
@@ -5444,6 +7124,22 @@ function checkpointStatus(cwd, journalGuard) {
   journalGuard(cwd);
   const snapshot = readAttachmentSnapshot(cwd);
   const attachment = snapshot === null ? null : attachmentFromSnapshot(snapshot);
+  const selected = readRecoveryFrontier(cwd);
+  if (selected !== null) {
+    const recoveryCapacity = assessRecoveryCapacity(recoveryStoreUsage(cwd), []);
+    let currentJournalCapacity = null;
+    try { currentJournalCapacity = journalCapacity(cwd, journalGuard); } catch { /* The operation observation below reports unavailable journal evidence. */ }
+    return {
+      attachmentHash: snapshot?.hash ?? null,
+      attachment: attachment === null ? null : {
+        status: attachment.status, sessionHash: attachment.sessionHash, routeGeneration: attachment.routeGeneration,
+        claimGeneration: attachment.claimGeneration, checkpointHash: attachment.checkpointHash,
+      },
+      frontierHash: selected.frontierHash, recoveryPhase: selected.frontier.phase, campaignId: selected.frontier.campaignId,
+      stopState: selected.frontier.stopState, operations: observeRecoveryEvidence(cwd, journalGuard, selected.frontier).operations,
+      recoveryCapacity, journalCapacity: currentJournalCapacity,
+    };
+  }
   let operations;
   try {
     if (attachment?.checkpointHash) {

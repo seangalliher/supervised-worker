@@ -955,7 +955,23 @@ function readHandoffSnapshotFile(filePath) {
 }
 
 const HANDOFF_IMPLEMENTATION_FILES = [
-  "./handoff.mjs", "./workflow.mjs", "./core.mjs", "./cli.mjs", "../schemas/lifecycle.schema.json",
+  "./handoff.mjs", "./workflow.mjs", "./ci-policy.mjs", "./core.mjs", "./cli.mjs", "../schemas/lifecycle.schema.json",
+  "./recovery-state.mjs", "./supervisor-diagnostics.mjs", "./journal-capacity.mjs", "./doctor-invocation.mjs",
+  "./recovery-authority.mjs", "./recovery.mjs",
+  "./artifact-publication.mjs",
+  "../schemas/recovery.schema.json", "../schemas/supervisor-failure.schema.json",
+  "../schemas/doctor-invocation.schema.json", "../schemas/artifact-publication.schema.json",
+  "../schemas/checkpoint.schema.json", "../schemas/transition.schema.json", "../schemas/doctor.schema.json",
+  "../schemas/campaign-release.schema.json",
+  "./authority.mjs", "./campaign-release.mjs", "./campaign.mjs", "./doctor-evidence.mjs",
+  "./doctor-promotion.mjs", "./doctor-repair.mjs", "./doctor-rescue.mjs", "./doctor-routing.mjs",
+  "./doctor-state.mjs", "./doctor.mjs", "./github-queue.mjs", "./hook-launcher.mjs",
+  "./hook-manifest.mjs", "./install.mjs", "./release-doctor-history.mjs", "./release-inputs.mjs", "./release-recovery.mjs",
+  "./rescue.mjs", "./standards.mjs",
+  "../schemas/episode.schema.json", "../schemas/local-campaign-receipt.schema.json",
+  "../schemas/model-receipt.schema.json", "../schemas/plan.schema.json",
+  "../schemas/policy-proposal.schema.json", "../schemas/procedure.schema.json",
+  "../schemas/role-handoff.schema.json", "../schemas/workflow.schema.json",
 ].map((relative) => fileURLToPath(new URL(relative, import.meta.url)));
 
 function handoffImplementationHash() {

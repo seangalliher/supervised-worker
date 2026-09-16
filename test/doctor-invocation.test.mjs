@@ -54,8 +54,10 @@ test("Doctor invocation refuses command additions, substitution, alternative exe
 });
 
 test("Doctor request quote escaping preserves data without introducing shell operations", () => {
-  const value = { ...request, diagnosticHash: "quoted' data; $(not-a-command) `literal`" };
-  assert.deepEqual(doctorInvocationRequest(invocation(commandFor(JSON.stringify(value))), root), value);
+  // The old assertion accepted arbitrary text in an inspect diagnosticHash. The closed
+  // operation contract forbids that field; exercise quoting in the permitted locator.
+  const value = { ...request, transcript_path: path.resolve("quoted' data; $(not-a-command) `literal`.jsonl") };
+  assert.deepEqual(doctorInvocationRequest({ ...invocation(commandFor(JSON.stringify(value))), transcript_path: value.transcript_path }, root), value);
   const unsafe = commandFor(JSON.stringify(value)).slice(0, -1) + "' ; echo unsafe";
   assert.equal(doctorInvocationRequest(invocation(unsafe), root), null);
 });

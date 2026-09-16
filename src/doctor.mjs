@@ -106,6 +106,22 @@ function lifecycleSelector(input, scope) {
   return { scope, ...(input.transcript_path === undefined ? {} : { session_id: input.session_id, transcript_path: input.transcript_path }) };
 }
 
+export function inspectDoctorScopes(cwd, input) {
+  let prerequisite = null;
+  return ["repository", ...(input.transcript_path === undefined ? [] : ["session"]), "journal"].map((scope) => {
+    if (prerequisite !== null) return requireDoctor({ schemaVersion: 1, kind: "doctor-scope-observation",
+      scope, status: "deferred", owner: null, snapshotHash: null, snapshot: null, prerequisite }, "scopeObservation");
+    const inspection = inspectLifecycleLock(cwd, lifecycleSelector(input, scope));
+    const owner = inspection.status === "absent" ? null : inspection.diagnostics[0]?.code === "LIFECYCLE_OWNER_DEAD" ? "dead"
+      : inspection.diagnostics[0]?.code === "LIFECYCLE_OWNER_LIVE" ? "live" : "unknown";
+    const value = requireDoctor({ schemaVersion: 1, kind: "doctor-scope-observation", scope,
+      status: inspection.status, owner, snapshotHash: inspection.expected === null ? null : doctorHash(inspection.expected),
+      snapshot: inspection.expected, prerequisite: null }, "scopeObservation");
+    if (inspection.status !== "absent") prerequisite = scope;
+    return value;
+  });
+}
+
 function applyInternalAction(cwd, input, intent, authority, records, incident, hostAdapter, authorize, artifact) {
   try {
     authorize();
@@ -137,22 +153,23 @@ function applyInternalAction(cwd, input, intent, authority, records, incident, h
   }
   if (intent.action === "create-repair") return { status: "succeeded", reason: "DOCTOR_REPAIR_CREATED", values: [createDoctorRepairAttempt(cwd, policy(cwd), intent, authorize)] };
   if (["diagnose", "inspect"].includes(intent.action)) {
-    const inspections = ["repository", ...(input.transcript_path === undefined ? [] : ["session"])].map((scope) => inspectLifecycleLock(cwd, lifecycleSelector(input, scope)));
+    const inspections = inspectDoctorScopes(cwd, input);
     if (inspections.some((value) => value.status === "unconfirmed")) return { status: "blocked", reason: "DOCTOR_OWNER_UNVERIFIABLE", values: inspections };
-    return { status: "succeeded", reason: "DOCTOR_INSPECTED", values: inspections };
+    return { status: "succeeded", reason: "DOCTOR_INSPECTED", values: [...inspections, ...inspections.filter((value) => value.snapshot !== null).map((value) => value.snapshot)] };
   }
   if (intent.action === "recover") {
-    const inspections = ["repository", ...(input.transcript_path === undefined ? [] : ["session"])].map((scope) => inspectLifecycleLock(cwd, lifecycleSelector(input, scope)));
-    const dead = inspections.filter((value) => value.status === "inspected" && value.diagnostics[0]?.code === "LIFECYCLE_OWNER_DEAD");
-    if (dead.length !== 1 || inspections.some((value) => value.status === "unconfirmed")) return { status: "blocked", reason: "DOCTOR_EXACT_DEAD_OWNER_REQUIRED", values: inspections };
-    const selected = dead[0];
-    if (!intent.inputHashes.includes(doctorHash(selected))) return { status: "conflict", reason: "DOCTOR_RECOVERY_SNAPSHOT_CHANGED", values: inspections };
+    const inspections = inspectDoctorScopes(cwd, input);
+    const selected = inspections.find((value) => value.status !== "absent");
+    if (selected?.status !== "inspected" || selected.owner !== "dead") return { status: "blocked", reason: "DOCTOR_EXACT_DEAD_OWNER_REQUIRED", values: inspections };
+    if (intent.recovery?.scope !== selected.scope || intent.recovery.snapshotHash !== selected.snapshotHash ||
+      !intent.inputHashes.includes(selected.snapshotHash)) return { status: "conflict", reason: "DOCTOR_RECOVERY_SNAPSHOT_CHANGED", values: inspections };
     const grant = issueRescueCapability(cwd, { session_id: input.session_id,
-      ...(input.transcript_path === undefined ? {} : { transcript_path: input.transcript_path }), scope: selected.expected.scope,
-      incidentId: intent.binding.incidentId, expiresAt: new Date(Date.now() + 600_000).toISOString() }, authority);
+      ...(input.transcript_path === undefined ? {} : { transcript_path: input.transcript_path }), scope: selected.scope,
+      incidentId: intent.binding.incidentId, expiresAt: new Date(Date.now() + 600_000).toISOString() }, authority, selected.snapshot);
     const result = rescueLifecycle(cwd, { session_id: input.session_id, ...(input.transcript_path === undefined ? {} : { transcript_path: input.transcript_path }),
       capability: grant.capability, incidentId: grant.incidentId, snapshotHash: grant.snapshotHash, action: "recover" });
-    return { status: ["recovered", "already-recovered"].includes(result.status) ? "succeeded" : "unknown", reason: "DOCTOR_RECOVERY_OBSERVED", values: [result] };
+    return { status: ["recovered", "already-recovered"].includes(result.status) ? "succeeded" : "unknown", reason: "DOCTOR_RECOVERY_OBSERVED",
+      values: [result, ...inspectDoctorScopes(cwd, input)] };
   }
   if (["cancel", "revoke"].includes(intent.action)) return { status: "cancelled", reason: "DOCTOR_CANCELLED", values: [] };
   return { status: "blocked", reason: "DOCTOR_HOST_ACTION_UNAVAILABLE", values: [] };
@@ -160,6 +177,7 @@ function applyInternalAction(cwd, input, intent, authority, records, incident, h
 
 export function executeDoctorIntent(cwd, input, intent, authority, hostAdapter = null) {
   requireDoctor(intent, "repairIntent");
+  if (intent.action === "recover" && intent.schemaVersion !== 2) throw new Error("DOCTOR_EXACT_DEAD_OWNER_REQUIRED");
   const incidentId = intent.binding.incidentId;
   return transaction(cwd, input, incidentId, authority, ({ root, incident, records, commit, authorize: authorizeOwner, artifact }) => {
     const capability = records.find((record) => record.kind === "doctor-capability" && doctorHash(record) === intent.capabilityHash);

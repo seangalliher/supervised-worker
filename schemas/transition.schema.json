@@ -17,13 +17,19 @@
       "type": "object", "additionalProperties": false,
       "required": ["schemaVersion", "kind", "state", "repositoryHash", "sessionHash", "planHash", "planBytesHash", "attachmentHash", "claimGeneration", "routeGeneration", "routeHash", "markerHash", "stopHash"],
       "properties": {
-        "schemaVersion": { "const": 1 }, "kind": { "const": "campaign-transition-observation" },
+        "schemaVersion": { "enum": [1, 2] }, "kind": { "const": "campaign-transition-observation" },
         "state": { "$ref": "#/$defs/state" }, "repositoryHash": { "$ref": "#/$defs/hash" },
         "sessionHash": { "$ref": "#/$defs/nullableHash" }, "planHash": { "$ref": "#/$defs/nullableHash" },
         "planBytesHash": { "$ref": "#/$defs/nullableHash" }, "attachmentHash": { "$ref": "#/$defs/nullableHash" },
         "claimGeneration": { "$ref": "#/$defs/generation" }, "routeGeneration": { "$ref": "#/$defs/generation" },
-        "routeHash": { "$ref": "#/$defs/nullableHash" }, "markerHash": { "$ref": "#/$defs/nullableHash" }, "stopHash": { "$ref": "#/$defs/nullableHash" }
-      }
+        "routeHash": { "$ref": "#/$defs/nullableHash" }, "markerHash": { "$ref": "#/$defs/nullableHash" }, "stopHash": { "$ref": "#/$defs/nullableHash" },
+        "frontierHash": { "$ref": "#/$defs/nullableHash" }
+      },
+      "allOf": [{
+        "if": { "properties": { "schemaVersion": { "const": 2 } } },
+        "then": { "required": ["frontierHash"] },
+        "else": { "not": { "required": ["frontierHash"] } }
+      }]
     },
     "planRequest": {
       "type": "object", "additionalProperties": false, "required": ["session_id", "expected", "plan"],

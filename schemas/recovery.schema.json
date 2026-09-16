@@ -1,0 +1,278 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://supervised-worker.dev/schemas/recovery.schema.json",
+  "title": "Causally Bound Recovery Evidence",
+  "anyOf": [
+    { "$ref": "#/$defs/frontier" }, { "$ref": "#/$defs/head" }, { "$ref": "#/$defs/runtime" },
+    { "$ref": "#/$defs/observation" }, { "$ref": "#/$defs/proposal" },
+    { "$ref": "#/$defs/authorization" }, { "$ref": "#/$defs/actionReceipt" }, { "$ref": "#/$defs/actionIntent" },
+    { "$ref": "#/$defs/actionConfirmation" }
+  ],
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nullableHash": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/hash" }] },
+    "id": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "quarantineLocator": { "type": "string", "pattern": "^\\.supervised-worker/recovery/quarantine/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/[0-9a-f]{64}\\.quarantined$" },
+    "generation": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/id" }] },
+    "uint": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "coverage": { "enum": ["complete", "partial", "unavailable"] },
+    "time": { "type": "string", "format": "date-time" },
+    "sessionId": { "$ref": "lifecycle.schema.json#/$defs/sessionId" },
+    "transcriptPath": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\\u0000-\\u001f\\u007f]+$" },
+    "counter": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["certainty", "value"],
+          "properties": { "certainty": { "const": "exact" }, "value": { "$ref": "#/$defs/uint" } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["certainty", "value", "lastObservation", "knownAfter"],
+          "properties": {
+            "certainty": { "const": "unknown" }, "value": { "type": "null" }, "knownAfter": { "$ref": "#/$defs/uint" },
+            "lastObservation": {
+              "anyOf": [
+                { "type": "null" },
+                { "type": "object", "additionalProperties": false, "required": ["value", "evidenceHash"],
+                  "properties": { "value": { "$ref": "#/$defs/uint" }, "evidenceHash": { "$ref": "#/$defs/hash" } } }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "stopState": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "progressHash", "sameProgressBlocks", "totalBlocks"],
+      "properties": {
+        "schemaVersion": { "const": 3 }, "progressHash": { "$ref": "#/$defs/nullableHash" },
+        "sameProgressBlocks": { "$ref": "#/$defs/counter" }, "totalBlocks": { "$ref": "#/$defs/counter" }
+      }
+    },
+    "orphan": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operationId", "sessionHash", "routeGeneration", "claimGeneration", "invocationHash", "toolName", "observationStatus"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/id" }, "sessionHash": { "$ref": "#/$defs/hash" },
+        "routeGeneration": { "$ref": "#/$defs/generation" }, "claimGeneration": { "$ref": "#/$defs/generation" },
+        "invocationHash": { "$ref": "#/$defs/nullableHash" },
+        "toolName": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.:/-]{0,127}$" },
+        "observationStatus": { "const": "outcome-unknown" }
+      }
+    },
+    "operations": {
+      "type": "object", "additionalProperties": false, "required": ["coverage", "orphans", "uncorrelatedCompletions"],
+      "properties": {
+        "coverage": { "$ref": "#/$defs/coverage" },
+        "orphans": { "type": "array", "maxItems": 256, "uniqueItems": true, "items": { "$ref": "#/$defs/orphan" } },
+        "uncorrelatedCompletions": { "$ref": "#/$defs/counter" }
+      }
+    },
+    "segment": {
+      "type": "object", "additionalProperties": false, "required": ["sessionHash", "path", "byteOffset", "recordCount", "prefixHash"],
+      "properties": {
+        "sessionHash": { "$ref": "#/$defs/hash" }, "path": { "type": "string", "pattern": "^runs/[0-9a-f]{64}(\\.[0-9]{6})?\\.jsonl$" },
+        "byteOffset": { "type": "integer", "minimum": 0, "maximum": 1048576 },
+        "recordCount": { "type": "integer", "minimum": 0, "maximum": 1048576 }, "prefixHash": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "ledger": {
+      "type": "object", "additionalProperties": false, "required": ["coverage", "segments"],
+      "properties": {
+        "coverage": { "$ref": "#/$defs/coverage" }, "segments": { "type": "array", "maxItems": 256, "uniqueItems": true, "items": { "$ref": "#/$defs/segment" } }
+      }
+    },
+    "owner": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["sessionHash", "sessionRootHash", "routeGeneration", "claimGeneration", "attachmentHash", "routeHash", "markerHash", "workerAuthorityHash"],
+          "properties": {
+            "sessionHash": { "$ref": "#/$defs/hash" }, "routeGeneration": { "$ref": "#/$defs/generation" },
+            "sessionRootHash": { "$ref": "#/$defs/nullableHash" },
+            "claimGeneration": { "$ref": "#/$defs/generation" }, "attachmentHash": { "$ref": "#/$defs/nullableHash" },
+            "routeHash": { "$ref": "#/$defs/nullableHash" }, "markerHash": { "$ref": "#/$defs/nullableHash" },
+            "workerAuthorityHash": { "$ref": "#/$defs/nullableHash" }
+          }
+        }
+      ]
+    },
+    "cause": { "enum": ["fresh-plan", "plan-progress", "stop-block", "stop-budget-exhausted", "stop-counters-uncertain", "stop-recursive", "stop-inactive", "stop-complete", "stop-invalid", "explicit-release", "checkpoint", "resume", "legacy-reconcile", "tool-observation"] },
+    "frontier": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "campaignId", "sequence", "previousHash", "transitionId", "phase", "repositoryHash", "sourceHash", "workflowHash", "planHash", "planBytesHash", "owner", "successor", "stopState", "operations", "ledger", "checkpointHash", "authorizationHash", "cause"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "recovery-frontier" }, "campaignId": { "$ref": "#/$defs/id" },
+        "sequence": { "$ref": "#/$defs/uint" }, "previousHash": { "$ref": "#/$defs/nullableHash" }, "transitionId": { "$ref": "#/$defs/id" },
+        "phase": { "enum": ["active", "detach-prepared", "detached", "checkpoint-prepared", "checkpointed", "resume-prepared", "reconciled"] },
+        "preparedAt": { "$ref": "#/$defs/time" },
+        "repositoryHash": { "$ref": "#/$defs/hash" }, "sourceHash": { "$ref": "#/$defs/hash" }, "workflowHash": { "$ref": "#/$defs/nullableHash" },
+        "planHash": { "$ref": "#/$defs/nullableHash" }, "planBytesHash": { "$ref": "#/$defs/nullableHash" },
+        "owner": { "$ref": "#/$defs/owner" }, "successor": { "$ref": "#/$defs/owner" },
+        "stopState": { "$ref": "#/$defs/stopState" }, "operations": { "$ref": "#/$defs/operations" }, "ledger": { "$ref": "#/$defs/ledger" },
+        "checkpointHash": { "$ref": "#/$defs/nullableHash" }, "authorizationHash": { "$ref": "#/$defs/nullableHash" }, "cause": { "$ref": "#/$defs/cause" }
+      }
+    },
+    "head": {
+      "type": "object", "additionalProperties": false, "required": ["schemaVersion", "kind", "campaignId", "sequence", "frontierHash"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "recovery-head" }, "campaignId": { "$ref": "#/$defs/id" },
+        "sequence": { "$ref": "#/$defs/uint" }, "frontierHash": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "runtime": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "campaignId", "sessionHash", "claimGeneration", "routeGeneration", "frontierHash", "stopState", "operations"],
+      "properties": {
+        "schemaVersion": { "const": 3 }, "kind": { "const": "recovery-runtime" }, "campaignId": { "$ref": "#/$defs/id" },
+        "sessionHash": { "$ref": "#/$defs/hash" }, "claimGeneration": { "$ref": "#/$defs/generation" }, "routeGeneration": { "$ref": "#/$defs/generation" },
+        "frontierHash": { "$ref": "#/$defs/hash" }, "stopState": { "$ref": "#/$defs/stopState" }, "operations": { "$ref": "#/$defs/operations" }
+      }
+    },
+    "identity": {
+      "type": "object", "additionalProperties": false, "required": ["dev", "ino", "size", "mtimeNs", "ctimeNs", "nlink"],
+      "properties": {
+        "dev": { "type": "string", "pattern": "^[0-9]{1,30}$" }, "ino": { "type": "string", "pattern": "^[0-9]{1,30}$" },
+        "size": { "type": "string", "pattern": "^[0-9]{1,30}$" }, "mtimeNs": { "type": "string", "pattern": "^-?[0-9]{1,30}$" },
+        "ctimeNs": { "type": "string", "pattern": "^-?[0-9]{1,30}$" }, "nlink": { "type": "string", "pattern": "^[0-9]{1,30}$" }
+      }
+    },
+    "file": {
+      "type": "object", "additionalProperties": false, "required": ["area", "path", "kind", "sha256", "identity"],
+      "properties": {
+        "area": { "enum": ["repository", "session"] }, "path": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\\u0000-\\u001f\\u007f]+$" },
+        "kind": { "enum": ["file", "directory", "absent", "unavailable"] }, "sha256": { "$ref": "#/$defs/nullableHash" },
+        "identity": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/identity" }, {
+          "type": "object", "additionalProperties": false, "required": ["dev", "ino"],
+          "properties": { "dev": { "type": "string", "pattern": "^[0-9]{1,30}$" }, "ino": { "type": "string", "pattern": "^[0-9]{1,30}$" } }
+        }] }
+      }
+    },
+    "scopeObservation": {
+      "type": "object", "additionalProperties": false, "required": ["scope", "status", "owner", "snapshotHash", "snapshot"],
+      "properties": {
+        "scope": { "enum": ["repository", "session", "journal"] }, "status": { "enum": ["absent", "inspected", "unconfirmed", "deferred"] },
+        "owner": { "enum": [null, "dead", "live", "unknown"] }, "snapshotHash": { "$ref": "#/$defs/nullableHash" },
+        "snapshot": { "anyOf": [{ "type": "null" }, { "$ref": "lifecycle.schema.json#/$defs/snapshot" }] }
+      }
+    },
+    "observation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "status", "repositoryHash", "sourceHash", "workflowHash", "sessionHash", "files", "scopes", "frontierHash", "planHash", "planBytesHash", "attachmentHash", "routeHash", "markerHash", "diagnostics"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "recovery-observation" }, "status": { "enum": ["complete", "incomplete", "racy", "unavailable"] },
+        "repositoryHash": { "$ref": "#/$defs/hash" }, "sourceHash": { "$ref": "#/$defs/hash" }, "workflowHash": { "$ref": "#/$defs/nullableHash" },
+        "sessionHash": { "$ref": "#/$defs/hash" }, "files": { "type": "array", "maxItems": 1536, "items": { "$ref": "#/$defs/file" } },
+        "scopes": { "type": "array", "minItems": 2, "maxItems": 3, "items": { "$ref": "#/$defs/scopeObservation" } },
+        "frontierHash": { "$ref": "#/$defs/nullableHash" }, "planHash": { "$ref": "#/$defs/nullableHash" }, "planBytesHash": { "$ref": "#/$defs/nullableHash" },
+        "attachmentHash": { "$ref": "#/$defs/nullableHash" }, "routeHash": { "$ref": "#/$defs/nullableHash" }, "markerHash": { "$ref": "#/$defs/nullableHash" },
+        "diagnostics": { "type": "array", "maxItems": 16, "uniqueItems": true, "items": { "$ref": "supervisor-failure.schema.json#/$defs/code" } }
+      }
+    },
+    "action": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "resolution"],
+          "properties": {
+            "kind": { "const": "legacy-reconcile" },
+            "resolution": { "oneOf": [
+              { "type": "object", "additionalProperties": false, "required": ["kind", "evidenceHash"],
+                "properties": { "kind": { "const": "use-proven-state" }, "evidenceHash": { "$ref": "#/$defs/hash" } } },
+              { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "preserve-uncertainty" } } }
+            ] }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "frontierHash"],
+          "properties": { "kind": { "const": "finish-release" }, "frontierHash": { "$ref": "#/$defs/hash" } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "scope", "snapshotHash"],
+          "properties": {
+            "kind": { "const": "recover-lock" }, "scope": { "enum": ["repository", "session", "journal"] }, "snapshotHash": { "$ref": "#/$defs/hash" }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "entryHash"],
+          "properties": { "kind": { "const": "quarantine-journal-entry" }, "entryHash": { "$ref": "#/$defs/hash" } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "targetActionId", "targetIntentHash"],
+          "properties": {
+            "kind": { "const": "confirm-completed-action" }, "targetActionId": { "$ref": "#/$defs/id" },
+            "targetIntentHash": { "$ref": "#/$defs/hash" }
+          }
+        }
+      ]
+    },
+    "proposal": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "actionId", "session", "expectedHash", "expected", "action"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "recovery-proposal" }, "actionId": { "$ref": "#/$defs/id" },
+        "session": { "$ref": "#/$defs/inspectRequest" },
+        "expectedHash": { "$ref": "#/$defs/hash" }, "expected": { "$ref": "#/$defs/observation" }, "action": { "$ref": "#/$defs/action" }
+      }
+    },
+    "authorization": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "authorizationId", "proposalHash", "proposal", "issuedAt", "expiresAt", "maxUses", "assurance"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "recovery-authorization" }, "authorizationId": { "$ref": "#/$defs/id" },
+        "proposalHash": { "$ref": "#/$defs/hash" }, "proposal": { "$ref": "#/$defs/proposal" },
+        "issuedAt": { "$ref": "#/$defs/time" }, "expiresAt": { "$ref": "#/$defs/time" }, "maxUses": { "const": 1 },
+        "assurance": { "const": "cooperative-local-operator" }
+      }
+    },
+    "actionReceipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "actionId", "authorizationHash", "proposalHash", "status", "beforeHash", "afterHash", "frontierHash", "locator", "sha256"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "recovery-action" }, "actionId": { "$ref": "#/$defs/id" },
+        "authorizationHash": { "$ref": "#/$defs/hash" }, "proposalHash": { "$ref": "#/$defs/hash" },
+        "status": { "enum": ["applied", "unconfirmed"] }, "beforeHash": { "$ref": "#/$defs/hash" }, "afterHash": { "$ref": "#/$defs/nullableHash" },
+        "frontierHash": { "$ref": "#/$defs/nullableHash" }, "locator": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/quarantineLocator" }] },
+        "sha256": { "$ref": "#/$defs/nullableHash" }
+      }
+    },
+    "actionConfirmation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "actionId", "targetActionId", "targetIntentHash", "quarantineMetadataHash", "originalAuthorizationHash", "authorizationHash", "proposalHash", "postStateHash", "locator", "sha256", "confirmedAt", "status", "effect"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "recovery-action-confirmation" },
+        "actionId": { "$ref": "#/$defs/id" }, "targetActionId": { "$ref": "#/$defs/id" },
+        "targetIntentHash": { "$ref": "#/$defs/hash" }, "quarantineMetadataHash": { "$ref": "#/$defs/hash" },
+        "originalAuthorizationHash": { "$ref": "#/$defs/hash" }, "authorizationHash": { "$ref": "#/$defs/hash" },
+        "proposalHash": { "$ref": "#/$defs/hash" }, "postStateHash": { "$ref": "#/$defs/hash" },
+        "locator": { "$ref": "#/$defs/quarantineLocator" }, "sha256": { "$ref": "#/$defs/hash" },
+        "confirmedAt": { "$ref": "#/$defs/time" }, "status": { "const": "confirmed-complete" },
+        "effect": { "const": "receipt-only" }
+      }
+    },
+    "actionIntent": {
+      "type": "object", "additionalProperties": false, "required": ["schemaVersion", "kind", "actionId", "authorizationHash", "proposalHash", "expectedHash", "action"],
+      "properties": {
+        "schemaVersion": { "const": 1 }, "kind": { "const": "recovery-action-intent" }, "actionId": { "$ref": "#/$defs/id" },
+        "authorizationHash": { "$ref": "#/$defs/hash" }, "proposalHash": { "$ref": "#/$defs/hash" },
+        "expectedHash": { "$ref": "#/$defs/hash" }, "action": { "$ref": "#/$defs/action" }
+      }
+    },
+    "inspectRequest": {
+      "type": "object", "additionalProperties": false, "required": ["session_id"],
+      "properties": { "session_id": { "$ref": "#/$defs/sessionId" }, "transcript_path": { "$ref": "#/$defs/transcriptPath" } }
+    },
+    "proposeRequest": {
+      "type": "object", "additionalProperties": false, "required": ["session_id", "expectedHash", "action"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/sessionId" }, "transcript_path": { "$ref": "#/$defs/transcriptPath" },
+        "expectedHash": { "$ref": "#/$defs/hash" }, "action": { "$ref": "#/$defs/action" }
+      }
+    },
+    "applyRequest": {
+      "type": "object", "additionalProperties": false, "required": ["session_id", "authorizationHash"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/sessionId" }, "transcript_path": { "$ref": "#/$defs/transcriptPath" }, "authorizationHash": { "$ref": "#/$defs/hash" }
+      }
+    }
+  }
+}

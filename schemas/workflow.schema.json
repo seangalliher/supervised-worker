@@ -61,6 +61,33 @@
           "type": "array",
           "items": { "$ref": "#/$defs/nonBlank" },
           "uniqueItems": true
+        },
+        "ci": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requiredJobs"],
+          "properties": {
+            "requiredJobs": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 128,
+              "uniqueItems": true,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "requiredSteps"],
+                "properties": {
+                  "name": { "$ref": "#/$defs/ciName" },
+                  "requiredSteps": {
+                    "type": "array",
+                    "maxItems": 128,
+                    "uniqueItems": true,
+                    "items": { "$ref": "#/$defs/ciName" }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -113,6 +140,15 @@
     }
   },
   "$defs": {
+    "ciName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "allOf": [
+        { "pattern": "\\S" },
+        { "pattern": "^[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]+$" }
+      ]
+    },
     "nonBlank": {
       "type": "string",
       "minLength": 1,

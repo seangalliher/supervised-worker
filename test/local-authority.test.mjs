@@ -314,17 +314,21 @@ test("local native Doctor requests recover a dead session lock while ordinary to
     const consultationInvocation = randomUUID();
     assert.equal(hook(null, consultationInput, "PreToolUse", consultationInvocation).permissionDecision, "allow");
     assert.deepEqual(hook(null, consultationInput, "PostToolUse", consultationInvocation), {});
-    const execute = (action, inputHashes = []) => {
+    const execute = (action, inputHashes = [], recovery = null) => {
       const current = doctor("inspect");
       const grant = doctor("grant", { grant: { action, actionId: randomUUID(), expectedHash: current.hash } });
-      return doctor("execute", { intent: { schemaVersion: 1, kind: "doctor-repair-intent", binding: current.incident.binding,
+      return doctor("execute", { intent: { schemaVersion: recovery === null ? 1 : 2, kind: "doctor-repair-intent", binding: current.incident.binding,
         attemptId: current.incident.attemptId, actionId: grant.capability.actionId, action,
-        capabilityHash: grant.hash, expectedHash: current.hash, inputHashes } });
+        capabilityHash: grant.hash, expectedHash: current.hash, inputHashes, ...(recovery === null ? {} : { recovery }) } });
     };
     const inspected = execute("inspect");
     assert.equal(inspected.status, "succeeded");
-    assert.ok(inspected.values.some((value) => value.diagnostics.some((entry) => entry.scope === "session" && entry.code === "LIFECYCLE_OWNER_DEAD")));
-    const recovered = execute("recover", inspected.outcome.outputHashes);
+    // Ordered inspection returns typed scope observations, not an undifferentiated
+    // diagnostic list. The action must bind the exact selected snapshot.
+    const selected = inspected.values.find((value) => value.kind === "doctor-scope-observation" && value.scope === "session" && value.owner === "dead");
+    assert.ok(selected, JSON.stringify(inspected));
+    assert.ok(inspected.outcome.outputHashes.includes(selected.snapshotHash));
+    const recovered = execute("recover", inspected.outcome.outputHashes, { scope: selected.scope, snapshotHash: selected.snapshotHash });
     assert.equal(recovered.status, "succeeded", JSON.stringify(recovered));
     assert.equal(existsSync(lock), false);
     assert.equal(readFileSync(path.join(`${lock}.${token}.recovered`, `${token}.json`), "utf8"), owner);
@@ -753,7 +757,8 @@ test("local checkpoint resumes in a fresh session and fences both competing and 
     assert.equal(resumed.status, "resumed");
     assert.notEqual(observeCampaignTransition(cwd, next).claimGeneration, admitted.observation.claimGeneration);
     assert.deepEqual(resumeSession(cwd, resumeRequest, successorAuthority), resumed);
-    assert.throws(() => checkpointSession(cwd, checkpointRequest, authority), /does not own/);
+    // Migrated ownership is checked against the source frontier, not only the old attachment.
+    assert.throws(() => checkpointSession(cwd, checkpointRequest, authority), /exact source Worker/);
     assert.throws(() => applyCampaignPlan(cwd, { ...request, expected: observeCampaignTransition(cwd, request), plan }, authority), /owning Worker/);
   });
 });
@@ -776,16 +781,18 @@ test("local Doctor recovers an exact dead owner once and retains the original re
     writeFileSync(path.join(lock, `${token}.json`), ownerBytes);
     const incidentId = randomUUID();
     const detected = detectDoctorIncident(cwd, request, incidentId, sha256("local-dead-owner"), authority);
-    const intentFor = (incident, action, inputHashes = []) => {
+    const intentFor = (incident, action, inputHashes = [], recovery = null) => {
       const grant = grantDoctorAction(cwd, request, incidentId, { action, actionId: randomUUID(), expectedHash: doctorHash(incident) }, authority);
-      return { schemaVersion: 1, kind: "doctor-repair-intent", binding: incident.binding, attemptId: incident.attemptId,
-        actionId: grant.capability.actionId, action, capabilityHash: grant.hash, expectedHash: doctorHash(incident), inputHashes };
+      return { schemaVersion: recovery === null ? 1 : 2, kind: "doctor-repair-intent", binding: incident.binding, attemptId: incident.attemptId,
+        actionId: grant.capability.actionId, action, capabilityHash: grant.hash, expectedHash: doctorHash(incident), inputHashes,
+        ...(recovery === null ? {} : { recovery }) };
     };
     const inspected = executeDoctorIntent(cwd, request, intentFor(detected.incident, "inspect"), authority);
     assert.equal(inspected.status, "succeeded");
-    assert.equal(inspected.values[0].diagnostics[0].code, "LIFECYCLE_OWNER_DEAD");
+    const selected = inspected.values.find((value) => value.kind === "doctor-scope-observation" && value.scope === "repository");
+    assert.equal(selected.owner, "dead");
     const current = inspectDoctorIncident(cwd, request, incidentId, authority).incident;
-    const intent = intentFor(current, "recover", inspected.outcome.outputHashes);
+    const intent = intentFor(current, "recover", inspected.outcome.outputHashes, { scope: selected.scope, snapshotHash: selected.snapshotHash });
     const recovered = executeDoctorIntent(cwd, request, intent, authority);
     assert.equal(recovered.status, "succeeded", JSON.stringify(recovered));
     assert.equal(existsSync(lock), false);

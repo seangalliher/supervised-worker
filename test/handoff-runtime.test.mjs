@@ -94,6 +94,26 @@ function issueFixtureReview(fixture, workflowHash = null, roles = DEFAULT_ROLES)
   return attempt;
 }
 
+function admitBeforeReviewFixture(runtime, cwd, plan) {
+  const directory = path.join(cwd, ".supervised-worker", "runtime");
+  const names = existsSync(directory) ? fs.readdirSync(directory) : [];
+  // Standalone handoff fixtures constructed review/model evidence before any
+  // campaign. Defer only those known fixture artifacts, never counter/history
+  // records, until the real first-plan transition establishes its frontier.
+  assert.ok(names.every((name) => ["model-receipts", "review-attempts"].includes(name)));
+  const deferred = path.join(cwd, ".supervised-worker", "fixture-review-seed");
+  mkdirSync(deferred);
+  for (const name of names) renameSync(path.join(directory, name), path.join(deferred, name));
+  try { return runtime.admit(plan); }
+  finally {
+    for (const name of names) {
+      assert.equal(existsSync(path.join(directory, name)), false);
+      renameSync(path.join(deferred, name), path.join(directory, name));
+    }
+    rmSync(deferred, { recursive: true });
+  }
+}
+
 function modelPublicationFixture(fixture, assurance = "host-attested") {
   fixture.cwd = realpathSync(fixture.cwd);
   const input = { session_id: "model-publication-owner" };
@@ -125,7 +145,7 @@ function modelPublicationFixture(fixture, assurance = "host-attested") {
     options = { baseDirectory: external };
   }
   const runtime = createWorkerAuthorityFixture(fixture.cwd, input, options);
-  assert.equal(runtime.admit({ schemaVersion: 1, mode: "active", goal: "Model publication boundaries",
+  assert.equal(admitBeforeReviewFixture(runtime, fixture.cwd, { schemaVersion: 1, mode: "active", goal: "Model publication boundaries",
     items: [{ id: fixture.review.itemId, title: "Receipt item", status: "in_progress" }], completion: null }).status, "applied");
   const attempt = issueReviewAttempt(fixture.cwd, fixture.contractPath, fixture.buildPath);
   assert.equal(attempt.ok, true, attempt.errors.join("\n"));
@@ -275,7 +295,7 @@ test("installed owner publishes model receipts that the real handoff verifier ac
   withFixture((fixture) => {
     const input = { session_id: "model-receipt-owner" };
     const runtime = createWorkerAuthorityFixture(fixture.cwd, input);
-    assert.equal(runtime.admit({ schemaVersion: 1, mode: "active", goal: "Verify receipt publication",
+    assert.equal(admitBeforeReviewFixture(runtime, fixture.cwd, { schemaVersion: 1, mode: "active", goal: "Verify receipt publication",
       items: [{ id: fixture.review.itemId, title: "Receipt item", status: "in_progress" }], completion: null }).status, "applied");
     const environment = { ...process.env, SUPERVISED_WORKER_HOST_AUTHORITY: runtime.inventoryPath };
     const installedCli = path.join(runtime.installRoot, "src", "cli.mjs");
@@ -663,6 +683,7 @@ test("handoff verification never executes a workspace-planted Git binary", {
 }, () => {
   withFixture((fixture) => {
     const external = mkdtempSync(path.join(os.tmpdir(), "supervised-worker-git-probe-"));
+    const previousPath = process.env.PATH;
     try {
       const markerPath = path.join(external, "workspace-git-ran.txt");
       const probePath = path.join(external, "probe.mjs");
@@ -673,6 +694,9 @@ test("handoff verification never executes a workspace-planted Git binary", {
       copyFileSync(process.execPath, path.join(fixture.cwd, "git.exe"));
       const excludePath = path.join(fixture.cwd, ".git", "info", "exclude");
       writeFileSync(excludePath, `${readFileSync(excludePath, "utf8")}\n/git.exe\n`);
+      // Current Node/Windows lookup need not search options.cwd first. Make the
+      // threat real for both the bare-lookup control and the actual consumer.
+      process.env.PATH = `${fixture.cwd}${path.delimiter}${previousPath ?? ""}`;
 
       const premise = spawnSync("git", [probePath], {
         cwd: fixture.cwd,
@@ -690,6 +714,8 @@ test("handoff verification never executes a workspace-planted Git binary", {
       assert.equal(result.ok, true, result.errors.join("\n"));
       assert.equal(existsSync(markerPath), false);
     } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
       rmSync(external, { recursive: true, force: true });
     }
   });

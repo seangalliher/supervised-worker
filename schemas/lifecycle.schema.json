@@ -6,7 +6,7 @@
     { "$ref": "#/$defs/diagnostic" }, { "$ref": "#/$defs/inspectRequest" },
     { "$ref": "#/$defs/recoverRequest" }, { "$ref": "#/$defs/inspection" },
     { "$ref": "#/$defs/recoveryIntent" }, { "$ref": "#/$defs/recoveryOutcome" },
-    { "$ref": "#/$defs/recoveryResult" }
+    { "$ref": "#/$defs/recoveryResult" }, { "$ref": "#/$defs/snapshot" }
   ],
   "$defs": {
     "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
@@ -37,7 +37,7 @@
           "type": "object", "additionalProperties": false,
           "required": ["state", "version", "file", "sessionHash", "status", "routeGeneration", "claimGeneration"],
           "properties": {
-            "state": { "const": "present" }, "version": { "enum": [1, 2, 3] }, "file": { "$ref": "#/$defs/file" },
+            "state": { "const": "present" }, "version": { "enum": [1, 2, 3, 4] }, "file": { "$ref": "#/$defs/file" },
             "sessionHash": { "$ref": "#/$defs/hash" }, "status": { "enum": ["active", "provisional", "checkpointed"] },
             "routeGeneration": { "$ref": "#/$defs/generation" }, "claimGeneration": { "$ref": "#/$defs/generation" }
           }
@@ -95,9 +95,9 @@
       },
       "dependentRequired": { "session_id": ["transcript_path"], "transcript_path": ["session_id"] },
       "allOf": [
-        { "if": { "required": ["scope"], "properties": { "scope": { "const": "doctor" } } }, "then": { "required": ["incidentId"] } },
-        { "if": { "required": ["scope"], "properties": { "scope": { "const": "session" } } }, "then": { "required": ["session_id", "transcript_path"] } },
-        { "if": { "required": ["location"], "properties": { "location": { "const": "retired" } } }, "then": { "required": ["token"] } }
+        { "if": { "required": ["scope"], "properties": { "scope": { "const": "doctor" } } }, "then": { "properties": { "incidentId": {} }, "required": ["incidentId"] } },
+        { "if": { "required": ["scope"], "properties": { "scope": { "const": "session" } } }, "then": { "properties": { "session_id": {}, "transcript_path": {} }, "required": ["session_id", "transcript_path"] } },
+        { "if": { "required": ["location"], "properties": { "location": { "const": "retired" } } }, "then": { "properties": { "token": {} }, "required": ["token"] } }
       ]
     },
     "recoverRequest": {
@@ -107,8 +107,8 @@
         "session_id": { "$ref": "#/$defs/sessionId" }, "transcript_path": { "$ref": "#/$defs/transcriptPath" }
       },
       "dependentRequired": { "session_id": ["transcript_path"], "transcript_path": ["session_id"] },
-      "if": { "properties": { "expected": { "properties": { "scope": { "const": "session" } } } } },
-      "then": { "required": ["session_id", "transcript_path"] }
+      "if": { "properties": { "expected": { "type": "object", "properties": { "scope": { "const": "session" } } } } },
+      "then": { "properties": { "session_id": {}, "transcript_path": {} }, "required": ["session_id", "transcript_path"] }
     },
     "diagnostic": {
       "type": "object", "additionalProperties": false,
@@ -157,8 +157,8 @@
         "intentHash": { "$ref": "#/$defs/hash" }, "status": { "enum": ["recovered", "unconfirmed"] }, "diagnostics": { "$ref": "#/$defs/diagnostics" }
       },
       "if": { "properties": { "status": { "const": "recovered" } } },
-      "then": { "properties": { "diagnostics": { "maxItems": 0 } } },
-      "else": { "properties": { "diagnostics": { "minItems": 1 } } }
+      "then": { "properties": { "diagnostics": { "type": "array", "maxItems": 0 } } },
+      "else": { "properties": { "diagnostics": { "type": "array", "minItems": 1 } } }
     },
     "recoveryResult": {
       "type": "object", "additionalProperties": false, "required": ["schemaVersion", "kind", "status", "intentHash", "outcomeHash", "diagnostics"],
@@ -168,8 +168,8 @@
         "intentHash": { "$ref": "#/$defs/nullableHash" }, "outcomeHash": { "$ref": "#/$defs/nullableHash" }, "diagnostics": { "$ref": "#/$defs/diagnostics" }
       },
       "if": { "properties": { "status": { "enum": ["recovered", "already-recovered"] } } },
-      "then": { "properties": { "intentHash": { "$ref": "#/$defs/hash" }, "outcomeHash": { "$ref": "#/$defs/hash" }, "diagnostics": { "maxItems": 0 } } },
-      "else": { "properties": { "diagnostics": { "minItems": 1 } } }
+      "then": { "properties": { "intentHash": { "$ref": "#/$defs/hash" }, "outcomeHash": { "$ref": "#/$defs/hash" }, "diagnostics": { "type": "array", "maxItems": 0 } } },
+      "else": { "properties": { "diagnostics": { "type": "array", "minItems": 1 } } }
     }
   }
 }

@@ -122,11 +122,45 @@
               }
             } }
           }
-        }] },
+        }, { "$ref": "#/$defs/repositoryCi" }] },
         "closures": { "type": "array", "maxItems": 4096, "items": {
           "type": "object", "additionalProperties": false, "required": ["itemHash", "state", "stateReason"],
           "properties": { "itemHash": { "$ref": "#/$defs/hash" }, "state": { "const": "CLOSED" }, "stateReason": { "enum": ["COMPLETED", "NOT_PLANNED", "DUPLICATE"] } }
         } }
+      }
+    },
+    "ciName": {
+      "type": "string", "minLength": 1, "maxLength": 256,
+      "allOf": [{ "pattern": "\\S" }, { "pattern": "^[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]+$" }]
+    },
+    "repositoryCi": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "workflowHash", "runId", "commit", "complete", "conclusion", "jobs"],
+      "properties": {
+        "kind": { "const": "repository-ci" }, "workflowHash": { "$ref": "#/$defs/hash" },
+        "runId": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "commit": { "$ref": "#/$defs/gitHash" }, "complete": { "const": true },
+        "conclusion": { "const": "success" },
+        "jobs": {
+          "type": "array", "minItems": 1, "maxItems": 256,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["name", "commit", "conclusion", "steps"],
+            "properties": {
+              "name": { "$ref": "#/$defs/ciName" }, "commit": { "$ref": "#/$defs/gitHash" },
+              "conclusion": { "const": "success" },
+              "steps": {
+                "type": "array", "maxItems": 128,
+                "items": {
+                  "type": "object", "additionalProperties": false, "required": ["name", "status", "conclusion"],
+                  "properties": {
+                    "name": { "$ref": "#/$defs/ciName" },
+                    "status": { "const": "completed" }, "conclusion": { "const": "success" }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     },
     "receipt": {

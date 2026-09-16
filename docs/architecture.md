@@ -311,12 +311,13 @@ The Stop bound measures consecutive attempts against the same canonical,
 schema-valid plan state, not total session length. After two blocked Stops at
 that state, the following Stop releases visibly so a stuck agent cannot loop
 forever. Object-key insertion order is normalized, and all invalid plans share
-one stable marker until repaired. A changed canonical valid-plan state resets
-the consecutive counter; the monotonic total remains ledger metadata. Runtime
-state version 2 identifies this hash algorithm. Version 1 raw hashes are
-translated when they match the current plan representation, preserving existing
-consecutive counters across an upgrade. Completion audit hashes use the same
-canonical representation.
+one stable marker until repaired. A changed canonical valid-plan state starts
+a new same-progress epoch. The authoritative recovery frontier preserves exact
+totals or explicitly uncertain history, not a guessed maximum or a reset.
+Runtime version 3 is a bound cache; historical versions 1/2 remain evidence.
+Unknown same-progress history grants no extra Stop allowance. See
+[the current recovery protocol](reliability-recovery.md) for counter, publication
+and migration rules. Completion audit hashes use the same canonical plan form.
 
 ## State And Trust
 
@@ -329,10 +330,13 @@ The state directory belongs to the repository being worked on, not the plugin:
 |-- handoffs/       # typed summaries below sha256(itemId), never raw provider ids
 |-- runs/*.jsonl    # append-only metadata events by hashed session id
 |-- checkpoints/*.json # immutable receipts named by exact file-byte SHA-256
+|-- releases/*.json # helper-owned canonical reports, never journal entries
+|-- recovery/head.json # current causally linked frontier
+|-- recovery/frontiers/*.json # immutable transition and uncertainty evidence
 |-- locks/lifecycle/ # shared repository lifecycle exclusion
 |-- locks/journal/   # bounded metadata publication and checkpoint-watermark exclusion
-|-- attachment.json # v3 claim/route identity; provisional, active, or checkpointed
-`-- runtime/*.json  # bounded Stop counters
+|-- attachment.json # claim/route identity bound to the current frontier
+`-- runtime/*.json  # retained versioned Stop caches/history
 ```
 
 When a review supplies resolved model evidence, runtime state contains
@@ -481,12 +485,25 @@ general portable compare-and-rename guarantee is claimed.
 
 ### Checkpoint State Machine
 
+The current producer emits checkpoint version 3 with a prepared recovery
+frontier reference and uncertainty-preserving operation/counter context.
+Ownerless resume must name the current `frontierHash`; checkpoint resume may
+derive it only from the uniquely matching current frontier under guards.
+Prepared successor IDs are durable and reused by an interrupted retry.
+The head selects authority through predecessor links, never by enumerating
+historical snapshot values. See [Bounded Local Reliability And Recovery](reliability-recovery.md)
+for the normative current write order and separately authorized legacy migration.
+
+The older v1/v2 wire and journal-watermark contracts below remain readable
+history. They are not permission to use an old runtime snapshot as the current
+recovery cursor or to downgrade a migrated campaign.
+
 `checkpointSession(cwd, request)`, `resumeSession(cwd, request)`, and
 `validateCheckpoint(value)` live in the existing core. The CLI accepts strict,
 duplicate-key-free UTF-8 JSON stdin up to 8 KiB. Checkpoint requests contain
 exactly `session_id`, optional `transcript_path`, `planHash`, and
 `attachmentHash`; resume replaces the latter with `checkpointHash` (digest or
-explicit `null`). Authority is the canonical local process cwd and validated
+explicit `null`) and accepts the explicit `frontierHash`. Authority is the canonical local process cwd and validated
 existing routing, never a repository override inside the request. `status`
 exposes the canonical plan hash and exact current attachment hash read-only.
 Confirmed responses contain `status` (`checkpointed` or `resumed`),
@@ -527,11 +544,11 @@ hash/count, and the persistence event at that exact watermark.
 
 Checkpoint version 1 retains its base-file prefix and 1 MiB offset bound.
 Version 2 uses that same path as a logical stream identifier and allows an
-offset up to the unchanged 16 MiB aggregate bound. Both versions retain the
-1,048,576-record watermark limit. The producer emits version 2 whenever either
-the prefix or its `checkpoint_persisted` record requires a segment. Verification
-follows the next logical record across boundaries; a version 1 proof still
-verifies against its original base after later segments exist.
+offset up to the unchanged 16 MiB aggregate bound. Version 3 retains that
+segmented-watermark contract and adds the prepared frontier reference. All
+versions retain the 1,048,576-record watermark limit. Verification follows the
+next logical record across boundaries; a version 1 proof still verifies against
+its original base after later segments exist.
 
 Once retained history contains segments, keep a segment-capable immutable helper.
 Older validators reject version 2 receipts, but older base-only readers can
@@ -550,15 +567,14 @@ already used by the successor. Before publication, failures retain the
 resumable tombstone; an incomplete, generation-unconfirmed host route requires
 manual inspection or a different fresh session, not opportunistic deletion.
 
-`checkpointHash: null` is an explicit ownerless active-plan recovery only. It
-rejects any current attachment, including tombstones, observes durable ledger
-context without replay, and preserves unambiguous valid Stop counters. It does
-not consume or alter review/model evidence under other runtime namespaces.
-Ambiguous counters require inspection rather than choosing the newest by time.
-An owner published during this recovery is not automatically removed if its
-confirmation fails. A known-stale owner must be handled with the separately
-authorized, snapshot-bound `release` operation. Neither SessionStart nor
-PreCompact initiates this process.
+`checkpointHash: null` is an explicit ownerless active-plan recovery only and
+requires `frontierHash`. It rejects conflicting ownership and restores the
+selected frontier without replay. Missing or ambiguous legacy state requires
+zero-write inspection and a separately confirmed, exact-snapshot reconciliation;
+multiple old runtime values are history, not competing current authorities.
+Review/model evidence is not rewritten. An owner published during recovery is
+not automatically removed if confirmation fails. Neither SessionStart nor
+PreCompact initiates recovery.
 
 When a session has no inherited checkpoint receipt, its next checkpoint observes
 the complete bounded journal set, as status does. This preserves prior-session
@@ -577,15 +593,14 @@ Predictable capacity failures deny new tool starts and are checked before
 checkpoint-receipt, plan-transition, and fresh-owner publication. Post-effect
 persistence failures remain unconfirmed and grant no automatic replay authority.
 
-There is no reserved space guaranteeing terminal or checkpoint recording at
-aggregate saturation. Stop and PreCompact report journal failures visibly;
-bounded Stop may still release ownership without a durable event or checkpoint.
-After release, a verified fresh session can use ownerless resume only if the
-existing history and aggregate limits permit it. This is not unlimited storage
-or guaranteed uninterrupted queue execution. If combined orphan references
-exceed the checkpoint's 256-reference bound, checkpointing fails rather than
-silently dropping references. Capacity handoff and unknown-outcome reconciliation
-require separately governed work.
+Admission now reserves bounded terminal liabilities and control headroom before
+starting new ordinary work. This is not physical preallocation: ENOSPC/EIO can
+still prevent recording, and ordinary work eventually stops at aggregate limits.
+Required frontier state must be preserved before release; journal mirroring is
+a separate observation. A fresh session does not reset capacity or uncertainty.
+If combined orphan references exceed the checkpoint's 256-reference bound,
+checkpointing fails rather than dropping references. Evidence-preserving archival
+and unlimited retention are not implemented by this wave.
 
 Receipt, flush, or pre-detachment event failure leaves the original attachment
 and route authoritative. After tombstone publication, a route-cleanup failure

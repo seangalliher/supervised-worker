@@ -1,8 +1,12 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 import { verifyWorkerAuthority } from "./authority.mjs";
 import { observeCampaignTransition, sha256, supervisorFailureFor } from "./core.mjs";
 import { detectDoctorIncident, inspectDoctorIncident } from "./doctor.mjs";
 import { doctorHash, requireDoctor } from "./doctor-state.mjs";
 import { parseWorkflowJson } from "./workflow.mjs";
+import { formatDoctorInvocation } from "./doctor-invocation.mjs";
 
 export function routeDoctorConsultation(input, eventName, pluginRoot) {
   if (!["PreToolUse", "PostToolUse", "PostToolUseFailure"].includes(eventName) ||
@@ -46,6 +50,26 @@ export function routeDoctorConsultation(input, eventName, pluginRoot) {
 export function routeDoctorFromHook(input, output, pluginRoot) {
   const failure = supervisorFailureFor(output);
   if (failure === null) return output;
+  let invocation = null;
+  try {
+    verifyWorkerAuthority(input.cwd, input, pluginRoot);
+    const nodePath = parseWorkflowJson(readFileSync(path.join(pluginRoot, "install-record.json"))).nodePath;
+    invocation = formatDoctorInvocation(input.cwd, { operation: "diagnose", session_id: input.session_id ?? input.sessionId,
+      ...((input.transcript_path ?? input.transcriptPath) === undefined ? {} : { transcript_path: input.transcript_path ?? input.transcriptPath }) }, pluginRoot, nodePath);
+  } catch {
+    // An unverified installation or session cannot supply an executable recovery route.
+  }
+  const appendRoute = (value) => {
+    if (invocation === null) return value;
+    const message = invocation.command === null
+      ? ` ${invocation.failure.code}: use the bounded direct operator interface; no runnable native command was generated.`
+      : ` Read-only recovery diagnosis is available through this exact immutable command: ${invocation.command}`;
+    const enrich = (object) => Object.fromEntries(Object.entries(object).map(([key, entry]) => [key,
+      ["reason", "permissionDecisionReason", "additionalContext", "systemMessage"].includes(key) && typeof entry === "string" ? `${entry}${message}` : entry]));
+    return { ...enrich(value), recoveryInvocation: invocation,
+      ...(value.hookSpecificOutput ? { hookSpecificOutput: enrich(value.hookSpecificOutput) } : {}) };
+  };
+  if (failure.kind === "supervisor-failure") return appendRoute(output);
   try {
     const authority = verifyWorkerAuthority(input.cwd, input, pluginRoot);
     const diagnosticHash = doctorHash(failure.diagnostics);
@@ -55,11 +79,11 @@ export function routeDoctorFromHook(input, output, pluginRoot) {
     const message = ` Internal supervisor incident ${incidentId} is ${detected.status}. Worker: invoke Supervised Doctor with the validated incident and hash ${detected.hash}; use the separate doctor-rescue helper and do not replay unknown effects or relay operator recovery commands.`;
     const enrich = (value) => Object.fromEntries(Object.entries(value).map(([key, entry]) => [key,
       ["reason", "permissionDecisionReason", "additionalContext", "systemMessage"].includes(key) && typeof entry === "string" ? `${entry}${message}` : entry]));
-    return { ...enrich(output), ...(output.hookSpecificOutput ? { hookSpecificOutput: enrich(output.hookSpecificOutput) } : {}) };
+    return appendRoute({ ...enrich(output), ...(output.hookSpecificOutput ? { hookSpecificOutput: enrich(output.hookSpecificOutput) } : {}) });
   } catch {
     const message = " Doctor incident capture is unavailable for the current authority, policy, or campaign state. Preserve the original failure and checkpoint through the owning Worker when possible; no recovery or completion is confirmed.";
     const enrich = (value) => Object.fromEntries(Object.entries(value).map(([key, entry]) => [key,
       ["reason", "permissionDecisionReason", "additionalContext", "systemMessage"].includes(key) && typeof entry === "string" ? `${entry}${message}` : entry]));
-    return { ...enrich(output), ...(output.hookSpecificOutput ? { hookSpecificOutput: enrich(output.hookSpecificOutput) } : {}) };
+    return appendRoute({ ...enrich(output), ...(output.hookSpecificOutput ? { hookSpecificOutput: enrich(output.hookSpecificOutput) } : {}) });
   }
 }

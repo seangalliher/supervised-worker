@@ -260,7 +260,7 @@ for (const phase of ["before-publication", "after-publication"]) {
 }
 
 test("authorized release retires its matching route and permits explicit readmission", () => {
-  withAuthorityFixture(({ base, cwd, input, installRoot, inventoryPath }) => {
+  withAuthorityFixture(({ base, cwd, input, installRoot, inventory, inventoryPath }) => {
     const storage = path.join(base, "storage");
     const transcripts = path.join(storage, "GitHub.copilot-chat", "transcripts");
     mkdirSync(transcripts, { recursive: true });
@@ -279,10 +279,19 @@ test("authorized release retires its matching route and permits explicit readmis
     assert.equal(existsSync(path.join(cwd, ".supervised-worker", "attachment.json")), false);
     assert.equal(JSON.parse(readFileSync(routeFile)).status, "released");
     assert.deepEqual(JSON.parse(readFileSync(path.join(cwd, ".supervised-worker", "plan.json"))), plan);
-    const resumed = resumeSession(cwd, { ...session, planHash: canonicalPlanHash(plan), checkpointHash: null }, authority);
+    // Released source sessions stay fenced. Readmission now names the exact
+    // preserved frontier and a separately verified fresh successor session.
+    const next = { session_id: "authorized-successor", transcript_path: path.join(transcripts, "authorized-successor.jsonl") };
+    writeFileSync(next.transcript_path, "");
+    writeFileSync(inventoryPath, JSON.stringify({ ...inventory, sessionHash: sha256(next.session_id) }));
+    const nextAuthority = verifyWorkerAuthority(cwd, next, installRoot, inventoryPath);
+    const releasedRoute = readFileSync(routeFile);
+    const resumed = resumeSession(cwd, { ...next, planHash: canonicalPlanHash(plan), checkpointHash: null, frontierHash: result.frontierHash }, nextAuthority);
     assert.equal(resumed.status, "resumed");
-    assert.notEqual(observeCampaignTransition(cwd, session).claimGeneration, before.claimGeneration);
-    assert.notEqual(JSON.parse(readFileSync(routeFile)).generation, before.routeGeneration);
+    assert.notEqual(observeCampaignTransition(cwd, next).claimGeneration, before.claimGeneration);
+    const successorRoute = path.join(storage, "supervised-worker", "session-roots", sha256(next.session_id), "route.json");
+    assert.notEqual(JSON.parse(readFileSync(successorRoute)).generation, before.routeGeneration);
+    assert.deepEqual(readFileSync(routeFile), releasedRoute);
   });
 });
 

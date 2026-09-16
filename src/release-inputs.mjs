@@ -6,6 +6,7 @@ import { doctorHash } from "./doctor-state.mjs";
 import { doctorRepairItemId } from "./doctor-repair.mjs";
 import { validateModelReceiptValue } from "./handoff.mjs";
 import { validateReleaseDoctorHistory } from "./release-doctor-history.mjs";
+import { captureReleaseRecovery } from "./release-recovery.mjs";
 import { parseWorkflowJson, resolveWorkflowRoles } from "./workflow.mjs";
 
 const openedInputs = new WeakMap();
@@ -19,7 +20,8 @@ function freezeJson(value) {
 }
 const hashPattern = "[0-9a-f]{64}";
 const uuidPattern = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
-const safeLocator = new RegExp(`^\\.supervised-worker/(?:plan\\.json|checkpoints/${hashPattern}\\.json|release-inputs/${hashPattern}\\.json|handoffs/${hashPattern}/(?:build-contract|build-report|review-report)\\.json|runtime/(?:model-receipts/${hashPattern}/(?:builder|reviewer)\\.json|review-attempts/${hashPattern}\\.json)|doctor/${uuidPattern}/(?:records|artifacts)/${hashPattern}\\.json|lifecycle-evidence/${hashPattern}\\.(?:intent|outcome)\\.json|rescue-capabilities/${hashPattern}\\.json)$`);
+const recoveryIdPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+const safeLocator = new RegExp(`^\\.supervised-worker/(?:plan\\.json|checkpoints/${hashPattern}\\.json|release-inputs/${hashPattern}\\.json|handoffs/${hashPattern}/(?:build-contract|build-report|review-report)\\.json|runtime/(?:model-receipts/${hashPattern}/(?:builder|reviewer)\\.json|review-attempts/${hashPattern}\\.json)|doctor/${uuidPattern}/(?:records|artifacts)/${hashPattern}\\.json|lifecycle-evidence/${hashPattern}\\.(?:intent|outcome)\\.json|rescue-capabilities/${hashPattern}\\.json|recovery/(?:(?:authorizations|frontiers)/${hashPattern}\\.json|actions/${recoveryIdPattern}/(?:intent|outcome|quarantine|confirmation)\\.json|quarantine/${recoveryIdPattern}/${hashPattern}\\.quarantined))$`);
 
 function sameStats(left, right) {
   return ["dev", "ino", "mode", "nlink", "size", "mtimeNs", "ctimeNs"].every((key) => left[key] === right[key]);
@@ -39,7 +41,7 @@ function safePath(root, locator) {
   return current;
 }
 
-function readReference(root, reference) {
+function readReference(root, reference, opaque = false) {
   if (validateCampaignRelease(reference, "link").length > 0) throw new Error("RELEASE_REFERENCE_INVALID");
   const file = safePath(root, reference.locator);
   const before = lstatSync(file, { bigint: true });
@@ -54,7 +56,8 @@ function readReference(root, reference) {
     closeSync(descriptor);
   }
   if (!sameStats(before, lstatSync(safePath(root, reference.locator), { bigint: true })) || bytes.length !== Number(before.size) || sha256(bytes) !== reference.sha256) throw new Error("RELEASE_ARTIFACT_CHANGED");
-  return { reference: { ...reference }, value: parseWorkflowJson(bytes), bytes };
+  return { reference: { ...reference }, value: opaque ? null : parseWorkflowJson(bytes), bytes,
+    identity: Object.fromEntries(["dev", "ino", "size"].map(key => [key, String(before[key])])) };
 }
 
 function directory(root, locator) {
@@ -77,7 +80,7 @@ function unlinkedExists(file) {
   }
 }
 
-function enumerateDoctor(root) {
+function enumerateDoctor(root, repositoryHash) {
   const files = [];
   const doctorRoot = path.join(root, ".supervised-worker", "doctor");
   const add = (locator) => {
@@ -113,14 +116,30 @@ function enumerateDoctor(root) {
       add(`${locator}/${name}`);
     }
   }
+  files.push(...captureReleaseRecovery({
+    repositoryHash,
+    list(locator) {
+      if (!unlinkedExists(path.join(root, locator))) return [];
+      const names = readdirSync(directory(root, locator)).sort();
+      if (names.length > 1024) throw new Error("RELEASE_RECOVERY_INVENTORY_TOO_LARGE");
+      return names;
+    },
+    read(locator, opaque) {
+      const file = safePath(root, locator);
+      const stats = lstatSync(file);
+      if (!stats.isFile() || stats.nlink !== 1 || stats.size > (opaque ? 4_194_304 : 262_144)) throw new Error("RELEASE_RECOVERY_ARTIFACT_INVALID");
+      return readReference(root, { locator, sha256: sha256(readFileSync(file)) }, opaque);
+    },
+  }));
+  if (files.length > 8192) throw new Error("RELEASE_DOCTOR_INVENTORY_TOO_LARGE");
   files.sort((left, right) => left.reference.locator < right.reference.locator ? -1 : left.reference.locator > right.reference.locator ? 1 : 0);
   if (files.reduce((total, entry) => total + entry.bytes.length, 0) > 16_777_216) throw new Error("RELEASE_DOCTOR_INVENTORY_TOO_LARGE");
   return { files, hash: doctorHash(files.map((entry) => entry.reference)) };
 }
 
 export function observeReleaseDoctorInventory(cwd, input, authority) {
-  return withWorkerEvidenceRead(cwd, input, authority, ({ root, authorize }) => {
-    const observed = enumerateDoctor(root);
+  return withWorkerEvidenceRead(cwd, input, authority, ({ root, observation, authorize }) => {
+    const observed = enumerateDoctor(root, observation.repositoryHash);
     authorize();
     return { doctorInventoryHash: observed.hash, references: observed.files.map((entry) => entry.reference) };
   });
@@ -134,7 +153,7 @@ export function openWorkerReleaseInputs(cwd, input, manifest, authority) {
     const artifacts = manifest.artifacts.map((entry) => ({ role: entry.role, ...readReference(root, entry.reference) }));
     const plan = artifacts.find((entry) => entry.role === "plan");
     if (plan.reference.locator !== ".supervised-worker/plan.json") throw new Error("RELEASE_PLAN_LOCATOR_INVALID");
-    const doctor = enumerateDoctor(root);
+    const doctor = enumerateDoctor(root, observation.repositoryHash);
     if (doctor.hash !== manifest.doctorInventoryHash) throw new Error("RELEASE_DOCTOR_INVENTORY_CHANGED");
     const workflow = resolveWorkflowRoles(root, { requireAcceptance: true });
     if (!workflow.ok || !workflow.accepted) throw new Error("RELEASE_WORKFLOW_UNCONFIRMED");
@@ -145,7 +164,7 @@ export function openWorkerReleaseInputs(cwd, input, manifest, authority) {
       for (const entry of artifacts) readReference(root, entry.reference);
       for (const reference of dependencies) readReference(root, reference);
       const currentWorkflow = resolveWorkflowRoles(root, { requireAcceptance: true });
-      if (enumerateDoctor(root).hash !== doctor.hash || !currentWorkflow.ok || !currentWorkflow.accepted || currentWorkflow.workflowHash !== workflow.workflowHash) throw new Error("RELEASE_INPUTS_CHANGED");
+      if (enumerateDoctor(root, observation.repositoryHash).hash !== doctor.hash || !currentWorkflow.ok || !currentWorkflow.accepted || currentWorkflow.workflowHash !== workflow.workflowHash) throw new Error("RELEASE_INPUTS_CHANGED");
     };
     const dependency = (reference) => {
       const entry = readReference(root, reference);
@@ -176,7 +195,8 @@ export function useWorkerReleaseInputs(token, action) {
 }
 
 export function summarizeReleaseDoctor(captured) {
-  const { files, hash } = captured.doctor;
+  const { hash } = captured.doctor;
+  const files = captured.doctor.files.filter(entry => !entry.reference.locator.startsWith(".supervised-worker/recovery/"));
   if (files.length === 0) return { status: "inapplicable", provenance: "inapplicable", inventoryHash: hash, incidents: [], references: [] };
   const incidents = [];
   const groups = new Map();

@@ -35,6 +35,13 @@ authority. Automatic host activation still requires a supported host integration
 local installation upgrades are checkpoint-and-restart handoffs. Source tests do
 not establish operational readiness or guarantee uninterrupted host availability.
 
+The bounded reliability repair adds an authoritative recovery frontier,
+uncertainty-preserving checkpoint/resume, zero-write ownerless diagnosis,
+separately confirmed recovery, canonical report publication, and journal control
+headroom. See [Bounded Local Reliability And Recovery](docs/reliability-recovery.md)
+before migrating an existing campaign. A tested source build is not a completed
+native long-campaign canary or permission to reconcile production state.
+
 ## Why It Exists
 
 Long-running coding sessions commonly fail between otherwise-correct steps:
@@ -265,7 +272,9 @@ For a queue or multi-step task, the agent creates:
 |-- checkpoints/<receipt-byte-sha256>.json
 |-- handoffs/<sha256(itemId)>/
 |-- locks/lifecycle/
-|-- runs/
+|-- runs/                         # reserved metadata journals only
+|-- releases/<receipt-sha256>.json # helper-published canonical reports
+|-- recovery/head.json            # authoritative recovery frontier selector
 `-- runtime/
 ```
 
@@ -480,7 +489,9 @@ resumption, or automatic session creation.
 
 `status` is read-only. It returns `planHash` (canonical plan content),
 `attachmentHash` (exact attachment or tombstone bytes), bounded attachment
-identity, and `operations` with explicit orphan-observation status. Use the
+identity, and `operations` with explicit orphan-observation coverage. Migrated
+campaigns additionally expose the current frontier, counter certainty and
+journal/recovery capacity. Use the
 current hashes and actual host session ID; these request examples show shapes
 with illustrative hashes, not reusable authorization:
 
@@ -500,7 +511,9 @@ duplicate and unknown keys, and are limited to 8 KiB. Invalid, stale, or
 unconfirmed operations exit `1` without echoing input.
 
 A successful response has `status: "checkpointed"`, `checkpointHash`,
-`planHash`, `attachmentHash`, and typed `context`. It is returned only after
+`planHash`, `attachmentHash`, `frontierHash`, and typed `context`. New checkpoints
+use version 3 and retain a prepared frontier reference; older versions remain
+readable as history. Success is returned only after
 the receipt and persistence event are verified, a matching **checkpointed
 tombstone** replaces the active attachment, and source route cleanup is
 confirmed. The old session is logically detached, although `attachment.json`
@@ -512,11 +525,12 @@ Start a fresh host session, then explicitly send this shape to `resume`:
 {
   "session_id": "fresh-session",
   "planHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "checkpointHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  "checkpointHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "frontierHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 }
 ```
 
-Use the returned receipt hash and the fresh session's transcript anchor when
+Use the returned receipt/frontier hashes and the fresh session's transcript anchor when
 available. A successful response has `status: "resumed"` and the same response
 fields with the successor attachment hash. A receipt or ledger event alone is
 insufficient: resume requires its matching tombstone or that exact session's
@@ -527,12 +541,14 @@ failure, the tombstone remains resumable. If an interrupted route is incomplete,
 use another fresh session or inspect it manually, never delete a replacement
 owner to make the request succeed.
 
-For an ownerless active-plan crash recovery only, `checkpointHash: null` reads
-the current durable context. It is rejected while any attachment or tombstone
-exists; it never releases an owner automatically. If this recovery publishes
-ownership but cannot confirm its final event, inspect that owner and its ledger
-before further recovery. A known-stale owner requires the explicit `release`
-procedure below, not an inferred timeout.
+For ownerless active-plan recovery, `checkpointHash: null` requires the explicit
+current `frontierHash`. Historical runtime values do not select authority.
+Missing or ambiguous legacy state first requires zero-write `recovery inspect`
+and a supported, separately operator-authorized reconciliation. Lost counter
+tails remain uncertain rather than becoming a guessed number or a fresh budget.
+An active attachment or unrelated tombstone cannot be displaced. If recovery
+publishes ownership but cannot confirm its final event, inspect that exact
+frontier and successor before retrying; never remove another owner.
 
 Checkpoint receipts follow the [checkpoint schema](schemas/checkpoint.schema.json)
 and contain counts, handoff item hashes, valid Stop counters, source identities,
@@ -629,19 +645,24 @@ attaching this or another repository; the released session route is not rebound.
 The Stop hook is inert when no durable plan exists. For an active incomplete
 plan it:
 
-1. blocks the initial stop;
+1. with exact counters, blocks the initial stop;
 2. blocks one unchanged continuation and tells the agent it is the final bounded
   attempt before release;
-3. then releases rather than looping forever, detaches ownership, and only
-  afterward records `completion_unverified_release`.
+3. then allows the host to stop rather than looping forever. It verifies a
+  prepared recovery frontier before detaching, confirms the detached frontier,
+  and separately mirrors the decision into the journal.
 
 Canonical valid-plan state changes reset the stagnant-block count; there is no
 total per-session ceiling, and the hook does not judge whether a valid state
 change is productive. A mechanically complete plan must contain a complete
 authenticated enumeration with zero actionable entries and at least one evidence reference.
-If the final ledger write fails, release still occurs because an unavailable
-ledger must not turn a bounded reliability control into an infinite loop. The
-preceding blocked continuation is the portable visible warning.
+Unknown same-progress counters grant no extra blocking allowance. If required
+frontier persistence fails, the host may stop but the existing evidence and
+ownership remain recoverable; no completed detach is claimed. If detachment is
+proved but journal mirroring fails, those outcomes are reported separately.
+Reserved journal/control capacity is bounded headroom, not disk preallocation
+or unlimited retention. Follow the [recovery protocol](docs/reliability-recovery.md)
+instead of deleting counters, history or locks.
 
 This is a reliability control, not a defense against a malicious process running
 as the same operating-system user.

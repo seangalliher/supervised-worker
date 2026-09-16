@@ -24,6 +24,7 @@ import {
   validateLocalCampaignReceipt,
 } from "../src/campaign.mjs";
 import { canonicalPlanHash, checkpointSession, handleHook, resumeSession, sha256, summarizePlan, summarizeRunLedger } from "../src/core.mjs";
+import { withReliabilityFixture } from "./reliability-fixture.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -174,17 +175,19 @@ test(`checkpoint v${version} producers cross ledger, campaign export, validation
     }
     const checkpoint = checkpointSession(cwd, { session_id: source.session_id, planHash: canonicalPlanHash(plan), attachmentHash });
     assert.equal(JSON.parse(readFileSync(path.join(state, "checkpoints", `${checkpoint.checkpointHash}.json`))).schemaVersion, version);
-    assert.equal(resumeSession(cwd, { session_id: "PRIVATE_SUCCESSOR", planHash: canonicalPlanHash(plan), checkpointHash: checkpoint.checkpointHash }).status, "resumed");
+    // Legacy checkpoint records remain exportable history, not implicit
+    // successor authority. The v3 producer test below exercises real resume.
+    assert.throws(() => resumeSession(cwd, { session_id: "PRIVATE_SUCCESSOR", planHash: canonicalPlanHash(plan), checkpointHash: checkpoint.checkpointHash }), /RECOVERY_AUTHORIZATION_REQUIRED/);
     const receipt = createLocalCampaignReceipt(cwd, root);
     assert.deepEqual(receipt.runLedger, summarizeRunLedger(cwd));
     assert.deepEqual(validateLocalCampaignReceipt(receipt), []);
     assert.equal(receipt.localDataStatus, "available");
     assert.equal(receipt.plan.localCompletionShape, false);
     assert.equal(summarizePlan(cwd).complete, false);
-    assert.equal(receipt.runLedger.recordCount, 6);
-    assert.equal(receipt.runLedger.sessionCount, 2);
+    assert.equal(receipt.runLedger.recordCount, 5);
+    assert.equal(receipt.runLedger.sessionCount, 1);
     assert.equal(Object.hasOwn(receipt.runLedger, "physicalFileCount"), false);
-    assert.deepEqual(receipt.runLedger.eventCounts.map(({ event }) => event), ["checkpoint_persisted", "checkpoint_resumed", "tool_completed", "tool_started"]);
+    assert.deepEqual(receipt.runLedger.eventCounts.map(({ event }) => event), ["checkpoint_persisted", "tool_completed", "tool_started"]);
     for (const fact of Object.values(receipt.providerFacts)) {
       assert.equal(fact.status, "unavailable");
       assert.equal(fact.value, null);
@@ -204,17 +207,18 @@ test(`checkpoint v${version} producers cross ledger, campaign export, validation
 });
 }
 
-test("new ledger variants enforce strict correlation and checkpoint binding field types", () => {
-  const cwd = temporaryWorkspace();
-  try {
-    const plan = writeCampaignPlan(cwd);
+test("new ledger variants enforce strict correlation and checkpoint binding field types", () => withReliabilityFixture((fixture) => {
+    const cwd = fixture.cwd;
+    const plan = fixture.plan;
     const state = path.join(cwd, ".supervised-worker");
-    const source = { cwd, session_id: "strict-source", tool_name: "Write", tool_use_id: "strict-hint", tool_input: { file_path: path.join(state, "plan.json") } };
-    assert.deepEqual(handleHook(source, "PreToolUse"), {});
-    assert.deepEqual(handleHook(source, "PostToolUse"), {});
-    const checkpoint = checkpointSession(cwd, { session_id: source.session_id, planHash: canonicalPlanHash(plan), attachmentHash: sha256(readFileSync(path.join(state, "attachment.json"))) });
-    assert.equal(resumeSession(cwd, { session_id: "strict-successor", planHash: canonicalPlanHash(plan), checkpointHash: checkpoint.checkpointHash }).status, "resumed");
-    const paths = ["strict-source", "strict-successor"].map((session) => path.join(state, "runs", `${sha256(session)}.jsonl`));
+    const source = fixture.input;
+    // Actual immutable authority/frontier publication replaces legacy adoption;
+    // all mutation predicates below still operate on real producer records.
+    fixture.tool("strict-hint");
+    const checkpoint = fixture.native(["checkpoint"], { ...source, planHash: canonicalPlanHash(plan), attachmentHash: fixture.observe().attachmentHash });
+    fixture.select("strict-successor");
+    assert.equal(fixture.native(["resume"], { ...fixture.input, ...checkpoint.resume }).status, "resumed");
+    const paths = [source.session_id, fixture.input.session_id].map((session) => path.join(state, "runs", `${sha256(session)}.jsonl`));
     const bytes = paths.map((file) => readFileSync(file, "utf8"));
     const records = bytes.flatMap((text) => text.trim().split("\n").map(JSON.parse));
     for (const event of ["tool_started", "tool_completed", "checkpoint_persisted", "checkpoint_resumed"]) {
@@ -241,10 +245,7 @@ test("new ledger variants enforce strict correlation and checkpoint binding fiel
       writeFileSync(file, originalText);
     }
     assert.equal(summarizeRunLedger(cwd).status, "available");
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
+}));
 
 test("ledger summary accepts only emitted variants and excludes record details", () => {
   const cwd = createCampaignWorkspace();

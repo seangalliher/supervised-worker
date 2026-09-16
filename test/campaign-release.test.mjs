@@ -14,10 +14,16 @@ import { acceptWorkflowRoles, DEFAULT_ROLES, resolveWorkflowRoles } from "../src
 import { observeReleaseDoctorInventory } from "../src/release-inputs.mjs";
 import { createWorkerAuthorityFixture } from "./worker-authority-fixture.mjs";
 
-function fixture(action) {
+function fixture(action, { workflow = null } = {}) {
   const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "release-compiler-fixture-")));
   try {
     doctorGit(root, ["init", "--quiet", "--initial-branch=main"]);
+    if (workflow !== null) {
+      mkdirSync(path.join(root, ".github"));
+      writeFileSync(path.join(root, ".github", "supervised-worker.json"), JSON.stringify(workflow));
+      doctorGit(root, ["add", ".github/supervised-worker.json"]);
+      assert.equal(acceptWorkflowRoles(root, resolveWorkflowRoles(root).workflowHash).accepted, true);
+    }
     doctorGit(root, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgSign=false", "commit", "--allow-empty", "-m", "fixture"]);
     const input = { session_id: "compiler-test-only" };
     const worker = createWorkerAuthorityFixture(root, input);
@@ -124,13 +130,17 @@ test("installed CLI checkpoints and resumes segmented history before compiling i
     const checkpointPath = path.join(state, "checkpoints", `${checkpoint.checkpointHash}.json`);
     const checkpointBytes = readFileSync(checkpointPath);
     const saved = JSON.parse(checkpointBytes);
-    assert.equal(saved.schemaVersion, 2);
+    // New checkpoints bind a recovery frontier while preserving the same segmented journal prefix.
+    assert.equal(saved.schemaVersion, 3);
+    assert.match(saved.frontierHash, /^[0-9a-f]{64}$/);
+    const sourceFrontier = readFileSync(path.join(state, "recovery", "frontiers", `${saved.frontierHash}.json`));
+    assert.equal(sha256(sourceFrontier), saved.frontierHash);
     assert.equal(saved.ledgerPosition.prefixHash, sha256(Buffer.concat([baseBytes, segmentBytes])));
     const successor = { session_id: "segmented-cli-successor" };
     worker.select(successor);
     const resumed = invoke(["resume"], { ...successor, planHash: canonicalPlanHash(plan), checkpointHash: checkpoint.checkpointHash });
     assert.equal(resumed.status, "resumed");
-    assert.equal(resumed.context.operations.status, "observed");
+    assert.equal(resumed.context.operations.coverage, "complete");
     assert.equal(resumed.context.operations.orphans.length, 0);
     const attachment = JSON.parse(readFileSync(path.join(state, "attachment.json")));
     assert.equal(attachment.sessionHash, sha256(successor.session_id));
@@ -285,6 +295,71 @@ test("provider and queue observations remain recorded and cannot grant completio
     manifest.artifacts.push(provider);
     rmSync(path.join(root, provider.reference.locator));
     assert.throws(() => compileCampaignRelease(root, input, manifest, authority));
+  });
+});
+
+test("repository CI compiles only against the accepted required-job profile and candidate", () => {
+  const workflow = JSON.parse(readFileSync(new URL("../examples/workflow.json", import.meta.url)));
+  workflow.validation.ci = { requiredJobs: [
+    { name: "python-tests", requiredSteps: ["Run tests"] },
+    { name: "ui-tests", requiredSteps: [] },
+  ] };
+  fixture(({ root, input, authority, manifest, add }) => {
+    const commit = manifest.candidate.commit;
+    const workflowHash = resolveWorkflowRoles(root, { requireAcceptance: true }).workflowHash;
+    const ci = { kind: "repository-ci", workflowHash, runId: 42, commit, complete: true, conclusion: "success",
+      jobs: [
+        { name: "python-tests", commit, conclusion: "success", steps: [{ name: "Run tests", status: "completed", conclusion: "success" }] },
+        { name: "ui-tests", commit, conclusion: "success", steps: [] },
+      ] };
+    const provider = { schemaVersion: 1, kind: "release-provider-observation", integrity: "unattested",
+      actorHash: "a".repeat(64), repositoryHash: "b".repeat(64), commit, ref: manifest.candidate.ref,
+      observedAt: "2026-01-01T00:00:00.000Z", complete: true, remoteCommit: commit, ci, closures: [] };
+    const replaceCi = next => {
+      manifest.artifacts = manifest.artifacts.filter(entry => entry.role !== "provider");
+      add("provider", { ...provider, ci: next });
+    };
+    replaceCi(ci);
+    const receipt = compileCampaignRelease(root, input, manifest, authority);
+    assert.equal(receipt.facts.find(fact => fact.name === "ci").status, "recorded");
+    assert.equal(receipt.facts.find(fact => fact.name === "ci").provenance, "unattested-provider-observation");
+    assert.equal(receipt.workflowHash, workflowHash);
+    assert.deepEqual(receipt.authority, { grantsPermissions: false, satisfiesStop: false, providerSealed: false });
+    for (const mutate of [
+      next => { next.jobs.pop(); },
+      next => { next.jobs[0].steps = []; },
+      next => { next.jobs.push(next.jobs[0]); },
+      next => { next.jobs[0].commit = "f".repeat(40); },
+      next => { next.workflowHash = "f".repeat(64); },
+    ]) {
+      const changed = structuredClone(ci);
+      mutate(changed);
+      replaceCi(changed);
+      assert.throws(() => compileCampaignRelease(root, input, manifest, authority), /RELEASE_CI_OBSERVATION_INVALID/);
+    }
+    const legacyCi = { runId: 1, commit, complete: true, conclusion: "success",
+      jobs: ["ubuntu-latest", "macos-latest", "windows-latest"].flatMap(os => [20, 22, 24].map(node =>
+        ({ name: `test (${os}, ${node})`, commit, conclusion: "success",
+          steps: ["Run npm test", "Run npm run validate"].map(name => ({ name, status: "completed", conclusion: "success" })) }))) };
+    replaceCi(legacyCi);
+    assert.throws(() => compileCampaignRelease(root, input, manifest, authority), /RELEASE_CI_OBSERVATION_INVALID/,
+      "the promotion matrix cannot replace the explicitly required repository jobs");
+    replaceCi(null);
+    assert.equal(compileCampaignRelease(root, input, manifest, authority).facts.find(fact => fact.name === "ci").status, "unavailable");
+    replaceCi(ci);
+    assert.equal(compileCampaignRelease(root, input, manifest, authority).facts.find(fact => fact.name === "ci").status, "recorded");
+  }, { workflow });
+});
+
+test("repository CI cannot opt itself in when the accepted workflow has no job policy", () => {
+  fixture(({ root, input, authority, manifest, add }) => {
+    const commit = manifest.candidate.commit;
+    add("provider", { schemaVersion: 1, kind: "release-provider-observation", integrity: "unattested",
+      actorHash: "a".repeat(64), repositoryHash: "b".repeat(64), commit, ref: manifest.candidate.ref,
+      observedAt: "2026-01-01T00:00:00.000Z", complete: true, remoteCommit: commit,
+      ci: { kind: "repository-ci", workflowHash: "c".repeat(64), runId: 1, commit, complete: true, conclusion: "success",
+        jobs: [{ name: "anything", commit, conclusion: "success", steps: [] }] }, closures: [] });
+    assert.throws(() => compileCampaignRelease(root, input, manifest, authority), /RELEASE_CI_POLICY_REQUIRED/);
   });
 });
 

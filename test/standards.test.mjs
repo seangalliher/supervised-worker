@@ -85,6 +85,11 @@ test("checkpoint runtime and published schema accept producer artifacts and reje
     const artifact = JSON.parse(readFileSync(path.join(state, "checkpoints", `${checkpoint.checkpointHash}.json`)));
     const ajv = new Ajv2020({ allErrors: true, strictTypes: false, strictRequired: false });
     addFormats(ajv);
+    // v3 adds closed recovery context; compile its explicit packaged references
+    // while retaining the legacy producer and malformed-field assertions.
+    for (const name of ["lifecycle", "supervisor-failure", "recovery"]) {
+      ajv.addSchema(JSON.parse(readFileSync(path.join(root, "schemas", `${name}.schema.json`))));
+    }
     const schema = ajv.compile(JSON.parse(readFileSync(path.join(root, "schemas", "checkpoint.schema.json"))));
     assert.equal(schema(artifact), true, JSON.stringify(schema.errors));
     assert.deepEqual(validateCheckpoint(artifact), []);

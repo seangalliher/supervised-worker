@@ -26,22 +26,26 @@ import { Worker } from "node:worker_threads";
 
 import {
   canonicalPlanHash,
-  checkpointSession,
-  handleHook,
+  checkpointSession as kernelCheckpoint,
+  handleHook as kernelHook,
   MAX_CHECKPOINT_BYTES,
   MAX_TOOL_TARGETS,
   observeCampaignTransition,
   planPath,
-  releaseAttachment,
-  resumeSession,
+  readRecoveryFrontier,
+  releaseAttachment as kernelRelease,
+  resumeSession as kernelResume,
   sha256,
   summarizePlan,
   summarizeRunLedger,
   validateCheckpoint,
   validatePlan,
 } from "../src/core.mjs";
+import { createWorkerAuthorityFixture } from "./worker-authority-fixture.mjs";
 
 const temporaryWorkspaces = new Set();
+const freshStopFixtures = new Set();
+const governedFixtures = new Map();
 const coreUrl = new URL("../src/core.mjs", import.meta.url).href;
 
 function workspace() {
@@ -53,7 +57,35 @@ function workspace() {
 afterEach(() => {
   for (const cwd of temporaryWorkspaces) rmSync(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   temporaryWorkspaces.clear();
+  freshStopFixtures.clear();
+  governedFixtures.clear();
 });
+
+function fixtureAuthority(cwd, request) {
+  const fixture = governedFixtures.get(cwd);
+  if (!fixture || !request || typeof request.session_id !== "string") return undefined;
+  fixture.input = { session_id: request.session_id, ...(request.transcript_path === undefined ? {} : { transcript_path: request.transcript_path }) };
+  return fixture.runtime.select(fixture.input).authority();
+}
+
+function handleHook(input, event, cwd = input?.cwd, forcedDenial = null) {
+  return kernelHook(input, event, cwd, forcedDenial, fixtureAuthority(cwd, input));
+}
+
+function checkpointSession(cwd, request) {
+  return kernelCheckpoint(cwd, request, fixtureAuthority(cwd, request));
+}
+
+function resumeSession(cwd, request) {
+  return kernelResume(cwd, request, fixtureAuthority(cwd, request));
+}
+
+function releaseAttachment(cwd, expected, request = {}) {
+  const fixture = governedFixtures.get(cwd);
+  if (!fixture) return kernelRelease(cwd, expected, request);
+  const input = Object.keys(request).length ? request : fixture.input;
+  return kernelRelease(cwd, expected ?? observeCampaignTransition(cwd, input), input, fixtureAuthority(cwd, input));
+}
 
 function writePlan(cwd, overrides = {}) {
   const value = {
@@ -66,7 +98,27 @@ function writePlan(cwd, overrides = {}) {
   };
   mkdirSync(path.dirname(planPath(cwd)), { recursive: true });
   writeFileSync(planPath(cwd), `${JSON.stringify(value, null, 2)}\n`);
+  seedFreshLegacyStopFixture(cwd);
   return value;
+}
+
+function seedFreshLegacyStopFixture(cwd) {
+  const file = path.join(cwd, ".supervised-worker", "attachment.json");
+  if (!existsSync(file)) return;
+  let attachment;
+  try { attachment = JSON.parse(readFileSync(file)); } catch { return; }
+  if (![1, 2, 3].includes(attachment.schemaVersion) || !/^[0-9a-f]{64}$/.test(attachment.sessionHash)) return;
+  const key = `${cwd}/${attachment.sessionHash}`;
+  if (freshStopFixtures.has(key)) return;
+  freshStopFixtures.add(key);
+  const runtime = path.join(cwd, ".supervised-worker", "runtime", `${attachment.sessionHash}.json`);
+  if (existsSync(runtime)) return;
+  const plan = JSON.parse(readFileSync(planPath(cwd)));
+  // These legacy codec fixtures start from a known fresh zero. Production must
+  // no longer infer that zero from a missing cache; loss tests remove it explicitly.
+  mkdirSync(path.dirname(runtime), { recursive: true });
+  writeFileSync(runtime, JSON.stringify({ schemaVersion: 2, progressHash: validatePlan(plan).length ? sha256("invalid-plan") : canonicalPlanHash(plan),
+    sameProgressBlocks: 0, totalBlocks: 0 }));
 }
 
 function stopInput(cwd, active = false) {
@@ -117,6 +169,7 @@ function attachPlan(cwd, sessionId = "11111111-1111-4111-8111-111111111111") {
     },
     "PostToolUse",
   );
+  seedFreshLegacyStopFixture(cwd);
 }
 
 function checkpointFixture(routed = false, cwd = workspace()) {
@@ -151,6 +204,32 @@ function checkpointFixture(routed = false, cwd = workspace()) {
   assert.equal(records.filter((record) => record.event === "tool_started").length, 1);
   assert.equal(records.at(-1).operationId, records[0].operationId);
   return { cwd, plan, source, storageRoot, request, attachment, attachmentFile, attachmentBytes, ledgerFile };
+}
+
+function frontierCheckpointFixture(routed = false, cwd = workspace()) {
+  const sessionId = `checkpoint-source-${routed}`;
+  const storageRoot = routed ? workspace() : null;
+  const source = { cwd, session_id: sessionId, ...(routed ? { transcript_path: vscodeTranscriptPath(storageRoot, sessionId) } : {}),
+    tool_name: "Write", tool_use_id: "setup-plan", tool_input: { file_path: planPath(cwd) } };
+  const plan = { schemaVersion: 1, mode: "active", goal: "PRIVATE_CHECKPOINT_GOAL", items: [
+    { id: "private-item-one", title: "PRIVATE_TITLE_ONE", status: "in_progress" },
+    { id: "private-item-two", title: "PRIVATE_TITLE_TWO", status: "pending" },
+  ], completion: null };
+  // Positive handoff scenarios now use an actual immutable grant and v3
+  // frontier, not the old authority-optional legacy resume shortcut.
+  const runtime = createWorkerAuthorityFixture(cwd, source);
+  assert.equal(runtime.admit(plan).status, "applied");
+  governedFixtures.set(cwd, { runtime, input: source });
+  const setup = { ...source, tool_input: { file_path: path.join(cwd, "setup.txt") } };
+  assert.deepEqual(handleHook(setup, "PreToolUse"), {});
+  assert.deepEqual(handleHook(setup, "PostToolUse"), {});
+  const attachmentFile = path.join(cwd, ".supervised-worker", "attachment.json");
+  const attachmentBytes = readFileSync(attachmentFile);
+  const attachment = JSON.parse(attachmentBytes);
+  const request = { session_id: sessionId, ...(routed ? { transcript_path: source.transcript_path } : {}),
+    planHash: canonicalPlanHash(plan), attachmentHash: sha256(attachmentBytes) };
+  return { cwd, plan, source, storageRoot, request, attachment, attachmentFile, attachmentBytes,
+    ledgerFile: path.join(cwd, ".supervised-worker", "runs", `${sha256(sessionId)}.jsonl`) };
 }
 
 function fillSessionJournal(filePath, session, size, sequenceStart = 0) {
@@ -326,13 +405,19 @@ for (const routed of [false, true]) {
     assert.equal(active.status, "active");
     assert.equal(active.claimGeneration, provisional.claimGeneration);
     assert.equal(active.routeGeneration, provisional.routeGeneration);
-    assert.equal(releaseAttachment(realpathSync(cwd)).released, true);
+    if (routed) {
+      // Unbound routed retirement used to discard source evidence. The exact
+      // legacy owner may still exercise its bounded, identity-checked Stop path.
+      assert.throws(() => releaseAttachment(realpathSync(cwd)), /provable unrouted ownership/);
+      for (let attempt = 0; attempt < 3; attempt += 1) handleHook({ ...input, stop_hook_active: false }, "Stop");
+      assert.equal(existsSync(attachmentPath), false);
+    } else assert.equal(releaseAttachment(realpathSync(cwd)).released, true);
     assert.deepEqual(handleHook(input, "PreToolUse"), {});
     const successor = JSON.parse(readFileSync(attachmentPath, "utf8"));
     assert.notEqual(successor.claimGeneration, active.claimGeneration);
     if (routed) assert.notEqual(successor.routeGeneration, active.routeGeneration);
     assert.deepEqual(readFileSync(planPath(cwd)), planBytes);
-    assert.equal(handleHook({ ...input, stop_hook_active: false }, "Stop").decision, "block");
+    assert.equal(handleHook({ ...input, stop_hook_active: false }, "Stop").decision, routed ? "allow" : "block");
     assert.equal(JSON.parse(readFileSync(planPath(cwd), "utf8")).completion, null);
   });
 }
@@ -731,7 +816,9 @@ test("a released route leaves interrupted-release evidence inert until explicit 
   assert.deepEqual(handleHook({ ...common, hook_event_name: "SessionStart" }, "SessionStart"), {});
   assert.deepEqual(readFileSync(attachmentPath), attachmentBefore);
   assert.equal(JSON.parse(readFileSync(routePath, "utf8")).status, "released");
-  assert.equal(releaseAttachment(repositoryRoot).released, true);
+  // A released route is not proof authorizing force-retirement of a legacy owner.
+  assert.throws(() => releaseAttachment(repositoryRoot), /provable unrouted ownership/);
+  assert.deepEqual(readFileSync(attachmentPath), attachmentBefore);
 });
 
 test("a fresh session lock denies concurrent state mutation", () => {
@@ -1609,6 +1696,7 @@ test("a routed plan claim migrates a matching v1 attachment", () => {
   assert.match(attachment.claimGeneration, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   assert.notEqual(attachment.claimGeneration, route.generation);
   assert.equal(attachment.checkpointHash, null);
+  seedFreshLegacyStopFixture(repositoryRoot);
   assert.equal(handleHook({ ...common, hook_event_name: "Stop" }, "Stop").decision, "block");
 });
 
@@ -2346,7 +2434,7 @@ test("complete plan audit hashes ignore object-key insertion order", () => {
 
 for (const routed of [false, true]) {
   test(`checkpoint and explicit fresh resume preserve incomplete work and Stop governance (routed=${routed})`, () => {
-    const fixture = checkpointFixture(routed);
+    const fixture = frontierCheckpointFixture(routed);
     const { cwd, source, request, attachment, attachmentFile, storageRoot } = fixture;
     const planBytes = readFileSync(planPath(cwd));
     const handoffFile = path.join(cwd, ".supervised-worker", "handoffs", sha256("private-item-one"), "build-report.json");
@@ -2364,7 +2452,7 @@ for (const routed of [false, true]) {
     assert.deepEqual(validateCheckpoint(receipt), []);
     assert.equal(receipt.attachmentHash, request.attachmentHash);
     assert.equal(receipt.claimGeneration, attachment.claimGeneration);
-    assert.equal(receipt.context.stopState.sameProgressBlocks, 1);
+    assert.deepEqual(receipt.context.stopState.sameProgressBlocks, { certainty: "exact", value: 1 });
     assert.deepEqual(receipt.context.itemHashes, fixture.plan.items.map((item) => sha256(item.id)));
     assert.equal(receipt.context.operations.orphans.length, 1);
     assert.equal(receipt.context.operations.orphans[0].observationStatus, "outcome-unknown");
@@ -2393,8 +2481,9 @@ for (const routed of [false, true]) {
     if (routed) assert.equal(JSON.parse(readFileSync(sessionRoutePath(storageRoot, nextId))).status, "active");
     assert.deepEqual(resumeSession(cwd, nextRequest), resumed);
     assert.deepEqual(readFileSync(attachmentFile), successorBytes);
-    assert.throws(() => checkpointSession(cwd, request), /does not own/);
-    assert.throws(() => resumeSession(cwd, { ...nextRequest, session_id: "another-successor", ...(routed ? { transcript_path: vscodeTranscriptPath(storageRoot, "another-successor") } : {}) }), /another session/);
+    // v3 identifies the exact frontier owner instead of the old attachment-only diagnostic.
+    assert.throws(() => checkpointSession(cwd, request), /exact source Worker/);
+    assert.throws(() => resumeSession(cwd, { ...nextRequest, session_id: "another-successor", ...(routed ? { transcript_path: vscodeTranscriptPath(storageRoot, "another-successor") } : {}) }), /resume requires a detached, checkpointed, or reconciled frontier/);
     assert.equal(handleHook(source, "PreToolUse").permissionDecision, "deny");
     assert.deepEqual(readFileSync(attachmentFile), successorBytes);
     assert.deepEqual(readFileSync(planPath(cwd)), planBytes);
@@ -2437,14 +2526,14 @@ test("host invocation reuse across claim generations never resolves a late termi
 });
 
 test("successive checkpoints preserve unresolved source context instead of resetting observation", () => {
-  const { cwd, source, request, attachmentFile } = checkpointFixture();
+  const { cwd, source, request, attachmentFile } = frontierCheckpointFixture();
   const tool = { ...source, tool_name: "Bash", tool_use_id: "unobserved-source", tool_input: {} };
   assert.deepEqual(handleHook(tool, "PreToolUse"), {});
   const first = checkpointSession(cwd, request);
   const next = { session_id: "second-checkpoint-source", planHash: request.planHash, checkpointHash: first.checkpointHash };
   assert.equal(resumeSession(cwd, next).status, "resumed");
   const second = checkpointSession(cwd, { session_id: next.session_id, planHash: next.planHash, attachmentHash: sha256(readFileSync(attachmentFile)) });
-  assert.equal(second.context.operations.status, "observed");
+  assert.equal(second.context.operations.coverage, "complete");
   assert.deepEqual(second.context.operations.orphans, first.context.operations.orphans);
   assert.notEqual(second.checkpointHash, first.checkpointHash);
   const resumed = resumeSession(cwd, { ...next, session_id: "third-checkpoint-session", checkpointHash: second.checkpointHash });
@@ -2478,8 +2567,9 @@ test("source partial or corrupt ledger tails block checkpoint without detachment
 });
 
 test("duplicate-key attachments and hard-linked receipts are rejected without modifying their peers", () => {
-  const { cwd, request, attachmentFile, attachmentBytes } = checkpointFixture();
-  const duplicated = attachmentBytes.toString().replace('"schemaVersion": 3', '"schemaVersion": 3, "schemaVersion": 3');
+  const { cwd, request, attachmentFile, attachmentBytes } = frontierCheckpointFixture();
+  // Migrated ownership is v4; duplicate-key rejection must reach that real reader.
+  const duplicated = attachmentBytes.toString().replace('"schemaVersion": 4', '"schemaVersion": 4, "schemaVersion": 4');
   assert.notEqual(duplicated, attachmentBytes.toString());
   writeFileSync(attachmentFile, duplicated);
   assert.throws(() => checkpointSession(cwd, { ...request, attachmentHash: sha256(duplicated) }));
@@ -2517,12 +2607,16 @@ test("unavailable ownerless observation stays unavailable with a corrupt prior s
   const corrupt = Buffer.concat([readFileSync(ledgerFile), Buffer.from("{PRIVATE_PARTIAL")]);
   writeFileSync(ledgerFile, corrupt);
   rmSync(attachmentFile);
-  const resumed = resumeSession(cwd, { session_id: "corrupt-ledger-recovery", planHash: request.planHash, checkpointHash: null });
-  assert.equal(resumed.context.operations.status, "unavailable");
-  assert.equal(resumed.context.operations.reason, "ledger-invalid");
-  assert.equal(resumed.context.operations.orphans, null);
+  // Corrupt, ownerless legacy history used to be adopted implicitly. It is now
+  // diagnosis-only until exact authorization and independent journal admission.
+  assert.throws(() => resumeSession(cwd, { session_id: "corrupt-ledger-recovery", planHash: request.planHash, checkpointHash: null }), /RECOVERY_AUTHORIZATION_REQUIRED/);
+  const observed = summarizePlan(cwd).operations;
+  assert.equal(observed.status, "unavailable");
+  assert.equal(observed.reason, "ledger-invalid");
+  assert.equal(observed.orphans, null);
   assert.deepEqual(readFileSync(ledgerFile), corrupt);
-  assert.doesNotMatch(JSON.stringify(resumed), /PRIVATE_PARTIAL/);
+  assert.equal(existsSync(attachmentFile), false);
+  assert.doesNotMatch(JSON.stringify(observed), /PRIVATE_PARTIAL/);
 });
 
 test("checkpoint request failures leave the active attachment and queue bytes unchanged", () => {
@@ -2552,20 +2646,24 @@ for (const schemaVersion of [1, 2]) {
     mkdirSync(path.dirname(runtime), { recursive: true });
     const stopState = { schemaVersion: 1, progressHash: sha256(JSON.stringify(plan)), sameProgressBlocks: 1, totalBlocks: 7 };
     writeFileSync(runtime, JSON.stringify(stopState));
+    // Preserve the real legacy counter migration, but exercise it while the
+    // proven source still owns the state, not via unbound successor adoption.
+    const output = handleHook({ cwd, session_id: source.session_id, stop_hook_active: true }, "Stop");
+    assert.equal(output.decision, "block");
+    const restored = JSON.parse(readFileSync(runtime));
+    assert.equal(restored.schemaVersion, 2);
+    assert.equal(restored.sameProgressBlocks, 2);
+    assert.equal(restored.totalBlocks, 8);
     const checkpoint = checkpointSession(cwd, { session_id: source.session_id, planHash: canonicalPlanHash(plan), attachmentHash: sha256(bytes) });
     const receipt = JSON.parse(readFileSync(path.join(cwd, ".supervised-worker", "checkpoints", `${checkpoint.checkpointHash}.json`)));
     assert.equal(receipt.attachmentHash, sha256(bytes));
     assert.equal(receipt.claimGeneration, null);
     assert.equal(receipt.routeGeneration, null);
-    assert.deepEqual(receipt.context.stopState, stopState);
+    assert.deepEqual(receipt.context.stopState, restored);
     const next = { session_id: `legacy-resume-${schemaVersion}`, planHash: canonicalPlanHash(plan), checkpointHash: checkpoint.checkpointHash };
-    assert.equal(resumeSession(cwd, next).status, "resumed");
-    const output = handleHook({ cwd, session_id: next.session_id, stop_hook_active: true }, "Stop");
-    assert.equal(output.decision, "block");
-    const restored = JSON.parse(readFileSync(path.join(cwd, ".supervised-worker", "runtime", `${sha256(next.session_id)}.json`)));
-    assert.equal(restored.schemaVersion, 2);
-    assert.equal(restored.sameProgressBlocks, 2);
-    assert.equal(restored.totalBlocks, 8);
+    assert.throws(() => resumeSession(cwd, next), /RECOVERY_AUTHORIZATION_REQUIRED/);
+    assert.deepEqual(JSON.parse(readFileSync(runtime)), restored);
+    assert.equal(existsSync(path.join(cwd, ".supervised-worker", "runtime", `${sha256(next.session_id)}.json`)), false);
   });
 }
 
@@ -2599,7 +2697,7 @@ for (const mode of ["absent", "inactive", "complete"]) {
 }
 
 test("receipt and ledger tampering cannot authorize resumption", () => {
-  const { cwd, request, ledgerFile, attachmentFile } = checkpointFixture();
+  const { cwd, request, ledgerFile, attachmentFile } = frontierCheckpointFixture();
   const checkpoint = checkpointSession(cwd, request);
   const receiptFile = path.join(cwd, ".supervised-worker", "checkpoints", `${checkpoint.checkpointHash}.json`);
   const receiptBytes = readFileSync(receiptFile);
@@ -2723,8 +2821,11 @@ test("legacy checkpoint base-prefix proof remains valid after later segments exi
   writeFileSync(segment, `${JSON.stringify({ schemaVersion: 1, at: "2020-01-01T00:00:00.000Z",
     event: "pre_compact", session: sha256(source.session_id), trigger: "manual" })}\n`);
   assert.equal(summarizeRunLedger(cwd).status, "available");
-  assert.equal(resumeSession(cwd, { session_id: "legacy-prefix-successor", planHash: request.planHash,
-    checkpointHash: checkpoint.checkpointHash }).status, "resumed");
+  // v1 remains readable at its exact base watermark; it is not implicit
+  // authority for a new owner without a migrated frontier and verified grant.
+  assert.equal(checkpointSession(cwd, request).checkpointHash, checkpoint.checkpointHash);
+  assert.throws(() => resumeSession(cwd, { session_id: "legacy-prefix-successor", planHash: request.planHash,
+    checkpointHash: checkpoint.checkpointHash }), /RECOVERY_AUTHORIZATION_REQUIRED/);
   assert.deepEqual(readFileSync(ledgerFile), originalBase);
   assert.deepEqual(readFileSync(receiptFile), receiptBytes);
 });
@@ -2817,7 +2918,7 @@ for (const kind of ["hard-link", "directory", "oversized"]) {
 
 for (const rollover of ["before-checkpoint", "persistence-event"]) {
   test(`segmented checkpoint preserves a logical prefix when rollover occurs at ${rollover}`, () => {
-    const { cwd, source, request, ledgerFile, attachmentFile } = checkpointFixture();
+    const { cwd, source, request, ledgerFile, attachmentFile } = frontierCheckpointFixture();
     fillSessionJournal(ledgerFile, sha256(source.session_id), 1_048_496);
     assert.equal(summarizeRunLedger(cwd).status, "available");
     const original = readFileSync(ledgerFile);
@@ -2829,7 +2930,8 @@ for (const rollover of ["before-checkpoint", "persistence-event"]) {
     const checkpoint = checkpointSession(cwd, { ...request, attachmentHash: sha256(readFileSync(attachmentFile)) });
     assert.equal(checkpoint.status, "checkpointed");
     const receipt = JSON.parse(readFileSync(path.join(cwd, ".supervised-worker", "checkpoints", `${checkpoint.checkpointHash}.json`)));
-    assert.equal(receipt.schemaVersion, 2);
+    // The segmented prefix remains exact; v3 additionally binds its source frontier.
+    assert.equal(receipt.schemaVersion, 3);
     assert.deepEqual(validateCheckpoint(receipt), []);
     assert.equal(receipt.ledgerPosition.byteOffset > 1_048_576, rollover === "before-checkpoint");
     const records = Buffer.concat([original, readFileSync(ledgerFile.replace(/\.jsonl$/, ".000001.jsonl"))]);
@@ -2837,36 +2939,38 @@ for (const rollover of ["before-checkpoint", "persistence-event"]) {
     const recovered = resumeSession(cwd, { session_id: `segment-checkpoint-successor-${rollover}`,
       planHash: request.planHash, checkpointHash: checkpoint.checkpointHash });
     assert.equal(recovered.status, "resumed");
-    assert.equal(recovered.context.operations.status, "observed");
+    assert.equal(recovered.context.operations.coverage, "complete");
     assert.equal(recovered.context.operations.orphans.length, 0);
     assert.deepEqual(readFileSync(ledgerFile), original);
   });
 }
 
 test("ownerless recovery preserves unknown operations and never repeats a side effect", () => {
-  const { cwd, source, request, attachmentFile } = checkpointFixture();
+  const { cwd, source, request, attachmentFile } = frontierCheckpointFixture();
   assert.equal(handleHook({ ...source, stop_hook_active: false }, "Stop").decision, "block");
   const input = { ...source, tool_name: "Bash", tool_use_id: undefined, tool_input: { command: "PRIVATE_COMMAND" } };
   assert.deepEqual(handleHook(input, "PreToolUse"), {});
   const before = summarizePlan(cwd).operations;
-  assert.equal(before.status, "observed");
+  assert.equal(before.coverage, "complete");
   assert.equal(before.orphans.length, 1);
   const sideEffect = path.join(cwd, "side-effect.txt");
   writeFileSync(sideEffect, "performed-once\n");
-  rmSync(attachmentFile);
-  const next = { session_id: "ownerless-successor", planHash: request.planHash, checkpointHash: null };
+  // Manual attachment deletion previously supplied implicit adoption authority.
+  // Publish the exact source frontier through the owning release instead.
+  assert.equal(releaseAttachment(cwd).released, true);
+  const next = { session_id: "ownerless-successor", planHash: request.planHash, checkpointHash: null, frontierHash: readRecoveryFrontier(cwd).frontierHash };
   const resumed = resumeSession(cwd, next);
   assert.equal(resumed.status, "resumed");
   assert.equal(resumed.context.operations.orphans[0].observationStatus, "outcome-unknown");
   assert.equal(readFileSync(sideEffect, "utf8"), "performed-once\n");
   assert.equal(handleHook({ cwd, session_id: next.session_id, stop_hook_active: true }, "Stop").decision, "block");
   const ownerBefore = readFileSync(attachmentFile);
-  assert.throws(() => resumeSession(cwd, { ...next, session_id: "stealing-owner" }), { transitionCode: "CAMPAIGN_COMPARE_AND_SET_CONFLICT" });
+  assert.throws(() => resumeSession(cwd, { ...next, session_id: "stealing-owner" }), /resume frontier reference is stale/);
   assert.deepEqual(readFileSync(attachmentFile), ownerBefore);
 });
 
 test("ownerless recovery carries prior unknown operations through checkpoint and next resume", () => {
-  const { cwd, source, request, attachmentFile, ledgerFile } = checkpointFixture();
+  const { cwd, source, request, attachmentFile, ledgerFile } = frontierCheckpointFixture();
   const input = { ...source, tool_name: "Bash", tool_use_id: "prior-outcome-unknown", tool_input: { command: "fixture-effect" } };
   assert.deepEqual(handleHook(input, "PreToolUse"), {});
   const sideEffect = path.join(cwd, "side-effect.txt");
@@ -2883,15 +2987,15 @@ test("ownerless recovery carries prior unknown operations through checkpoint and
   assert.equal(existsSync(attachmentFile), false);
   const originalLedger = readFileSync(ledgerFile);
   const planBytes = readFileSync(planPath(cwd));
-  const next = { session_id: "ownerless-checkpoint-successor", planHash: request.planHash, checkpointHash: null };
+  const next = { session_id: "ownerless-checkpoint-successor", planHash: request.planHash, checkpointHash: null, frontierHash: readRecoveryFrontier(cwd).frontierHash };
   const recovered = resumeSession(cwd, next);
   assert.equal(recovered.status, "resumed");
-  assert.equal(recovered.context.operations.status, "observed");
+  assert.equal(recovered.context.operations.coverage, "complete");
   assert.deepEqual(recovered.context.operations.orphans, orphans);
   const checkpoint = checkpointSession(cwd, { session_id: next.session_id, planHash: next.planHash,
     attachmentHash: sha256(readFileSync(attachmentFile)) });
   assert.equal(checkpoint.status, "checkpointed");
-  assert.equal(checkpoint.context.operations.status, "observed");
+  assert.equal(checkpoint.context.operations.coverage, "complete");
   assert.deepEqual(checkpoint.context.operations.orphans, orphans);
   const final = resumeSession(cwd, { session_id: "ownerless-checkpoint-final", planHash: next.planHash,
     checkpointHash: checkpoint.checkpointHash });
@@ -2904,7 +3008,7 @@ test("ownerless recovery carries prior unknown operations through checkpoint and
 
 for (const history of ["empty", "mixed", "unavailable"]) {
   test(`ownerless checkpoint preserves ${history} operation history without double counting`, () => {
-    const { cwd, source, request, attachmentFile, ledgerFile } = checkpointFixture();
+    const { cwd, source, request, attachmentFile, ledgerFile } = frontierCheckpointFixture();
     if (history === "mixed") {
       assert.deepEqual(handleHook({ ...source, tool_name: "Bash", tool_use_id: "old-unknown",
         tool_input: { command: "old fixture action" } }, "PreToolUse"), {});
@@ -2912,7 +3016,16 @@ for (const history of ["empty", "mixed", "unavailable"]) {
     assert.equal(releaseAttachment(cwd).released, true);
     if (history === "unavailable") writeFileSync(ledgerFile, Buffer.concat([readFileSync(ledgerFile), Buffer.from("{partial")]));
     const originalLedger = readFileSync(ledgerFile);
-    const next = { session_id: `ownerless-${history}-successor`, planHash: request.planHash, checkpointHash: null };
+    const next = { session_id: `ownerless-${history}-successor`, planHash: request.planHash, checkpointHash: null, frontierHash: readRecoveryFrontier(cwd).frontierHash };
+    if (history === "unavailable") {
+      // A frontier preserves history but no longer bypasses corrupt journal
+      // admission. The foreign-file recoverable chain is qualified separately.
+      assert.throws(() => resumeSession(cwd, next), /run-ledger|ledger/);
+      assert.equal(existsSync(attachmentFile), false);
+      assert.equal(summarizePlan(cwd).operations.coverage, "unavailable");
+      assert.deepEqual(readFileSync(ledgerFile), originalLedger);
+      return;
+    }
     assert.equal(resumeSession(cwd, next).status, "resumed");
     const tool = { cwd, ...next, tool_name: "Read", tool_use_id: "successor-read", tool_input: {} };
     assert.deepEqual(handleHook(tool, "PreToolUse"), {});
@@ -2922,35 +3035,33 @@ for (const history of ["empty", "mixed", "unavailable"]) {
       assert.deepEqual(handleHook({ ...tool, tool_use_id: undefined }, "PostToolUse"), {});
     }
     const before = summarizePlan(cwd).operations;
-    assert.equal(before.status, history === "unavailable" ? "unavailable" : "observed");
+    assert.equal(before.coverage, "complete");
     if (history !== "unavailable") {
       assert.equal(before.orphans.length, history === "mixed" ? 2 : 0);
-      assert.equal(before.uncorrelatedCompletions, history === "mixed" ? 1 : 0);
+      assert.deepEqual(before.uncorrelatedCompletions, { certainty: "exact", value: history === "mixed" ? 1 : 0 });
     }
     const checkpoint = checkpointSession(cwd, { session_id: next.session_id, planHash: request.planHash,
       attachmentHash: sha256(readFileSync(attachmentFile)) });
-    assert.equal(checkpoint.context.operations.status, before.status);
-    assert.equal(checkpoint.context.operations.reason, before.reason);
+    assert.equal(checkpoint.context.operations.coverage, before.coverage);
     assert.deepEqual(checkpoint.context.operations.orphans, before.orphans);
-    assert.equal(checkpoint.context.operations.uncorrelatedCompletions, before.uncorrelatedCompletions);
+    assert.deepEqual(checkpoint.context.operations.uncorrelatedCompletions, before.uncorrelatedCompletions);
     const final = resumeSession(cwd, { session_id: `ownerless-${history}-final`, planHash: request.planHash,
       checkpointHash: checkpoint.checkpointHash });
-    assert.equal(final.context.operations.status, before.status);
-    assert.equal(final.context.operations.reason, before.reason);
+    assert.equal(final.context.operations.coverage, before.coverage);
     assert.deepEqual(final.context.operations.orphans, before.orphans);
-    assert.equal(final.context.operations.uncorrelatedCompletions, before.uncorrelatedCompletions);
+    assert.deepEqual(final.context.operations.uncorrelatedCompletions, before.uncorrelatedCompletions);
     assert.deepEqual(readFileSync(ledgerFile), originalLedger);
   });
 }
 
   test("ownerless checkpoint reads preserved read-only historical journals", { skip: process.platform !== "win32" }, () => {
-    const { cwd, source, request, attachmentFile, ledgerFile } = checkpointFixture();
+    const { cwd, source, request, attachmentFile, ledgerFile } = frontierCheckpointFixture();
     assert.deepEqual(handleHook({ ...source, tool_name: "Bash", tool_use_id: "read-only-history-orphan",
       tool_input: { command: "fixture action" } }, "PreToolUse"), {});
     const orphans = summarizePlan(cwd).operations.orphans;
     assert.equal(orphans.length, 1);
     assert.equal(releaseAttachment(cwd).released, true);
-    const next = { session_id: "read-only-history-successor", planHash: request.planHash, checkpointHash: null };
+    const next = { session_id: "read-only-history-successor", planHash: request.planHash, checkpointHash: null, frontierHash: readRecoveryFrontier(cwd).frontierHash };
     assert.equal(resumeSession(cwd, next).status, "resumed");
     const original = readFileSync(ledgerFile);
     const originalMode = lstatSync(ledgerFile).mode;
@@ -2961,7 +3072,7 @@ for (const history of ["empty", "mixed", "unavailable"]) {
         const descriptor = openSync(ledgerFile, "r+");
         closeSync(descriptor);
       }, "The fixture must reject write-mode access to the historical journal");
-      assert.equal(summarizePlan(cwd).operations.status, "observed");
+      assert.equal(summarizePlan(cwd).operations.coverage, "complete");
       const checkpoint = checkpointSession(cwd, { session_id: next.session_id, planHash: request.planHash,
         attachmentHash: sha256(readFileSync(attachmentFile)) });
       assert.equal(checkpoint.status, "checkpointed");
@@ -2996,13 +3107,14 @@ for (const history of ["empty", "mixed", "unavailable"]) {
 test("missing ledger observation is unavailable rather than a verified empty orphan list", () => {
   const cwd = workspace();
   const plan = writePlan(cwd);
-  const recovered = resumeSession(cwd, { session_id: "unobserved-recovery", planHash: canonicalPlanHash(plan), checkpointHash: null });
-  assert.equal(recovered.context.operations.status, "unavailable");
-  assert.equal(recovered.context.operations.orphans, null);
-  assert.equal(recovered.context.operations.uncorrelatedCompletions, null);
+  // Absence used to grant implicit ownerless adoption. Observation remains
+  // unavailable; recovery now requires a separately authorized proven frontier.
+  assert.throws(() => resumeSession(cwd, { session_id: "unobserved-recovery", planHash: canonicalPlanHash(plan), checkpointHash: null }), /RECOVERY_AUTHORIZATION_REQUIRED/);
   assert.equal(summarizePlan(cwd).operations.status, "unavailable");
   assert.equal(summarizePlan(cwd).operations.orphans, null);
-  assert.match(handleHook({ cwd, session_id: "unobserved-recovery" }, "SessionStart").additionalContext, /"status":"unavailable"/);
+  assert.equal(summarizePlan(cwd).operations.uncorrelatedCompletions, null);
+  assert.deepEqual(handleHook({ cwd, session_id: "unobserved-recovery" }, "SessionStart"), {});
+  assert.equal(existsSync(path.join(cwd, ".supervised-worker", "attachment.json")), false);
 });
 
 for (const segmented of [false, true]) {
@@ -3022,7 +3134,7 @@ test(`checkpoint and resume preserve staged, unstaged, untracked work and index 
   };
   assert.match(before.status, /AM tracked\.txt/);
   assert.match(before.status, /\?\? untracked\.txt/);
-  const { request, ledgerFile, source } = checkpointFixture(false, cwd);
+  const { request, ledgerFile, source } = frontierCheckpointFixture(false, cwd);
   if (segmented) fillSessionJournal(ledgerFile, sha256(source.session_id), 1_048_496);
   assert.throws(() => checkpointSession(cwd, { ...request, attachmentHash: "0".repeat(64) }));
   const checkpoint = checkpointSession(cwd, request);
@@ -3234,6 +3346,7 @@ test("apply_patch plan writes attach without retaining patch content", () => {
     },
     "PostToolUse",
   );
+  seedFreshLegacyStopFixture(cwd);
   const stop = handleHook(
     {
       hook_event_name: "Stop",
@@ -3321,7 +3434,7 @@ test("apply_patch mentions outside target headers do not claim the plan", () => 
   );
 });
 
-test("malformed runtime counters release a recursive Stop visibly", () => {
+test("malformed runtime counters allow recursive Stop while preserving evidence", () => {
   const cwd = workspace();
   writePlan(cwd);
   attachPlan(cwd);
@@ -3339,19 +3452,28 @@ test("malformed runtime counters release a recursive Stop visibly", () => {
     totalBlocks: "0",
   }));
   const output = handleHook(stopInput(cwd, true), "Stop");
-  assert.match(output.systemMessage, /runtime state was invalid/);
-  assert.deepEqual(handleHook(stopInput(cwd), "Stop"), {});
+  // The former release deleted the only uncertain source. Retain both it and
+  // ownership instead of treating malformed counters as a reset or detach.
+  assert.match(output.systemMessage, /without resetting counters or retiring ownership/);
+  assert.equal(output.supervisorFailure.code, "RECOVERY_FRONTIER_MISSING");
+  assert.equal(existsSync(path.join(cwd, ".supervised-worker", "attachment.json")), true);
+  assert.equal(JSON.parse(readFileSync(runtime)).totalBlocks, "0");
+  assert.equal(handleHook(stopInput(cwd), "Stop").decision, "allow");
 });
 
-test("first recursive Stop without runtime counters releases visibly", () => {
+test("first recursive Stop without runtime counters preserves ownership visibly", () => {
   const cwd = workspace();
   writePlan(cwd);
   attachPlan(cwd);
-
+  // Explicitly inject the loss; the fixture now starts from known fresh state.
+  const runtime = path.join(cwd, ".supervised-worker", "runtime", `${sha256(stopInput(cwd).session_id)}.json`);
+  rmSync(runtime);
+  assert.equal(existsSync(runtime), false);
   const output = handleHook(stopInput(cwd, true), "Stop");
   assert.equal(output.decision, "allow");
-  assert.match(output.systemMessage, /bounded retry limit/);
-  assert.equal(existsSync(path.join(cwd, ".supervised-worker", "attachment.json")), false);
+  assert.match(output.systemMessage, /without resetting counters or retiring ownership/);
+  assert.equal(existsSync(path.join(cwd, ".supervised-worker", "attachment.json")), true);
+  assert.equal(existsSync(runtime), false);
 });
 
 test("persisted zero totalBlocks does not authorize recursive Stop release", () => {
